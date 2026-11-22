@@ -57,11 +57,16 @@ actor PreviewDecoder {
         }) {
             return true
         }
+        #if DEBUG
+        // Development only: release builds must not embed `#filePath` (absolute home folder path).
         let sourceFallback = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("PyrowaveKit/Metal/PyrowaveKernels.metal")
         return FileManager.default.fileExists(atPath: sourceFallback.path)
+        #else
+        return false
+        #endif
     }
 
     func decode(bitstream: Data, width: Int, height: Int) async -> SendablePreviewBuffer? {

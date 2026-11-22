@@ -3593,6 +3593,9 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 return url
             }
         }
+        #if DEBUG
+        // Development only: shaders next to the sources. Release builds must not embed
+        // `#filePath`, which contains the builder's absolute home folder path.
         let sourceFallback = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .appendingPathComponent("Metal")
@@ -3600,6 +3603,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         if FileManager.default.fileExists(atPath: sourceFallback.path) {
             return sourceFallback
         }
+        #endif
         return Bundle.module.url(forResource: name, withExtension: ext)
     }
 }

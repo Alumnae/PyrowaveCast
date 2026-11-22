@@ -20,6 +20,14 @@ Chroma: 4:2:0 by default; macOS server optional 4:4:4 (`'xf44'` capture → Pyro
 - **Build & Version Display**: `SPPWBuildVersion` displays formatted version strings including short git commit hash (e.g. `v0.6.4 (build 604, 7fd7479)`).
 
 ## Active tasks
+- [ ] **Rotazione dinamica dei controlli su schermo (iOS e macOS)**:
+  - Quando lo schermo / orientamento del display o del flusso video è ruotato (es. rotazione fisica del dispositivo iOS portrait/landscape o rotazione display su macOS), applicare automaticamente la corretta trasformazione di orientamento e rotazione anche a tutti i controlli sovrapposti (overlay UI, dock del controllo remoto, pannello tasti speciali, pulsanti floating/uscita fullscreen).
+  - Assicurare che il sistema di coordinate touch/mouse e i gesti vengano trasposti correttamente in funzione dell'angolo di rotazione corrente (0°, 90°, 180°, 270°) per mantenere la corrispondenza 1:1 con l'immagine remota.
+- [ ] **Aggiunta zoom / lente d'ingrandimento max 2x (iOS e macOS)**:
+  - Implementare la capacità di ingrandimento (magnifier/zoom) sul flusso video del ricevitore fino a un massimo di 2×.
+  - **iOS**: Supporto pinch-to-zoom (gesto a 2 dita) e pan per esplorare l'area ingrandita all'interno della viewport video; preservare o adattare il mapping delle coordinate per il controllo remoto durante lo zoom attivo.
+  - **macOS**: Supporto scroll/pinch con trackpad, tasti di scelta rapida o controllo zoom dedicato a schermo, con clamp a 2.0× e riposizionamento fluido / reset al doppio clic.
+  - Esecuzione ottimizzata a livello di rendering (`MetalVideoSurface` o trasformazione view SwiftUI senza introdurre latenza aggiuntiva).
 - [ ] **Verifica compatibilità HDR e Apple XDR per client compatibili**:
   - Analizzare il supporto per display HDR / Apple XDR (Pro Display XDR, MacBook Pro Liquid Retina XDR, iPad Pro con pannelli Ultra Retina / Tandem OLED o Mini-LED).
   - Valutare l'acquisizione ScreenCaptureKit in spazio colore wide/HDR (ad es. `colorMatrix` / `pixelFormat` 10-bit come `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` o `kCVPixelFormatType_420YpCbCr10BiPlanarFullRange`, spazio colori Rec.2100 / Display P3 / HDR10 o HLG).
