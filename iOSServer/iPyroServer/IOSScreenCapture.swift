@@ -1,0 +1,385 @@
+import CoreImage
+import CoreMedia
+import CoreVideo
+import Foundation
+import Metal
+import ReplayKit
+#if canImport(ScreenCaptureKit)
+import ScreenCaptureKit
+#endif
+
+@MainActor
+final class IOSScreenCaptureCoordinator: NSObject {
+    private let recorder = RPScreenRecorder.shared()
+    private let converter = IOSNV12Converter()
+    private var continuation: AsyncStream<IOSSendablePixelBuffer>.Continuation?
+    private var isCapturing = false
+    private var scPickerCoordinator: AnyObject?
+
+    func start(width: Int, height: Int) async throws -> AsyncStream<IOSSendablePixelBuffer> {
+        let targetWidth = max(width, 2) & ~1
+        let targetHeight = max(height, 2) & ~1
+
+        #if canImport(ScreenCaptureKit)
+        if #available(iOS 27.0, *) {
+            let pickerCoordinator = IOSScreenCaptureKitCoordinator(converter: converter)
+            self.scPickerCoordinator = pickerCoordinator
+            do {
+                let stream = try await pickerCoordinator.start(width: targetWidth, height: targetHeight)
+                isCapturing = true
+                return stream
+            } catch {
+                self.scPickerCoordinator = nil
+                if error is CancellationError {
+                    throw error
+                }
+                // Fall back to ReplayKit in-app screen capture if SCContentSharingPicker is unavailable.
+            }
+        }
+        #endif
+
+        guard recorder.isAvailable else {
+            throw NSError(
+                domain: "PyroWaveServer",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "ReplayKit screen capture is not available on this device"]
+            )
+        }
+        if recorder.isRecording {
+            try? await stopCaptureInternal()
+        }
+
+        let (stream, continuation) = AsyncStream<IOSSendablePixelBuffer>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        self.continuation = continuation
+        self.recorder.isMicrophoneEnabled = false
+
+        let converter = self.converter
+        try await withCheckedThrowingContinuation { (startCont: CheckedContinuation<Void, Error>) in
+            recorder.startCapture(
+                handler: { sampleBuffer, sampleType, error in
+                    guard error == nil,
+                          sampleType == .video,
+                          let sourceBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+                          let normalized = converter.normalizeToNV12(
+                              sourceBuffer,
+                              targetWidth: targetWidth,
+                              targetHeight: targetHeight
+                          ) else {
+                        return
+                    }
+                    continuation.yield(IOSSendablePixelBuffer(buffer: normalized))
+                },
+                completionHandler: { error in
+                    if let error {
+                        startCont.resume(throwing: error)
+                    } else {
+                        startCont.resume(returning: ())
+                    }
+                }
+            )
+        }
+
+        isCapturing = true
+        return stream
+    }
+
+    func stop() async {
+        #if canImport(ScreenCaptureKit)
+        if #available(iOS 27.0, *), let pickerCoordinator = scPickerCoordinator as? IOSScreenCaptureKitCoordinator {
+            scPickerCoordinator = nil
+            await pickerCoordinator.stop()
+        }
+        #endif
+        if isCapturing || recorder.isRecording {
+            try? await stopCaptureInternal()
+        }
+        isCapturing = false
+        continuation?.finish()
+        continuation = nil
+    }
+
+    private func stopCaptureInternal() async throws {
+        guard recorder.isRecording else { return }
+        try await withCheckedThrowingContinuation { (stopCont: CheckedContinuation<Void, Error>) in
+            recorder.stopCapture { error in
+                if let error {
+                    stopCont.resume(throwing: error)
+                } else {
+                    stopCont.resume(returning: ())
+                }
+            }
+        }
+    }
+}
+
+#if canImport(ScreenCaptureKit)
+@available(iOS 27.0, *)
+@MainActor
+private final class IOSScreenCaptureKitCoordinator: NSObject, SCContentSharingPickerObserver, SCStreamDelegate {
+    private let picker = SCContentSharingPicker.shared
+    private let outputQueue = DispatchQueue(label: "com.pyrowavecast.ios.capture-output", qos: .userInteractive)
+    private let converter: IOSNV12Converter
+    private var captureStream: SCStream?
+    private var output: IOSScreenOutput?
+    private var continuation: AsyncStream<IOSSendablePixelBuffer>.Continuation?
+    private var outputStream: AsyncStream<IOSSendablePixelBuffer>?
+    private var startContinuation: CheckedContinuation<AsyncStream<IOSSendablePixelBuffer>, Error>?
+    private var requestedWidth = 1920
+    private var requestedHeight = 1080
+
+    init(converter: IOSNV12Converter) {
+        self.converter = converter
+        super.init()
+    }
+
+    func start(width: Int, height: Int) async throws -> AsyncStream<IOSSendablePixelBuffer> {
+        requestedWidth = max(width, 2) & ~1
+        requestedHeight = max(height, 2) & ~1
+        let (stream, continuation) = AsyncStream<IOSSendablePixelBuffer>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        outputStream = stream
+        self.continuation = continuation
+
+        picker.isActive = true
+        var pickerConfiguration = picker.defaultConfiguration
+        pickerConfiguration.showsMicrophoneControl = false
+        picker.defaultConfiguration = pickerConfiguration
+        picker.add(self)
+
+        return try await withCheckedThrowingContinuation { continuation in
+            startContinuation = continuation
+            picker.present()
+        }
+    }
+
+    func stop() async {
+        picker.remove(self)
+        picker.isActive = false
+        if let captureStream, captureStream.isCapturing {
+            try? await captureStream.stopCapture()
+        }
+        captureStream = nil
+        output = nil
+        continuation?.finish()
+        continuation = nil
+        outputStream = nil
+        startContinuation?.resume(throwing: CancellationError())
+        startContinuation = nil
+    }
+
+    nonisolated func contentSharingPicker(
+        _ picker: SCContentSharingPicker,
+        didUpdateWith filter: SCContentFilter,
+        for stream: SCStream?
+    ) {
+        let selection = IOSPickerSelection(filter: filter, stream: stream)
+        Task { @MainActor [weak self] in
+            await self?.startSelectedCapture(selection)
+        }
+    }
+
+    private func startSelectedCapture(_ selection: IOSPickerSelection) async {
+        do {
+            let configuration = SCStreamConfiguration()
+            configuration.width = requestedWidth
+            configuration.height = requestedHeight
+            let selectedStream = selection.stream ?? SCStream(
+                filter: selection.filter,
+                configuration: configuration,
+                delegate: self
+            )
+            let converter = self.converter
+            let frameContinuation = self.continuation
+            let targetWidth = self.requestedWidth
+            let targetHeight = self.requestedHeight
+            let frameOutput = IOSScreenOutput { sampleBuffer in
+                guard let sourceBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+                      let normalized = converter.normalizeToNV12(
+                          sourceBuffer,
+                          targetWidth: targetWidth,
+                          targetHeight: targetHeight
+                      ) else { return }
+                frameContinuation?.yield(IOSSendablePixelBuffer(buffer: normalized))
+            }
+            try selectedStream.addStreamOutput(
+                frameOutput,
+                type: .screen,
+                sampleHandlerQueue: outputQueue
+            )
+            if !selectedStream.isCapturing {
+                try await selectedStream.startCapture()
+            }
+            captureStream = selectedStream
+            output = frameOutput
+            if let result = startContinuation {
+                startContinuation = nil
+                result.resume(returning: outputStream!)
+            }
+        } catch {
+            startContinuation?.resume(throwing: error)
+            startContinuation = nil
+        }
+    }
+
+    nonisolated func contentSharingPicker(
+        _ picker: SCContentSharingPicker,
+        didCancelFor stream: SCStream?
+    ) {
+        Task { @MainActor [weak self] in
+            self?.startContinuation?.resume(throwing: CancellationError())
+            self?.startContinuation = nil
+        }
+    }
+
+    nonisolated func contentSharingPickerStartDidFailWithError(_ error: Error) {
+        Task { @MainActor [weak self] in
+            self?.startContinuation?.resume(throwing: error)
+            self?.startContinuation = nil
+        }
+    }
+
+    nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        Task { @MainActor [weak self] in
+            self?.continuation?.finish()
+            self?.continuation = nil
+            self?.captureStream = nil
+        }
+    }
+}
+
+@available(iOS 27.0, *)
+private struct IOSPickerSelection: @unchecked Sendable {
+    let filter: SCContentFilter
+    let stream: SCStream?
+}
+
+@available(iOS 27.0, *)
+private final class IOSScreenOutput: NSObject, SCStreamOutput, @unchecked Sendable {
+    private let handler: @Sendable (CMSampleBuffer) -> Void
+
+    init(handler: @escaping @Sendable (CMSampleBuffer) -> Void) {
+        self.handler = handler
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of type: SCStreamOutputType
+    ) {
+        guard type == .screen else { return }
+        handler(sampleBuffer)
+    }
+}
+#endif
+
+private final class IOSNV12Converter: @unchecked Sendable {
+    private let context: CIContext? = MTLCreateSystemDefaultDevice().map { CIContext(mtlDevice: $0) }
+    private let lock = NSLock()
+    private var pool: CVPixelBufferPool?
+    private var poolWidth = 0
+    private var poolHeight = 0
+
+    func normalizeToNV12(_ source: CVPixelBuffer, targetWidth: Int, targetHeight: Int) -> CVPixelBuffer? {
+        let srcWidth = CVPixelBufferGetWidth(source)
+        let srcHeight = CVPixelBufferGetHeight(source)
+        let format = CVPixelBufferGetPixelFormatType(source)
+
+        // Ensure the buffer is a genuine 2-plane IOSurface with exact even Y and UV
+        // dimensions before passing it directly; ReplayKit buffers with odd dimensions
+        // or padded plane heights must be normalized into a clean NV12 IOSurface.
+        if (format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+           srcWidth >= 2, srcHeight >= 2,
+           srcWidth.isMultiple(of: 2),
+           srcHeight.isMultiple(of: 2),
+           let surfaceRef = CVPixelBufferGetIOSurface(source) {
+            let surface = surfaceRef.takeUnretainedValue()
+            if IOSurfaceGetPlaneCount(surface) == 2,
+               IOSurfaceGetWidthOfPlane(surface, 0) == srcWidth,
+               IOSurfaceGetHeightOfPlane(surface, 0) == srcHeight,
+               IOSurfaceGetWidthOfPlane(surface, 1) == srcWidth / 2,
+               IOSurfaceGetHeightOfPlane(surface, 1) == srcHeight / 2 {
+                return source
+            }
+        }
+
+        let width = (srcWidth > 0 ? srcWidth : targetWidth) & ~1
+        let height = (srcHeight > 0 ? srcHeight : targetHeight) & ~1
+        guard width >= 2, height >= 2, let context else { return nil }
+
+        guard let destination = allocateBuffer(width: width, height: height) else { return nil }
+
+        var input = CIImage(cvPixelBuffer: source)
+        let extent = input.extent
+        if Int(extent.width) != width || Int(extent.height) != height,
+           extent.width > 0, extent.height > 0 {
+            input = input.transformed(by: CGAffineTransform(
+                scaleX: CGFloat(width) / extent.width,
+                y: CGFloat(height) / extent.height
+            ))
+        }
+        context.render(
+            input,
+            to: destination,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
+        return destination
+    }
+
+    private func allocateBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if pool == nil || poolWidth != width || poolHeight != height {
+            pool = nil
+            let poolAttrs: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 4
+            ]
+            let bufferAttrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                kCVPixelBufferMetalCompatibilityKey: true
+            ]
+            var newPool: CVPixelBufferPool?
+            if CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttrs as CFDictionary,
+                bufferAttrs as CFDictionary,
+                &newPool
+            ) == kCVReturnSuccess {
+                pool = newPool
+                poolWidth = width
+                poolHeight = height
+            }
+        }
+
+        if let pool {
+            var pixelBuffer: CVPixelBuffer?
+            if CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
+               let pixelBuffer {
+                return pixelBuffer
+            }
+        }
+
+        var destination: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            kCVPixelBufferMetalCompatibilityKey: true
+        ]
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            attributes as CFDictionary,
+            &destination
+        ) == kCVReturnSuccess else { return nil }
+        return destination
+    }
+}

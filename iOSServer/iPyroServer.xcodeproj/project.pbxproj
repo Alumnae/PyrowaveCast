@@ -1,0 +1,114 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		200000000000000000000101 /* WireProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000101 /* WireProtocol.swift */; };
+		200000000000000000000102 /* TestContentRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000102 /* TestContentRenderer.swift */; };
+		200000000000000000000103 /* TestVideoSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000103 /* TestVideoSource.swift */; };
+		200000000000000000000104 /* UpstreamMetalEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000104 /* UpstreamMetalEncoder.swift */; };
+		200000000000000000000106 /* SPPWAudioInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000106 /* SPPWAudioInput.swift */; };
+		200000000000000000000107 /* SPPWForwardErrorCorrection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000107 /* SPPWForwardErrorCorrection.swift */; };
+		200000000000000000000108 /* SPPWFrameAssembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000108 /* SPPWFrameAssembler.swift */; };
+		200000000000000000000109 /* SPPWTransportSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000109 /* SPPWTransportSupport.swift */; };
+		200000000000000000000201 /* pyrowave_common.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000201 /* pyrowave_common.mm */; };
+		200000000000000000000202 /* pyrowave_encoder.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000202 /* pyrowave_encoder.mm */; };
+		200000000000000000000203 /* pyrowave_decoder.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000203 /* pyrowave_decoder.mm */; };
+		200000000000000000000204 /* pyrowave_bitstream.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000204 /* pyrowave_bitstream.cpp */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000001 /* Pyrowavecast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Pyrowavecast.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000101 /* WireProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireProtocol.swift; sourceTree = "<group>"; };
+		100000000000000000000102 /* TestContentRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestContentRenderer.swift; sourceTree = "<group>"; };
+		100000000000000000000103 /* TestVideoSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestVideoSource.swift; sourceTree = "<group>"; };
+		100000000000000000000104 /* UpstreamMetalEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpstreamMetalEncoder.swift; sourceTree = "<group>"; };
+		100000000000000000000106 /* SPPWAudioInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SPPWAudioInput.swift; sourceTree = "<group>"; };
+		100000000000000000000107 /* SPPWForwardErrorCorrection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SPPWForwardErrorCorrection.swift; sourceTree = "<group>"; };
+		100000000000000000000108 /* SPPWFrameAssembler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SPPWFrameAssembler.swift; sourceTree = "<group>"; };
+		100000000000000000000109 /* SPPWTransportSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SPPWTransportSupport.swift; sourceTree = "<group>"; };
+		100000000000000000000201 /* pyrowave_common.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = src/pyrowave_common.mm; sourceTree = "<group>"; };
+		100000000000000000000202 /* pyrowave_encoder.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = src/pyrowave_encoder.mm; sourceTree = "<group>"; };
+		100000000000000000000203 /* pyrowave_decoder.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = src/pyrowave_decoder.mm; sourceTree = "<group>"; };
+		100000000000000000000204 /* pyrowave_bitstream.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = src/pyrowave_bitstream.cpp; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		700000000000000000000001 /* App folder special files */ = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (Info.plist, iPyroServer.entitlements,); target = 500000000000000000000001 /* iPyroServer */; };
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		300000000000000000000001 /* iPyroServer */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (700000000000000000000001 /* App folder special files */,); explicitFileTypes = {}; explicitFolders = (); path = iPyroServer; sourceTree = "<group>"; };
+		300000000000000000000002 /* PyrowaveKit sources */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (); explicitFileTypes = {}; explicitFolders = (); path = ../Sources/PyrowaveKit; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		400000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		000000000000000000000001 = {isa = PBXGroup; children = (300000000000000000000001 /* iPyroServer */, 300000000000000000000002 /* PyrowaveKit sources */, 000000000000000000000002 /* Shared server sources */, 000000000000000000000005 /* SPPWCommon sources */, 000000000000000000000003 /* PyroWave Metal sources */, 000000000000000000000004 /* Products */,); sourceTree = "<group>"; };
+		000000000000000000000002 /* Shared server sources */ = {isa = PBXGroup; children = (100000000000000000000101 /* WireProtocol.swift */, 100000000000000000000102 /* TestContentRenderer.swift */, 100000000000000000000103 /* TestVideoSource.swift */, 100000000000000000000104 /* UpstreamMetalEncoder.swift */,); path = ../Sources/PyrowaveServerKit; sourceTree = "<group>"; };
+		000000000000000000000003 /* PyroWave Metal sources */ = {isa = PBXGroup; children = (100000000000000000000201 /* pyrowave_common.mm */, 100000000000000000000202 /* pyrowave_encoder.mm */, 100000000000000000000203 /* pyrowave_decoder.mm */, 100000000000000000000204 /* pyrowave_bitstream.cpp */,); path = ../Vendor/pyrowave-metal; sourceTree = "<group>"; };
+		000000000000000000000004 /* Products */ = {isa = PBXGroup; children = (100000000000000000000001 /* Pyrowavecast.app */,); name = Products; sourceTree = "<group>"; };
+		000000000000000000000005 /* SPPWCommon sources */ = {isa = PBXGroup; children = (100000000000000000000106 /* SPPWAudioInput.swift */, 100000000000000000000107 /* SPPWForwardErrorCorrection.swift */, 100000000000000000000108 /* SPPWFrameAssembler.swift */, 100000000000000000000109 /* SPPWTransportSupport.swift */,); path = ../Sources/SPPWCommon; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		500000000000000000000001 /* iPyroServer */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 600000000000000000000002 /* Build configuration list for PBXNativeTarget "iPyroServer" */;
+			buildPhases = (400000000000000000000002 /* Sources */, 400000000000000000000001 /* Frameworks */, 400000000000000000000003 /* Resources */,);
+			buildRules = ();
+			dependencies = ();
+			fileSystemSynchronizedGroups = (300000000000000000000001 /* iPyroServer */, 300000000000000000000002 /* PyrowaveKit sources */,);
+			name = iPyroServer;
+			productName = Pyrowavecast;
+			productReference = 100000000000000000000001 /* Pyrowavecast.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		500000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2720; LastUpgradeCheck = 2720; TargetAttributes = {500000000000000000000001 = {CreatedOnToolsVersion = 27.2; };};};
+			buildConfigurationList = 600000000000000000000001 /* Build configuration list for PBXProject "iPyroServer" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base, it, "zh-Hans", fr, de, ja, es,);
+			mainGroup = 000000000000000000000001;
+			productRefGroup = 000000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (500000000000000000000001 /* iPyroServer */,);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		400000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		400000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (200000000000000000000101 /* WireProtocol.swift in Sources */, 200000000000000000000102 /* TestContentRenderer.swift in Sources */, 200000000000000000000103 /* TestVideoSource.swift in Sources */, 200000000000000000000104 /* UpstreamMetalEncoder.swift in Sources */, 200000000000000000000106 /* SPPWAudioInput.swift in Sources */, 200000000000000000000107 /* SPPWForwardErrorCorrection.swift in Sources */, 200000000000000000000108 /* SPPWFrameAssembler.swift in Sources */, 200000000000000000000109 /* SPPWTransportSupport.swift in Sources */, 200000000000000000000201 /* pyrowave_common.mm in Sources */, 200000000000000000000202 /* pyrowave_encoder.mm in Sources */, 200000000000000000000203 /* pyrowave_decoder.mm in Sources */, 200000000000000000000204 /* pyrowave_bitstream.cpp in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		610000000000000000000001 /* Debug project settings */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_CXX_LANGUAGE_STANDARD = "gnu++20"; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0;}; name = Debug; };
+		610000000000000000000002 /* Release project settings */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_CXX_LANGUAGE_STANDARD = "gnu++20"; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0;}; name = Release; };
+		610000000000000000000003 /* Debug app settings */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = iPyroServer/iPyroServer.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = ("$(inherited)", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/include", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/src", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/src/shaders",); INFOPLIST_FILE = "$(PROJECT_DIR)/iPyroServer/Info.plist"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; OTHER_LDFLAGS = ("$(inherited)", "-framework", Metal, "-framework", IOSurface, "-framework", CoreVideo, "-framework", CoreMedia, "-framework", CoreGraphics, "-framework", CoreText, "-framework", ImageIO, "-framework", AVFoundation, "-framework", ReplayKit, "-weak_framework", ScreenCaptureKit, "-framework", PhotosUI,); PRODUCT_BUNDLE_IDENTIFIER = com.pyrowavecast.ios; PRODUCT_NAME = Pyrowavecast; SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Vendor/pyrowave-metal/include/pyrowave_metal.h"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2";}; name = Debug; };
+		610000000000000000000004 /* Release app settings */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = iPyroServer/iPyroServer.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = ("$(inherited)", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/include", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/src", "$(PROJECT_DIR)/../Vendor/pyrowave-metal/src/shaders",); INFOPLIST_FILE = "$(PROJECT_DIR)/iPyroServer/Info.plist"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; OTHER_LDFLAGS = ("$(inherited)", "-framework", Metal, "-framework", IOSurface, "-framework", CoreVideo, "-framework", CoreMedia, "-framework", CoreGraphics, "-framework", CoreText, "-framework", ImageIO, "-framework", AVFoundation, "-framework", ReplayKit, "-weak_framework", ScreenCaptureKit, "-framework", PhotosUI,); PRODUCT_BUNDLE_IDENTIFIER = com.pyrowavecast.ios; PRODUCT_NAME = Pyrowavecast; SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Vendor/pyrowave-metal/include/pyrowave_metal.h"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2";}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		600000000000000000000001 /* Build configuration list for PBXProject "iPyroServer" */ = {isa = XCConfigurationList; buildConfigurations = (610000000000000000000001 /* Debug project settings */, 610000000000000000000002 /* Release project settings */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		600000000000000000000002 /* Build configuration list for PBXNativeTarget "iPyroServer" */ = {isa = XCConfigurationList; buildConfigurations = (610000000000000000000003 /* Debug app settings */, 610000000000000000000004 /* Release app settings */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 500000000000000000000002 /* Project object */;
+}

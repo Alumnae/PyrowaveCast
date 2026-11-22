@@ -1,0 +1,14 @@
+/.build
+/.pyrowave-results
+.swiftpm
+.DS_Store
+.workbuddy-ai/
+build/
+PyroWave.app/
+*.ipa
+Products/
+
+# Xcode personal/generated state
+*.xcuserdata/
+xcuserdata/
+DerivedData/
