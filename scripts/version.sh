@@ -12,7 +12,8 @@
 #   pyrowave_parse_build_args "$@"   # sets PYROWAVE_BUMP_MODE and PYROWAVE_OUT_ARG
 #   pyrowave_apply_version "$ROOT" "$PYROWAVE_BUMP_MODE"
 #   # Exports: PYROWAVE_VERSION (e.g. 0.5.1), PYROWAVE_BUILD_NUMBER (e.g. 501),
-#   #          PYROWAVE_VERSION_TAG (e.g. v0.5.1-build501)
+#   #          PYROWAVE_COMMIT (e.g. c778763), PYROWAVE_BUILD_VERSION_TEXT (e.g. v0.5.1 (build 501, c778763)),
+#   #          PYROWAVE_VERSION_TAG (e.g. v0.5.1-build501-c778763)
 #
 # Usage standalone:
 #   bash scripts/version.sh [patch|minor|major-fix|major|none]
@@ -101,21 +102,52 @@ pyrowave_apply_version() {
             ;;
     esac
 
+    local commit
+    commit="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo "")"
+    PYROWAVE_COMMIT="${commit}"
     PYROWAVE_VERSION="${major}.${minor}.${patch}"
     PYROWAVE_BUILD_NUMBER=$((major * 10000 + minor * 100 + patch))
-    PYROWAVE_VERSION_TAG="v${PYROWAVE_VERSION}-build${PYROWAVE_BUILD_NUMBER}"
-    export PYROWAVE_VERSION PYROWAVE_BUILD_NUMBER PYROWAVE_VERSION_TAG
+    if [[ -n "$PYROWAVE_COMMIT" ]]; then
+        PYROWAVE_VERSION_TAG="v${PYROWAVE_VERSION}-build${PYROWAVE_BUILD_NUMBER}-${PYROWAVE_COMMIT}"
+        PYROWAVE_BUILD_VERSION_TEXT="v${PYROWAVE_VERSION} (build ${PYROWAVE_BUILD_NUMBER}, ${PYROWAVE_COMMIT})"
+    else
+        PYROWAVE_VERSION_TAG="v${PYROWAVE_VERSION}-build${PYROWAVE_BUILD_NUMBER}"
+        PYROWAVE_BUILD_VERSION_TEXT="v${PYROWAVE_VERSION} (build ${PYROWAVE_BUILD_NUMBER})"
+    fi
+    export PYROWAVE_VERSION PYROWAVE_BUILD_NUMBER PYROWAVE_COMMIT PYROWAVE_VERSION_TAG PYROWAVE_BUILD_VERSION_TEXT
 
     printf '%s\n' "$PYROWAVE_VERSION" > "$version_file"
 
-    # Keep the iOS Xcode project's Info.plist synchronized with VERSION.
-    local ios_plist="$root/iOSServer/iPyroServer/Info.plist"
+    # Keep the iOS Xcode project's Info.plist synchronized with VERSION and commit.
+    local ios_plist="$root/PyrowaveCastiOS/PyrowaveCastiOS/Info.plist"
     if [[ -f "$ios_plist" && -x /usr/libexec/PlistBuddy ]]; then
-        /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PYROWAVE_VERSION" "$ios_plist"
-        /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $PYROWAVE_BUILD_NUMBER" "$ios_plist"
+        /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PYROWAVE_VERSION" "$ios_plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $PYROWAVE_VERSION" "$ios_plist"
+        /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $PYROWAVE_BUILD_NUMBER" "$ios_plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $PYROWAVE_BUILD_NUMBER" "$ios_plist"
+        if [[ -n "$PYROWAVE_COMMIT" ]]; then
+            /usr/libexec/PlistBuddy -c "Set :PyrowaveGitCommit $PYROWAVE_COMMIT" "$ios_plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :PyrowaveGitCommit string $PYROWAVE_COMMIT" "$ios_plist"
+            /usr/libexec/PlistBuddy -c "Set :PyrowaveBuildVersion \"$PYROWAVE_BUILD_VERSION_TEXT\"" "$ios_plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :PyrowaveBuildVersion string \"$PYROWAVE_BUILD_VERSION_TEXT\"" "$ios_plist"
+        fi
     fi
 
-    echo "==> Version: $PYROWAVE_VERSION (build $PYROWAVE_BUILD_NUMBER, mode: $mode)"
+    # Keep fallback constants in SPPWTransportSupport.swift synchronized if present.
+    local transport_file="$root/Sources/SPPWCommon/SPPWTransportSupport.swift"
+    if [[ -f "$transport_file" ]]; then
+        sed -i '' -e "s/public static let fallbackVersion = \".*\"/public static let fallbackVersion = \"$PYROWAVE_VERSION\"/" "$transport_file" 2>/dev/null || true
+        sed -i '' -e "s/public static let fallbackBuildNumber = \".*\"/public static let fallbackBuildNumber = \"$PYROWAVE_BUILD_NUMBER\"/" "$transport_file" 2>/dev/null || true
+        if [[ -n "$PYROWAVE_COMMIT" ]]; then
+            sed -i '' -e "s/public static let fallbackCommit = \".*\"/public static let fallbackCommit = \"$PYROWAVE_COMMIT\"/" "$transport_file" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -n "$PYROWAVE_COMMIT" ]]; then
+        echo "==> Version: $PYROWAVE_VERSION (build $PYROWAVE_BUILD_NUMBER, commit $PYROWAVE_COMMIT, mode: $mode)"
+    else
+        echo "==> Version: $PYROWAVE_VERSION (build $PYROWAVE_BUILD_NUMBER, mode: $mode)"
+    fi
 }
 
 # Allow standalone invocation: bash scripts/version.sh [mode]

@@ -54,6 +54,30 @@ final class IOSServerModel: ObservableObject {
     @Published private(set) var status = StreamStatus()
     @Published private(set) var logs: [ServerLogEntry] = []
     @Published private(set) var previewPixelBuffer: CVPixelBuffer?
+    /// Audio sources read from the system (none, app/system audio, audio inputs).
+    @Published private(set) var audioSources: [SPPWAudioSourceOption] = SPPWAudioSourceCatalog.availableSources()
+    /// Persisted choice (`SPPWAudioSourceOption.id`); applies to screen capture, read at start.
+    @Published var audioSourceID: String = UserDefaults.standard.string(forKey: "iosServerAudioSource") ?? SPPWAudioSourceOption.system.id {
+        didSet { UserDefaults.standard.set(audioSourceID, forKey: "iosServerAudioSource") }
+    }
+    /// Input volume 0...2 (100% = unchanged); applied live, also to video file audio.
+    @Published var audioInputVolume: Double = UserDefaults.standard.object(forKey: "iosServerAudioInputVolume") as? Double ?? 1 {
+        didSet {
+            UserDefaults.standard.set(audioInputVolume, forKey: "iosServerAudioInputVolume")
+            server?.setAudioInputGain(Float(audioInputVolume))
+        }
+    }
+    private var microphone: SPPWMicrophoneCapture?
+    /// Extra background time + diagnostics while the server runs.
+    private var backgroundGuard: IOSBackgroundStreamingGuard?
+
+    func refreshAudioSources() {
+        audioSources = SPPWAudioSourceCatalog.availableSources()
+        if !audioSources.contains(where: { $0.id == audioSourceID }) {
+            audioSourceID = SPPWAudioSourceOption.system.id
+        }
+    }
+
     @Published var previewEnabled: Bool = UserDefaults.standard.object(forKey: "iosServerPreviewEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(previewEnabled, forKey: "iosServerPreviewEnabled")
@@ -112,6 +136,7 @@ final class IOSServerModel: ObservableObject {
             source: selectedSource,
             screenResolution: serverScreenResolution,
             previewEnabled: previewEnabled,
+            audioInputGain: Float(audioInputVolume),
             logHandler: { [weak self] entry in
                 Task { @MainActor in self?.append(entry) }
             },
@@ -135,6 +160,11 @@ final class IOSServerModel: ObservableObject {
                 }
                 try await instance.start(port: UInt16(self.port))
                 self.isRunning = true
+                // No auto-lock while serving; a locked device suspends the app and the stream.
+                IOSKeepAwake.shared.acquire(.server)
+                self.backgroundGuard = IOSBackgroundStreamingGuard { [weak self] message, isError in
+                    self?.append(ServerLogEntry(id: 0, timestamp: Date(), text: message, isError: isError))
+                }
                 self.startStatusPolling(for: instance)
                 self.append(ServerLogEntry(
                     id: 0,
@@ -148,10 +178,34 @@ final class IOSServerModel: ObservableObject {
                     let capture = IOSScreenCaptureCoordinator()
                     self.screenCapture = capture
                     do {
+                        let audioKind = SPPWAudioSourceCatalog.source(withID: self.audioSourceID, in: self.audioSources).kind
+                        let systemAudioHandler: (@Sendable (CMSampleBuffer) -> Void)?
+                        if audioKind == .system {
+                            systemAudioHandler = { sampleBuffer in instance.ingestAudio(sampleBuffer) }
+                        } else {
+                            systemAudioHandler = nil
+                        }
                         let frames = try await capture.start(
                             width: serverScreenResolution.width,
-                            height: serverScreenResolution.height
+                            height: serverScreenResolution.height,
+                            audioHandler: systemAudioHandler
                         )
+                        if case .input(let portUID) = audioKind {
+                            let microphone = SPPWMicrophoneCapture()
+                            do {
+                                try microphone.start(portUID: portUID) { buffer, capturedAt in
+                                    instance.ingestAudio(pcmBuffer: buffer, captureNanoseconds: capturedAt)
+                                }
+                                self.microphone = microphone
+                            } catch {
+                                self.append(ServerLogEntry(
+                                    id: 0,
+                                    timestamp: Date(),
+                                    text: "Microphone capture failed: \(error.localizedDescription)",
+                                    isError: true
+                                ))
+                            }
+                        }
                         await instance.setScreenFrameStream(frames)
                         self.append(ServerLogEntry(
                             id: 0,
@@ -171,6 +225,9 @@ final class IOSServerModel: ObservableObject {
                 self.isStartingScreenCapture = false
                 self.errorMessage = error.localizedDescription
                 self.isRunning = false
+                self.backgroundGuard?.invalidate()
+                self.backgroundGuard = nil
+                IOSKeepAwake.shared.release(.server)
             }
         }
     }
@@ -188,6 +245,11 @@ final class IOSServerModel: ObservableObject {
             self.screenCapture = nil
             Task { await capture.stop() }
         }
+        microphone?.stop()
+        microphone = nil
+        backgroundGuard?.invalidate()
+        backgroundGuard = nil
+        IOSKeepAwake.shared.release(.server)
     }
 
     func acceptFile(_ url: URL, for targetMode: Mode? = nil) {

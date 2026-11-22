@@ -1059,13 +1059,11 @@ pyrowave_result wrap_gpu_input(pyrowave_encoder encoder, const pyrowave_gpu_inpu
 
 	if (biplanar)
 	{
-		if (!chroma_420)
-		{
-			device->log("Biplanar NV12 input has half resolution chroma, "
-			            "so it cannot feed a 4:4:4 encoder.");
-			return PYROWAVE_ERROR_INVALID_ARGUMENT;
-		}
-
+		// PyrowaveKit: biplanar input is accepted for both layouts. Under 4:2:0 the
+		// chroma plane is half resolution (NV12 / P010); under 4:4:4 it is full
+		// resolution ('444f' / 'xf44', e.g. ScreenCaptureKit's 10-bit 4:4:4 output).
+		// plane_matches() below checks the chroma plane against the encoder's layout,
+		// so a mismatched surface is still rejected. The bitstream is unchanged.
 		if (IOSurfaceGetPlaneCount(surface(0)) != 2)
 		{
 			device->log("Expected a biplanar surface in planes[0], but it has %zu planes.",

@@ -7,8 +7,7 @@ The port is intentionally native: Swift Package Manager, Metal compute, CoreVide
 ## Requirements
 
 - macOS 14 or newer (Swift 6 toolchain, Metal-capable Apple GPU)
-- iOS 17 or newer for the iOS app (`iOSServer/iPyroServer.xcodeproj`)
-- visionOS 1.1+ package target support
+- iOS 17 or newer for the iOS app (`PyrowaveCastiOS/PyrowaveCastiOS.xcodeproj`)
 - VideoToolbox-capable Apple platform runtime for HEVC comparison benchmarks
 
 ## Architecture & Targets
@@ -43,7 +42,13 @@ See [PROTOCOL.md](PROTOCOL.md) for the full wire specification (datagram header 
 - **Resilient low-latency decode:** Unrecoverable LL loss drops stale frames immediately; when LL is intact and trailing HF packets are lost, Metal decodes the valid prefix with zeroed HF coefficients.
 - **Socket tuning & pacing:** POSIX dual-stack UDP with `SO_SNDBUF`/`SO_RCVBUF` sizing, DSCP CS4 (`AC_VI`), `mach_wait_until` micro-burst pacing, and EWMA adaptive Wi-Fi jitter buffering.
 - **Closed-loop adaptive bitrate (ABR):** Evaluates network health every 1 second when `automaticBitrate == true`, steps bitrate down each second during packet loss or jitter, holds ramp-up for $\ge 10$ seconds of clean link, and reverts/locks to the problem-free bitrate if instability persists to avoid oscillation.
-- **Audio & input:** 48 kHz stereo PCM16 audio (`kind = 9`, `AVAudioEngine`) and mouse/scroll/keyboard/touch input forwarding (`kind = 4`, `CGEvent` on macOS).
+- **Audio & input:** 48 kHz stereo PCM16 audio (`kind = 9`, `AVAudioEngine`) from both servers in screen capture mode (macOS ScreenCaptureKit system audio; iOS ScreenCaptureKit audio on iOS 27, ReplayKit app audio otherwise, resampled to 48 kHz) and mouse/scroll/keyboard/touch input forwarding (`kind = 4`, `CGEvent` on macOS).
+- **Server audio controls:** an *Audio source* picker reads the sources from the system — none, system audio, or an input device (macOS microphones via ScreenCaptureKit, macOS 15+; iOS `AVAudioSession` inputs via `AVAudioEngine`) — plus an *Input volume* slider (0–200%, live). In video file mode the file's own audio track is streamed (tapped from `AVPlayer`, silent on the server) on the same timeline as its frames.
+- **Remote control (iOS receiver → macOS server):** keyboard, mouse and clipboard over `SPPW/1`. Committed text from the system keyboard — including IME composition such as Chinese Pinyin, accents and dictation — is sent as Unicode (`.text`) and typed with `CGEventKeyboardSetUnicodeString`, so the Mac's own input source never re-interprets it; special keys, hardware keyboards and shortcuts are sent as macOS virtual key codes with modifier flags (`.key` / atomic `.keyPress`). Trackpad mode sends relative pointer motion (`.pointerDelta`) and clicks at the cursor (`.clickAtCursor`, `.buttonAtCursor`); discrete events travel in a `.sequenced` envelope sent twice and applied once. Clipboard sync (`kind = 10`, UTF-8 text and PNG up to 1 MiB / 8 MiB, chunked with retransmission) runs while the server allows remote control: Mac → iPhone automatically (`NSPasteboard` `changeCount` polling, password-manager items skipped), iPhone → Mac only on an explicit paste (`UIPasteControl`, no permission prompt). iPhone writes are `localOnly`, so Universal Clipboard and the channel never bounce items back and forth. In the iOS receiver's fullscreen view a dock offers trackpad or direct-touch mode, the system keyboard, a special keys sheet (F1–F12, Esc, Mac shortcuts, navigation), a clipboard paste button, sticky ⇧⌃⌥⌘ (tap: next key, double tap: lock) and a right-click toggle; hardware keyboards send key codes with client-side auto-repeat, and iPad mice/trackpads use `GCMouse` with pointer lock. Gestures: one finger moves, tap clicks, two fingers scroll (with momentum), two-finger tap right-clicks, press and hold to drag, three-finger tap shows or hides the controls. Settings → *Remote control* holds touch mode, pointer speed, natural scrolling and clipboard sync. While a receiver shows its own pointer (macOS receiver with remote control on, iOS direct touch) the server leaves the delayed Mac cursor out of the video (`cursorVisibility`). In the macOS receiver's fullscreen, the top-right bar (with an *Exit* button) slides away after 3 s and returns when the pointer reaches the top edge; pressing and releasing ⌃⌥ on its own also leaves fullscreen, while ⌃⌥+key shortcuts still go to the remote Mac.
+- **Client-chosen resolution:** the receiver picks *Native*, *Automatic* or a short-side level (2160p, 1440p, 1080p, 720p, 480p, 360p, 320p); the server derives the exact size from its own aspect ratio and never upscales. *Automatic* steps the level down/up from the adaptive bitrate.
+- **Background resilience:** while streaming, servers and receivers hold a process activity assertion (no App Nap, precise timers, no idle/display sleep while capturing or watching); the macOS server automatically restarts a capture that ScreenCaptureKit stopped; on iOS auto-lock is disabled while the server or receiver is active and background time is requested when the app leaves the foreground.
+- **Lip sync:** video frames and audio packets carry their capture instant on one sender clock. Receivers measure the capture-to-screen video delay (`SPPWAVSyncClock`) and a jitter buffer (`SPPWAudioJitterController`) keeps the audio queue at the depth that matches it — never below a safe minimum, corrected at most every 250 ms by 5–10 ms — so audio follows video without dropouts; video keeps its lowest-latency path.
+- **Chroma 4:2:0 / 4:4:4:** Streams default to 8-bit 4:2:0 (NV12 capture and output). The macOS server can opt into full colour 4:4:4 (GUI toggle "Full color 4:4:4", CLI `--chroma444`): ScreenCaptureKit captures 10-bit `'xf44'`, the vendored encoder codes PyroWave 4:4:4, and receivers read the chroma mode from the PyroWave sequence header and decode to BGRA (BT.709) for `AVSampleBufferDisplayLayer`. No `SPPW/1` change; the iOS server (ReplayKit) stays 4:2:0. 4:4:4 costs roughly twice the samples per frame, so expect higher bitrate and GPU time.
 
 ## Build & Run
 
@@ -57,11 +62,11 @@ swift build
 
 ### Automatic Versioning (`VERSION`)
 
-All macOS and iOS packaging scripts share `VERSION` (via `scripts/version.sh`) and keep `iOSServer/iPyroServer/Info.plist` synchronized automatically:
+All macOS and iOS packaging scripts share `VERSION` (via `scripts/version.sh`) and keep `PyrowaveCastiOS/PyrowaveCastiOS/Info.plist` synchronized automatically:
 
-- Default (`--patch`): increments minor/patch builds (`0.5.x` → `0.5.(x+1)`)
-- Major fixes (`--minor` or `--major-fix`): increments to `0.(x+1).0`
-- Keep current version (`--no-bump` or `PYROWAVE_BUMP=none`): useful when packaging macOS and iOS for the same release
+- **Regola di incremento Z ad ogni build**: ogni volta che viene eseguito un build, la cifra **Z** di `X.Y.Z` viene incrementata (`--patch`: `0.x.z` → `0.x.(z+1)`).
+- Incrementi maggiori (`--minor` o `--major-fix`): avanzano a `0.(x+1).0`.
+- Mantenimento versione (`--no-bump` o `PYROWAVE_BUMP=none`): riservato solo a verifiche o riesecuzioni senza nuova build di rilascio.
 
 ### macOS App Bundles
 
@@ -74,7 +79,7 @@ The packaging scripts build release binaries and embed the required `PyrowaveKit
 ./scripts/build-receiver.sh           # Standalone receiver       -> build/PyrowaveReceiver.app
 ```
 
-Set `PYROWAVE_CODESIGN_IDENTITY` before running `./scripts/build-app.sh` to keep macOS Screen Recording permissions stable across rebuilds.
+`build-app.sh` always signs ad hoc: the repositories are public, so builds never carry a personal signing identity. macOS may ask for the Screen Recording permission again after a rebuild.
 
 ### iOS App
 
@@ -83,10 +88,19 @@ Set `PYROWAVE_CODESIGN_IDENTITY` before running `./scripts/build-app.sh` to keep
 ./scripts/build-ios.sh --no-bump      # Package iOS with the same VERSION as macOS
 ```
 
+### App Icon
+
+The icon source is `Resources/AppIcon/AppIcon.svg`. After editing it, regenerate every derived asset (iOS `AppIcon.appiconset`, the multiplatform Xcode app's `AppIcon.appiconset`, and `Resources/AppIcon/AppIcon.icns` used by the `build-*.sh` macOS bundles via `CFBundleIconFile`):
+
+```shell
+python3 Resources/AppIcon/generate.py   # needs macOS (qlmanage, iconutil) and Pillow
+```
+
 ### CLI Server
 
 ```shell
 swift run -c release pyrowave-server --port 9888
+swift run -c release pyrowave-server --chroma444   # full colour 4:4:4 screen capture
 # Test modes (no Screen Recording permission required):
 swift run -c release pyrowave-server --test
 swift run -c release pyrowave-server --test-image /path/to/image.png
@@ -100,7 +114,7 @@ swift test
 swift test -c release
 ```
 
-Coverage includes packet decoding, wavelet padding/filtering, 4:2:0 and 4:4:4 round trips, rate control, Metal parity checks (`PyrowaveKitTests`), and the `SPPW/1` transport pipeline—Cauchy Reed-Solomon FEC, subband LL boundary inspection, partial-HF assembly, pacing, audio, and input (`SPPWPipelineTests`).
+Coverage includes packet decoding, wavelet padding/filtering, 4:2:0 and 4:4:4 round trips, rate control, Metal parity checks (`PyrowaveKitTests`), and the `SPPW/1` transport pipeline—Cauchy Reed-Solomon FEC, subband LL boundary inspection, partial-HF assembly, pacing, audio, and input (`SPPWPipelineTests`), plus the remote control wire events, keyboard translation, sticky modifiers and clipboard channel (`SPPWRemoteControlTests`).
 
 ## Benchmarks
 

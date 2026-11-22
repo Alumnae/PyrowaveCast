@@ -27,6 +27,14 @@ struct CropNV12Constants {
     uint outputHeight;
 };
 
+struct CropYUV444ToBGRAConstants {
+    uint yPaddedWidth;
+    uint chromaPaddedWidth;
+    uint outputWidth;
+    uint outputHeight;
+    uint limitedRange;
+};
+
 struct PlaneQuantizationDescriptor {
     uint originX;
     uint originY;
@@ -249,6 +257,39 @@ kernel void pyrowave_crop_nv12_textures(
         float cr = clamp(crInput[index] + 0.5f, 0.0f, 1.0f);
         cbCrOutput.write(float4(cb, cr, 0.0f, 1.0f), uint2(x, y));
     }
+}
+
+// 4:4:4 decode output. There is no displayable biplanar 8-bit 4:4:4 format we can
+// rely on for AVSampleBufferDisplayLayer on every platform, so full resolution
+// chroma is converted to BGRA here (BT.709 matrix, the matrix the server captures
+// with), in the same pass that crops the padded iDWT planes.
+kernel void pyrowave_crop_yuv444_to_bgra(
+    device const float *yInput [[buffer(0)]],
+    device const float *cbInput [[buffer(1)]],
+    device const float *crInput [[buffer(2)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    constant CropYUV444ToBGRAConstants &constants [[buffer(3)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.outputWidth || y >= constants.outputHeight) {
+        return;
+    }
+    float luma = clamp(yInput[y * constants.yPaddedWidth + x] + 0.5f, 0.0f, 1.0f);
+    uint chromaIndex = y * constants.chromaPaddedWidth + x;
+    float cb = clamp(cbInput[chromaIndex] + 0.5f, 0.0f, 1.0f) - 0.5f;
+    float cr = clamp(crInput[chromaIndex] + 0.5f, 0.0f, 1.0f) - 0.5f;
+    if (constants.limitedRange != 0u) {
+        luma = (luma - 16.0f / 255.0f) * (255.0f / 219.0f);
+        cb *= 255.0f / 224.0f;
+        cr *= 255.0f / 224.0f;
+    }
+    float r = luma + 1.5748f * cr;
+    float g = luma - 0.1873f * cb - 0.4681f * cr;
+    float b = luma + 1.8556f * cb;
+    // bgra8Unorm texture: the write takes RGBA and the format stores it as BGRA.
+    output.write(float4(saturate(r), saturate(g), saturate(b), 1.0f), position);
 }
 
 kernel void pyrowave_quantize(

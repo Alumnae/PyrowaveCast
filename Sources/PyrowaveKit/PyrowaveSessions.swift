@@ -28,8 +28,28 @@ public struct PyrowaveSessionDescriptor: Equatable, Sendable {
 
     static let supportedPixelFormats: Set<OSType> = [
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        // Decoder output for 4:4:4 streams (BT.709 conversion on the GPU).
+        kCVPixelFormatType_32BGRA
     ]
+
+    /// The decoder output format for a bitstream: NV12 (`420f` / `420v`) for
+    /// 4:2:0 frames, BGRA for 4:4:4 frames. Receivers call this on the first
+    /// frame and whenever they rebuild their session, so a server switching
+    /// chroma mode is followed without any SPPW/1 signalling. Unparseable data
+    /// falls back to NV12.
+    public static func preferredPixelFormat(
+        forBitstream data: Data,
+        yCbCrRange: YCbCrRange = .full
+    ) -> OSType {
+        var reader = BinaryReader(data)
+        if let sequence = try? PyrowaveSequenceHeader(reader: &reader), sequence.chroma == .yuv444 {
+            return kCVPixelFormatType_32BGRA
+        }
+        return yCbCrRange == .limited
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    }
 }
 
 public enum PyrowaveSessionError: Error, Equatable, Sendable, CustomStringConvertible {
@@ -262,6 +282,14 @@ public actor PyrowaveDecoderSession {
                     actualHeight: sequence.height
                 )
             }
+            let wantsBGRA = descriptor.pixelFormat == kCVPixelFormatType_32BGRA
+            guard wantsBGRA == (sequence.chroma == .yuv444) else {
+                // The stream changed chroma mode; the caller rebuilds the session
+                // with `PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream:)`.
+                throw PyrowaveSessionError.recoverableFrameFailure(
+                    .unsupportedFormat("frame chroma does not match the session output format")
+                )
+            }
             let headerEnd = PyrowaveClock.now
             var pixelBuffer: CVPixelBuffer?
             let poolStatus = CVPixelBufferPoolCreatePixelBuffer(nil, outputPool, &pixelBuffer)
@@ -270,7 +298,12 @@ public actor PyrowaveDecoderSession {
             }
             let acquisitionEnd = PyrowaveClock.now
             let output = PyrowavePixelBufferInput(pixelBuffer)
-            let contiguousMetrics = try await codec.decodeContiguousFrame(frame, to: output, allowPartialFrame: allowPartialFrame)
+            let contiguousMetrics = try await codec.decodeContiguousFrame(
+                frame,
+                to: output,
+                allowPartialFrame: allowPartialFrame,
+                limitedRange: descriptor.videoSignal.yCbCrRange == .limited
+            )
             Self.applyVideoSignalAttachments(descriptor.videoSignal, to: pixelBuffer)
             let decodeEnd = PyrowaveClock.now
             return PyrowaveDecodedFrameResult(

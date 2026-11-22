@@ -4,6 +4,7 @@ import SPPWCommon
 public struct ServerContentView: View {
     @EnvironmentObject private var model: ServerModel
     @State private var showScreenPermissionGuide = true
+    @State private var showAccessibilityPermissionGuide = true
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
 
     public init() {}
@@ -226,6 +227,50 @@ public struct ServerContentView: View {
                     }
                 }
 
+                if model.mode == .screen {
+                    Toggle(SPPWLocalization.tr("server.chroma444"), isOn: $model.fullChroma444)
+                        .font(.subheadline)
+                        .help(SPPWLocalization.tr("server.chroma444.help"))
+                        .disabled(model.isRunning)
+
+                    Toggle(SPPWLocalization.tr("server.remote_control"), isOn: $model.remoteControlEnabled)
+                        .font(.subheadline)
+                        .help(SPPWLocalization.tr("server.remote_control.help"))
+                }
+
+                if model.mode == .screen {
+                    HStack {
+                        Picker(SPPWLocalization.tr("audio.source.label"), selection: $model.audioSourceID) {
+                            ForEach(model.audioSources) { source in
+                                Text(source.name).tag(source.id)
+                            }
+                        }
+                        .disabled(model.isRunning)
+                        Button {
+                            model.refreshAudioSources()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                        .help(SPPWLocalization.tr("audio.refresh_sources"))
+                        .disabled(model.isRunning)
+                    }
+                    .font(.subheadline)
+                }
+
+                if model.mode == .screen || model.mode == .video {
+                    HStack {
+                        Image(systemName: model.audioInputVolume == 0 ? "speaker.slash" : "speaker.wave.2")
+                            .foregroundStyle(.secondary)
+                        Text(SPPWLocalization.tr("audio.input_volume"))
+                        Slider(value: $model.audioInputVolume, in: 0...2)
+                        Text("\(Int((model.audioInputVolume * 100).rounded()))%")
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                    .font(.subheadline)
+                }
+
                 Toggle(SPPWLocalization.tr("server.client_preview"), isOn: $model.previewEnabled)
                     .font(.subheadline)
 
@@ -252,6 +297,9 @@ public struct ServerContentView: View {
 
                 if model.mode == .screen {
                     screenCaptureGuidanceCard
+                    if model.remoteControlEnabled {
+                        accessibilityGuidanceCard
+                    }
                 } else {
                     Label(
                         SPPWLocalization.tr("server.test_modes_no_permission"),
@@ -268,10 +316,23 @@ public struct ServerContentView: View {
         }
         .onAppear {
             model.refreshScreenRecordingPermission()
+            model.refreshAccessibilityPermission()
             showScreenPermissionGuide = !model.hasScreenRecordingPermission
+            showAccessibilityPermissionGuide = !model.hasAccessibilityPermission
         }
         .onChange(of: model.hasScreenRecordingPermission) { _, granted in
             if !granted { showScreenPermissionGuide = true }
+        }
+        .onChange(of: model.hasAccessibilityPermission) { _, granted in
+            showAccessibilityPermissionGuide = !granted
+        }
+        .onChange(of: model.remoteControlEnabled) { _, enabled in
+            if enabled {
+                model.refreshAccessibilityPermission()
+                if !model.hasAccessibilityPermission {
+                    showAccessibilityPermissionGuide = true
+                }
+            }
         }
     }
 
@@ -372,6 +433,108 @@ public struct ServerContentView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke((model.hasScreenRecordingPermission ? Color.green : Color.orange).opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private var accessibilityGuidanceCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: model.hasAccessibilityPermission ? "hand.point.up.left.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(model.hasAccessibilityPermission ? .green : .orange)
+                Text(model.hasAccessibilityPermission
+                     ? SPPWLocalization.tr("server.accessibility_permission_active")
+                     : SPPWLocalization.tr("server.accessibility_permission_required"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(model.hasAccessibilityPermission ? .green : .orange)
+                Spacer()
+            }
+
+            if !model.hasAccessibilityPermission {
+                Text(SPPWLocalization.tr("server.accessibility_permission_hint"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            DisclosureGroup(
+                isExpanded: $showAccessibilityPermissionGuide,
+                content: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        guideStep(
+                            number: "1",
+                            text: SPPWLocalization.tr("server.accessibility_guide_step1")
+                        )
+                        guideStep(
+                            number: "2",
+                            text: SPPWLocalization.tr("server.accessibility_guide_step2")
+                        )
+                        guideStep(
+                            number: "3",
+                            text: SPPWLocalization.tr("server.accessibility_guide_step3")
+                        )
+                        guideStep(
+                            number: "4",
+                            text: SPPWLocalization.tr("server.accessibility_guide_step4")
+                        )
+
+                        Divider()
+
+                        VStack(spacing: 6) {
+                            Button {
+                                model.requestAccessibilityPermission()
+                            } label: {
+                                Label(SPPWLocalization.tr("action.request_permission"), systemImage: "hand.raised.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+
+                            Button {
+                                model.openAccessibilitySettings()
+                            } label: {
+                                Label(SPPWLocalization.tr("action.open_system_settings"), systemImage: "gearshape.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            HStack(spacing: 6) {
+                                Button {
+                                    model.revealAppInFinder()
+                                } label: {
+                                    Label(SPPWLocalization.tr("action.show_in_finder"), systemImage: "folder")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                Button {
+                                    model.refreshAccessibilityPermission()
+                                } label: {
+                                    Label(SPPWLocalization.tr("action.verify"), systemImage: "arrow.clockwise")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                },
+                label: {
+                    Text(SPPWLocalization.tr("server.accessibility_guide_title"))
+                        .font(.caption.weight(.medium))
+                }
+            )
+        }
+        .padding(10)
+        .background(
+            (model.hasAccessibilityPermission ? Color.green : Color.orange).opacity(0.1),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke((model.hasAccessibilityPermission ? Color.green : Color.orange).opacity(0.35), lineWidth: 1)
         )
     }
 

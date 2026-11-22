@@ -1,6 +1,14 @@
 import Foundation
 import AVFoundation
 import CoreVideo
+import MediaToolbox
+#if canImport(SPPWCommon)
+import SPPWCommon
+#endif
+
+/// Receives the file's decoded audio: a PCM buffer and the `SPPWCaptureClock` instant at which
+/// it is played, i.e. on the same timeline as the video frames `nextFrame()` returns.
+typealias TestVideoAudioHandler = @Sendable (AVAudioPCMBuffer, UInt64) -> Void
 
 /// Plays a video file and yields its frames as NV12 pixel buffers.
 ///
@@ -18,6 +26,14 @@ final class TestVideoSource: NSObject, @unchecked Sendable {
     private var cachedDurationSeconds: Double = 0
     private var pendingSeekSeconds: Double?
     private var seekGeneration: UInt64 = 0
+    private let audioTap = TestVideoAudioTapContext()
+
+    /// Set to stream the file's audio track. The audio is tapped out of the player (and
+    /// silenced locally, so the server does not play it out loud).
+    var audioHandler: TestVideoAudioHandler? {
+        get { audioTap.handler }
+        set { audioTap.handler = newValue }
+    }
 
     init(url: URL, initialTimeSeconds: Double = 0) throws {
         let asset = AVURLAsset(url: url)
@@ -38,7 +54,10 @@ final class TestVideoSource: NSObject, @unchecked Sendable {
         super.init()
 
         player.actionAtItemEnd = .none
-        player.isMuted = true
+        // The audio tap needs the player to render audio; the tap zeroes it after
+        // copying, so nothing is heard on the server.
+        player.isMuted = false
+        audioTap.item = item
         player.automaticallyWaitsToMinimizeStalling = false
         NotificationCenter.default.addObserver(
             self,
@@ -46,6 +65,13 @@ final class TestVideoSource: NSObject, @unchecked Sendable {
             name: .AVPlayerItemDidPlayToEndTime,
             object: item
         )
+
+        let tapContext = audioTap
+        Task.detached(priority: .utility) { [weak item] in
+            guard let track = try? await asset.loadTracks(withMediaType: .audio).first,
+                  let mix = TestVideoAudioTapContext.makeAudioMix(track: track, context: tapContext) else { return }
+            await MainActor.run { item?.audioMix = mix }
+        }
 
         let assetURL = url
         Task.detached(priority: .utility) { [weak self] in
@@ -212,5 +238,96 @@ final class TestVideoSource: NSObject, @unchecked Sendable {
         at itemTime: CMTime
     ) -> CVPixelBuffer? {
         output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil)
+    }
+}
+
+
+// MARK: - Audio tap
+
+/// Shared state between `TestVideoSource` and its `MTAudioProcessingTap` (render thread).
+final class TestVideoAudioTapContext: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _handler: TestVideoAudioHandler?
+    private var format: AVAudioFormat?
+    weak var item: AVPlayerItem?
+
+    var handler: TestVideoAudioHandler? {
+        get { lock.lock(); defer { lock.unlock() }; return _handler }
+        set { lock.lock(); _handler = newValue; lock.unlock() }
+    }
+
+    fileprivate func setFormat(_ newFormat: AVAudioFormat?) {
+        lock.lock()
+        format = newFormat
+        lock.unlock()
+    }
+
+    /// Hands one rendered slice to the handler. Called on the audio render thread.
+    fileprivate func deliver(bufferList: UnsafeMutablePointer<AudioBufferList>, frames: CMItemCount, mediaStart: CMTime) {
+        lock.lock()
+        let handler = _handler
+        let format = format
+        lock.unlock()
+        guard let handler, let format, frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: bufferList, deallocator: nil) else {
+            return
+        }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        var captured = SPPWCaptureClock.nowNanoseconds()
+        if let timebase = item?.timebase, mediaStart.isValid {
+            // Media time -> host time: the instant this slice is meant to be heard, the
+            // same timeline `nextFrame()` samples video on (itemTime(forHostTime:)).
+            let hostTime = CMSyncConvertTime(mediaStart, from: timebase, to: CMClockGetHostTimeClock())
+            captured = SPPWCaptureClock.nanoseconds(fromHostTime: hostTime) ?? captured
+        }
+        handler(buffer, captured)
+    }
+
+    static func makeAudioMix(track: AVAssetTrack, context: TestVideoAudioTapContext) -> AVAudioMix? {
+        var callbacks = MTAudioProcessingTapCallbacks(
+            version: kMTAudioProcessingTapCallbacksVersion_0,
+            clientInfo: Unmanaged.passRetained(context).toOpaque(),
+            init: { _, clientInfo, tapStorageOut in
+                tapStorageOut.pointee = clientInfo
+            },
+            finalize: { tap in
+                Unmanaged<TestVideoAudioTapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).release()
+            },
+            prepare: { tap, _, processingFormat in
+                let context = Unmanaged<TestVideoAudioTapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                var description = processingFormat.pointee
+                context.setFormat(AVAudioFormat(streamDescription: &description))
+            },
+            unprepare: { tap in
+                let context = Unmanaged<TestVideoAudioTapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                context.setFormat(nil)
+            },
+            process: { tap, numberFrames, _, bufferListInOut, numberFramesOut, flagsOut in
+                var timeRange = CMTimeRange()
+                guard MTAudioProcessingTapGetSourceAudio(
+                    tap, numberFrames, bufferListInOut, flagsOut, &timeRange, numberFramesOut
+                ) == noErr else { return }
+                let context = Unmanaged<TestVideoAudioTapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                context.deliver(bufferList: bufferListInOut, frames: numberFramesOut.pointee, mediaStart: timeRange.start)
+                // Silence the local output: the audio is for the stream, not the server's speakers.
+                for buffer in UnsafeMutableAudioBufferListPointer(bufferListInOut) {
+                    if let data = buffer.mData {
+                        memset(data, 0, Int(buffer.mDataByteSize))
+                    }
+                }
+            }
+        )
+        var tap: MTAudioProcessingTap?
+        guard MTAudioProcessingTapCreate(
+            kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap
+        ) == noErr, let tap else {
+            Unmanaged<TestVideoAudioTapContext>.fromOpaque(callbacks.clientInfo!).release()
+            return nil
+        }
+        let parameters = AVMutableAudioMixInputParameters(track: track)
+        parameters.audioTapProcessor = tap
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = [parameters]
+        return mix
     }
 }

@@ -43,6 +43,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let cropPlanePipeline: MTLComputePipelineState
     private let cropTexturePlanePipeline: MTLComputePipelineState
     private let cropNV12TexturesPipeline: MTLComputePipelineState
+    private let cropYUV444ToBGRAPipeline: MTLComputePipelineState
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
@@ -102,6 +103,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         cropPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_plane", library: library))
         cropTexturePlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_texture_plane", library: library))
         cropNV12TexturesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_nv12_textures", library: library))
+        cropYUV444ToBGRAPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_yuv444_to_bgra", library: library))
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
@@ -691,24 +693,47 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         yTexture: MTLTexture,
         cbCrTexture: MTLTexture
     ) async throws {
-        let commandBuffer = try makeSparsePacketsInverseAndCropToNV12CommandBuffer(
+        let commandBuffer = try makeSparsePacketsInverseAndCropCommandBuffer(
             packetData: packetData,
             planes: planes,
             width: width,
             height: height,
-            yTexture: yTexture,
-            cbCrTexture: cbCrTexture
+            output: .nv12(yTexture: yTexture, cbCrTexture: cbCrTexture)
         )
         try await finishAsync(commandBuffer: commandBuffer, context: "Metal combined NV12 decode")
     }
 
-    private func makeSparsePacketsInverseAndCropToNV12CommandBuffer(
+    /// 4:4:4 counterpart of `decodeSparsePacketsInverseAndCropToNV12Textures`:
+    /// sparse packet decode, iDWT and a BGRA conversion in one command buffer.
+    func decodeSparsePacketsInverseAndCropToBGRATexture(
         packetData: Data,
         planes: [(sampleCount: Int, paddedWidth: Int, paddedHeight: Int, levels: Int, descriptors: [MetalSparsePacketDecodeDescriptor])],
         width: Int,
         height: Int,
-        yTexture: MTLTexture,
-        cbCrTexture: MTLTexture
+        bgraTexture: MTLTexture,
+        limitedRange: Bool
+    ) async throws {
+        let commandBuffer = try makeSparsePacketsInverseAndCropCommandBuffer(
+            packetData: packetData,
+            planes: planes,
+            width: width,
+            height: height,
+            output: .bgra444(texture: bgraTexture, limitedRange: limitedRange)
+        )
+        try await finishAsync(commandBuffer: commandBuffer, context: "Metal combined 4:4:4 BGRA decode")
+    }
+
+    private enum CombinedDecodeOutput {
+        case nv12(yTexture: MTLTexture, cbCrTexture: MTLTexture)
+        case bgra444(texture: MTLTexture, limitedRange: Bool)
+    }
+
+    private func makeSparsePacketsInverseAndCropCommandBuffer(
+        packetData: Data,
+        planes: [(sampleCount: Int, paddedWidth: Int, paddedHeight: Int, levels: Int, descriptors: [MetalSparsePacketDecodeDescriptor])],
+        width: Int,
+        height: Int,
+        output: CombinedDecodeOutput
     ) throws -> MTLCommandBuffer {
         guard planes.count == 3 else {
             throw PyrowaveError.invalidDimensions
@@ -746,22 +771,103 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal iDWT returned \(reconstructed.count) buffers for \(planes.count) planes")
         }
 
-        try encodeCropPlanesToNV12Textures(
-            commandBuffer: commandBuffer,
-            yBuffer: reconstructed[0],
-            ySampleCount: planes[0].sampleCount,
-            yPaddedWidth: planes[0].paddedWidth,
-            cbBuffer: reconstructed[1],
-            cbSampleCount: planes[1].sampleCount,
-            crBuffer: reconstructed[2],
-            crSampleCount: planes[2].sampleCount,
-            chromaPaddedWidth: planes[1].paddedWidth,
-            width: width,
-            height: height,
-            yTexture: yTexture,
-            cbCrTexture: cbCrTexture
-        )
+        switch output {
+        case let .nv12(yTexture, cbCrTexture):
+            try encodeCropPlanesToNV12Textures(
+                commandBuffer: commandBuffer,
+                yBuffer: reconstructed[0],
+                ySampleCount: planes[0].sampleCount,
+                yPaddedWidth: planes[0].paddedWidth,
+                cbBuffer: reconstructed[1],
+                cbSampleCount: planes[1].sampleCount,
+                crBuffer: reconstructed[2],
+                crSampleCount: planes[2].sampleCount,
+                chromaPaddedWidth: planes[1].paddedWidth,
+                width: width,
+                height: height,
+                yTexture: yTexture,
+                cbCrTexture: cbCrTexture
+            )
+        case let .bgra444(texture, limitedRange):
+            try encodeCropYUV444ToBGRATexture(
+                commandBuffer: commandBuffer,
+                yBuffer: reconstructed[0],
+                ySampleCount: planes[0].sampleCount,
+                yPaddedWidth: planes[0].paddedWidth,
+                cbBuffer: reconstructed[1],
+                cbSampleCount: planes[1].sampleCount,
+                crBuffer: reconstructed[2],
+                crSampleCount: planes[2].sampleCount,
+                chromaPaddedWidth: planes[1].paddedWidth,
+                width: width,
+                height: height,
+                bgraTexture: texture,
+                limitedRange: limitedRange
+            )
+        }
         return commandBuffer
+    }
+
+    private func encodeCropYUV444ToBGRATexture(
+        commandBuffer: MTLCommandBuffer,
+        yBuffer: MTLBuffer,
+        ySampleCount: Int,
+        yPaddedWidth: Int,
+        cbBuffer: MTLBuffer,
+        cbSampleCount: Int,
+        crBuffer: MTLBuffer,
+        crSampleCount: Int,
+        chromaPaddedWidth: Int,
+        width: Int,
+        height: Int,
+        bgraTexture: MTLTexture,
+        limitedRange: Bool
+    ) throws {
+        guard bgraTexture.pixelFormat == .bgra8Unorm,
+              bgraTexture.width == width,
+              bgraTexture.height == height,
+              yPaddedWidth >= width,
+              chromaPaddedWidth >= width,
+              width > 0,
+              height > 0,
+              yPaddedWidth <= Int(UInt32.max),
+              chromaPaddedWidth <= Int(UInt32.max),
+              width <= Int(UInt32.max),
+              height <= Int(UInt32.max),
+              ySampleCount >= yPaddedWidth * height,
+              cbSampleCount >= chromaPaddedWidth * height,
+              crSampleCount >= chromaPaddedWidth * height,
+              yBuffer.length >= ySampleCount * MemoryLayout<Float>.stride,
+              cbBuffer.length >= cbSampleCount * MemoryLayout<Float>.stride,
+              crBuffer.length >= crSampleCount * MemoryLayout<Float>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var constants = CropYUV444ToBGRAConstants(
+            yPaddedWidth: UInt32(yPaddedWidth),
+            chromaPaddedWidth: UInt32(chromaPaddedWidth),
+            outputWidth: UInt32(width),
+            outputHeight: UInt32(height),
+            limitedRange: limitedRange ? 1 : 0
+        )
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal 4:4:4 BGRA crop command encoder")
+        }
+
+        encoder.setComputePipelineState(cropYUV444ToBGRAPipeline)
+        encoder.setBuffer(yBuffer, offset: 0, index: 0)
+        encoder.setBuffer(cbBuffer, offset: 0, index: 1)
+        encoder.setBuffer(crBuffer, offset: 0, index: 2)
+        encoder.setTexture(bgraTexture, index: 0)
+        encoder.setBytes(&constants, length: MemoryLayout<CropYUV444ToBGRAConstants>.stride, index: 3)
+        let threadWidth = min(16, cropYUV444ToBGRAPipeline.maxTotalThreadsPerThreadgroup)
+        let threadHeight = max(1, min(16, cropYUV444ToBGRAPipeline.maxTotalThreadsPerThreadgroup / threadWidth))
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: height, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
+        )
+        encoder.endEncoding()
     }
 
     func decodeSparsePacketBuffersInverseAndCropToNV12Textures(
@@ -3619,6 +3725,14 @@ private struct CropNV12Constants {
     var chromaPaddedWidth: UInt32
     var outputWidth: UInt32
     var outputHeight: UInt32
+}
+
+private struct CropYUV444ToBGRAConstants {
+    var yPaddedWidth: UInt32
+    var chromaPaddedWidth: UInt32
+    var outputWidth: UInt32
+    var outputHeight: UInt32
+    var limitedRange: UInt32
 }
 
 private struct PlaneQuantizationConstants {

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1d1f2e"/><stop offset="1" stop-color="#0b0c14"/></linearGradient>
+<linearGradient id="dia" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a2a"/><stop offset="0.55" stop-color="#f2402a"/><stop offset="1" stop-color="#c0162f"/></linearGradient>
+</defs>
+<rect width="1024" height="1024" fill="url(#bg)"/>
+<g transform="translate(512 512)">
+<rect x="-270" y="-270" width="540" height="540" rx="56" transform="rotate(45)" fill="url(#dia)"/>
+<rect x="-232" y="-232" width="464" height="464" rx="34" transform="rotate(45)" fill="none" stroke="#fff" stroke-opacity="0.9" stroke-width="14"/>
+<g transform="translate(-14 0) rotate(-90) scale(1.25)">
+<path d="M 0,-150 C 40,-95 100,-50 100,30 C 100,95 55,135 0,135 C -55,135 -100,95 -100,30 C -100,-20 -72,-50 -52,-88 C -46,-48 -30,-24 -12,-16 C -20,-68 -14,-110 0,-150 Z" fill="#fff"/>
+<path d="M 4,-10 C 22,22 48,48 48,80 C 48,106 28,122 4,122 C -20,122 -40,106 -40,80 C -40,50 -14,30 4,-10 Z" fill="#f2402a"/>
+</g>
+<g stroke="#fff" stroke-width="22" stroke-linecap="round">
+<line x1="190" y1="-62" x2="260" y2="-62"/>
+<line x1="210" y1="0" x2="300" y2="0"/>
+<line x1="190" y1="62" x2="260" y2="62"/>
+</g>
+</g>
+</svg>

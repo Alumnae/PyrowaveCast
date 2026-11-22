@@ -40,6 +40,7 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
     private var encoder: OpaquePointer?
     private var encoderWidth = 0
     private var encoderHeight = 0
+    private var encoderChroma = PYROWAVE_CHROMA_SUBSAMPLING_420
     /// Reused bitstream output buffer. The encoder previously allocated and
     /// zeroed a fresh `[UInt8]` of `maximumBitstreamBytes + 65_536` on every
     /// frame — at 180 Mb/s / 60 fps that is ~26 MB/s of pointless allocation
@@ -77,7 +78,13 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
             throw EncoderError.encodeFailed("Frame must have even dimensions, got \(width)x\(height)")
         }
 
-        if encoder == nil || encoderWidth != width || encoderHeight != height {
+        // 4:4:4 is selected by the capture format: a biplanar surface whose chroma
+        // plane is full resolution ('444f' / 'xf44') feeds a 4:4:4 encoder, anything
+        // else (NV12 / P010) keeps 4:2:0. The chroma mode travels in the PyroWave
+        // sequence header, so receivers pick it up without any SPPW/1 change.
+        let chroma = Self.chromaSubsampling(of: pixelBuffer, width: width, height: height)
+
+        if encoder == nil || encoderWidth != width || encoderHeight != height || encoderChroma != chroma {
             if let stale = encoder {
                 pyrowave_encoder_destroy(stale)
             }
@@ -87,7 +94,7 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
             info.device = device
             info.width = Int32(width)
             info.height = Int32(height)
-            info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420
+            info.chroma = chroma
 
             var newEncoder: OpaquePointer?
             let createResult = pyrowave_encoder_create(&info, &newEncoder)
@@ -97,6 +104,7 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
             encoder = newEncoder
             encoderWidth = width
             encoderHeight = height
+            encoderChroma = chroma
         }
         guard let activeEncoder = encoder else {
             throw EncoderError.encoderCreationFailed("encoder was not created")
@@ -108,11 +116,12 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
         let encodeResult: pyrowave_result
         if let surfaceRef = CVPixelBufferGetIOSurface(pixelBuffer) {
             let surface = surfaceRef.takeUnretainedValue()
+            let chromaDivisor = chroma == PYROWAVE_CHROMA_SUBSAMPLING_444 ? 1 : 2
             let matchesBiplanarLayout = IOSurfaceGetPlaneCount(surface) == 2
                 && IOSurfaceGetWidthOfPlane(surface, 0) == width
                 && IOSurfaceGetHeightOfPlane(surface, 0) == height
-                && IOSurfaceGetWidthOfPlane(surface, 1) == width / 2
-                && IOSurfaceGetHeightOfPlane(surface, 1) == height / 2
+                && IOSurfaceGetWidthOfPlane(surface, 1) == width / chromaDivisor
+                && IOSurfaceGetHeightOfPlane(surface, 1) == height / chromaDivisor
             if matchesBiplanarLayout {
                 // Direct zero-copy IOSurface lookup via CoreVideo without
                 // allocating a transient CVMetalTexture on every frame.
@@ -196,6 +205,11 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
         height: Int,
         rateControl: inout pyrowave_rate_control
     ) throws -> pyrowave_result {
+        // The CPU upload path only understands 8-bit NV12; 4:4:4 capture is always
+        // IOSurface backed, so it never needs this fallback.
+        guard encoderChroma == PYROWAVE_CHROMA_SUBSAMPLING_420 else {
+            throw EncoderError.encodeFailed("4:4:4 frames must be IOSurface backed biplanar buffers")
+        }
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
@@ -220,6 +234,16 @@ final class UpstreamMetalEncoder: @unchecked Sendable {
         cpuInput.height = Int32(height)
         cpuInput.format = PYROWAVE_CPU_BUFFER_FORMAT_NV12
         return pyrowave_encoder_encode_cpu(activeEncoder, &cpuInput, &rateControl)
+    }
+
+    /// 4:4:4 when the second plane of a biplanar buffer is full resolution.
+    static func chromaSubsampling(of pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> pyrowave_chroma_subsampling {
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2,
+              CVPixelBufferGetWidthOfPlane(pixelBuffer, 1) == width,
+              CVPixelBufferGetHeightOfPlane(pixelBuffer, 1) == height else {
+            return PYROWAVE_CHROMA_SUBSAMPLING_420
+        }
+        return PYROWAVE_CHROMA_SUBSAMPLING_444
     }
 
     private static func describe(_ result: pyrowave_result) -> String {

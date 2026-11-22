@@ -41,6 +41,14 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
     private let videoSeekBackButton = UIButton(type: .system)
     private let videoSeekSlider = UISlider()
     private let videoSeekForwardButton = UIButton(type: .system)
+    private let audioSourceRow = UIStackView()
+    private let audioSourceLabel = UILabel()
+    private let audioSourceButton = UIButton(type: .system)
+    private let audioVolumeRow = UIStackView()
+    private let audioVolumeIcon = UIImageView()
+    private let audioVolumeSlider = UISlider()
+    private let audioVolumeValueLabel = UILabel()
+    private var lastAudioMenuSignature = ""
     private var clearBarItem: UIBarButtonItem?
     private var gearBarItem: UIBarButtonItem?
     private var lastRenderedLogCount = -1
@@ -237,6 +245,42 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         videoSeekContainer.isHidden = true
         stack.addArrangedSubview(videoSeekContainer)
 
+        // Audio source (screen capture) and input volume (screen capture + video file).
+        audioSourceRow.axis = .horizontal
+        audioSourceRow.alignment = .center
+        audioSourceRow.spacing = 8
+        audioSourceLabel.text = SPPWLocalization.tr("audio.source.label")
+        audioSourceLabel.font = .preferredFont(forTextStyle: .subheadline)
+        audioSourceButton.showsMenuAsPrimaryAction = true
+        audioSourceButton.changesSelectionAsPrimaryAction = false
+        audioSourceButton.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
+        audioSourceButton.contentHorizontalAlignment = .trailing
+        audioSourceRow.addArrangedSubview(audioSourceLabel)
+        audioSourceRow.addArrangedSubview(UIView())
+        audioSourceRow.addArrangedSubview(audioSourceButton)
+        stack.addArrangedSubview(audioSourceRow)
+
+        audioVolumeRow.axis = .horizontal
+        audioVolumeRow.alignment = .center
+        audioVolumeRow.spacing = 8
+        audioVolumeIcon.tintColor = .secondaryLabel
+        audioVolumeIcon.contentMode = .scaleAspectFit
+        audioVolumeIcon.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        audioVolumeIcon.accessibilityLabel = SPPWLocalization.tr("audio.input_volume")
+        audioVolumeSlider.minimumValue = 0
+        audioVolumeSlider.maximumValue = 2
+        audioVolumeSlider.value = Float(model.audioInputVolume)
+        audioVolumeSlider.accessibilityLabel = SPPWLocalization.tr("audio.input_volume")
+        audioVolumeSlider.addTarget(self, action: #selector(audioVolumeChanged), for: .valueChanged)
+        audioVolumeValueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        audioVolumeValueLabel.textColor = .secondaryLabel
+        audioVolumeValueLabel.textAlignment = .right
+        audioVolumeValueLabel.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        audioVolumeRow.addArrangedSubview(audioVolumeIcon)
+        audioVolumeRow.addArrangedSubview(audioVolumeSlider)
+        audioVolumeRow.addArrangedSubview(audioVolumeValueLabel)
+        stack.addArrangedSubview(audioVolumeRow)
+
         let portRow = UIStackView()
         portRow.axis = .horizontal
         portRow.alignment = .center
@@ -379,6 +423,7 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         chooseAssetButton.isEnabled = !model.isRunning
         if !portField.isFirstResponder { portField.text = String(model.port) }
         portField.isEnabled = !model.isRunning
+        updateAudioControls()
 
         let buttonTitle: String
         if model.isRunning {
@@ -493,6 +538,47 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
 
     @objc private func videoSeekForwardPressed() {
         model.nudgeVideo(by: 15)
+    }
+
+    private func updateAudioControls() {
+        audioSourceRow.isHidden = model.mode != .screen
+        audioVolumeRow.isHidden = model.mode != .screen && model.mode != .video
+        let selected = SPPWAudioSourceCatalog.source(withID: model.audioSourceID, in: model.audioSources)
+        audioSourceButton.setTitle(selected.name, for: .normal)
+        audioSourceButton.isEnabled = !model.isRunning && !model.isStartingScreenCapture
+        let signature = model.audioSources.map(\.id).joined(separator: "|") + "#" + model.audioSourceID
+        if signature != lastAudioMenuSignature {
+            lastAudioMenuSignature = signature
+            let items: [UIMenuElement] = model.audioSources.map { source in
+                UIAction(
+                    title: source.name,
+                    state: source.id == model.audioSourceID ? .on : .off
+                ) { [weak self] _ in
+                    self?.model.audioSourceID = source.id
+                }
+            }
+            let refresh = UIAction(
+                title: SPPWLocalization.tr("audio.refresh_sources"),
+                image: UIImage(systemName: "arrow.clockwise")
+            ) { [weak self] _ in
+                self?.model.refreshAudioSources()
+            }
+            audioSourceButton.menu = UIMenu(children: [
+                UIMenu(options: .displayInline, children: items),
+                refresh
+            ])
+        }
+        let volume = model.audioInputVolume
+        if !audioVolumeSlider.isTracking {
+            audioVolumeSlider.value = Float(volume)
+        }
+        audioVolumeValueLabel.text = "\(Int((volume * 100).rounded()))%"
+        audioVolumeIcon.image = UIImage(systemName: volume == 0 ? "speaker.slash" : "speaker.wave.2")
+    }
+
+    @objc private func audioVolumeChanged() {
+        model.audioInputVolume = Double(audioVolumeSlider.value)
+        audioVolumeValueLabel.text = "\(Int((model.audioInputVolume * 100).rounded()))%"
     }
 
     @objc private func previewToggled() {

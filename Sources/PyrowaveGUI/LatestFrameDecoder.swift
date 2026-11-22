@@ -18,6 +18,8 @@ struct MacDecodedReceiverFrame: @unchecked Sendable {
     let ageMilliseconds: Double
     let recoveredWithFEC: Bool
     let isPartialHF: Bool
+    /// Server capture instant (`SPPWCaptureClock`), used for audio/video sync.
+    let senderTimestampNanoseconds: UInt64
 }
 
 actor LatestFrameDecoder {
@@ -28,6 +30,8 @@ actor LatestFrameDecoder {
     private var draining = false
     private var session: PyrowaveDecoderSession?
     private var sessionSize: (Int, Int)?
+    /// NV12 for 4:2:0 streams, BGRA for 4:4:4 ones.
+    private var sessionPixelFormat: OSType?
     private var generation: UInt64 = 0
     private var droppedFrames = 0
     private let outputHandler: OutputHandler
@@ -51,6 +55,7 @@ actor LatestFrameDecoder {
         pending = nil
         session = nil
         sessionSize = nil
+        sessionPixelFormat = nil
         droppedFrames = 0
     }
 
@@ -59,11 +64,13 @@ actor LatestFrameDecoder {
             pending = nil
             let currentGeneration = generation
             do {
-                if session == nil || sessionSize?.0 != frame.width || sessionSize?.1 != frame.height {
+                let pixelFormat = PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: frame.data)
+                if session == nil || sessionSize?.0 != frame.width || sessionSize?.1 != frame.height
+                    || sessionPixelFormat != pixelFormat {
                     let descriptor = try PyrowaveSessionDescriptor(
                         width: frame.width,
                         height: frame.height,
-                        pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                        pixelFormat: pixelFormat,
                         videoSignal: VideoSignalMetadata(yCbCrRange: .full)
                     )
                     // Pre-warm 4 output buffers so triple-buffered display
@@ -71,6 +78,7 @@ actor LatestFrameDecoder {
                     // Metal decode) never causes mid-stream IOSurface allocations.
                     session = try PyrowaveDecoderSession(descriptor: descriptor, minimumOutputBufferCount: 4)
                     sessionSize = (frame.width, frame.height)
+                    sessionPixelFormat = pixelFormat
                 }
                 guard let session else { continue }
                 let start = ContinuousClock.now
@@ -92,7 +100,8 @@ actor LatestFrameDecoder {
                     decodeMilliseconds: decodeMilliseconds,
                     ageMilliseconds: ageMilliseconds,
                     recoveredWithFEC: frame.recoveredWithFEC,
-                    isPartialHF: frame.isPartialHF
+                    isPartialHF: frame.isPartialHF,
+                    senderTimestampNanoseconds: frame.senderTimestampNanoseconds
                 ))
             } catch {
                 await errorHandler("PyroWave decode failed: \(error)")

@@ -16,6 +16,8 @@ public enum WireMessageKind: UInt8, Sendable {
     case pong = 7
     case fecParity = 8
     case audioFrame = 9
+    /// Clipboard sync, both directions (`SPPWClipboardMessage`).
+    case clipboard = 10
 }
 
 public struct WireHeader: Sendable {

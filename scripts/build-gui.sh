@@ -15,7 +15,7 @@
 # Usage:
 #   ./scripts/build-gui.sh [--patch|--minor|--major-fix|--no-bump] [output.app path]
 #
-# Default output: build/PyrowaveCastServer-v<VERSION>-build<BUILD_NUMBER>.app
+# Default output: build/PyrowaveCastServer-v<VERSION>-build<BUILD_NUMBER>-<COMMIT>.app
 #                 (with convenience symlink build/PyrowaveCastServer.app)
 
 set -euo pipefail
@@ -52,12 +52,13 @@ if [[ ! -d "$BUNDLE" ]]; then
     exit 1
 fi
 
-echo "==> Packaging $OUT (v$PYROWAVE_VERSION, build $PYROWAVE_BUILD_NUMBER)"
+echo "==> Packaging $OUT (${PYROWAVE_BUILD_VERSION_TEXT})"
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 
 cp "$BIN" "$OUT/Contents/MacOS/PyrowaveCastServer"
 cp -R "$BUNDLE" "$OUT/Contents/Resources/"
+cp "$ROOT/Resources/AppIcon/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -74,6 +75,12 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <string>${PYROWAVE_BUILD_NUMBER}</string>
     <key>CFBundleShortVersionString</key>
     <string>${PYROWAVE_VERSION}</string>
+    <key>PyrowaveGitCommit</key>
+    <string>${PYROWAVE_COMMIT}</string>
+    <key>PyrowaveBuildVersion</key>
+    <string>${PYROWAVE_BUILD_VERSION_TEXT}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -84,6 +91,8 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>PyrowaveCast Server needs screen recording permission to stream your display.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>PyrowaveCast Server streams the selected microphone as the stream's audio when you choose it as audio source.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>PyrowaveCast Server needs local network access to stream to clients.</string>
     <key>NSBonjourServices</key>
@@ -101,5 +110,5 @@ if [[ -z "${PYROWAVE_OUT_ARG:-}" ]]; then
     ln -s "$(basename "$OUT")" "$ROOT/build/PyrowaveCastServer.app"
 fi
 
-echo "==> Done: $OUT (v$PYROWAVE_VERSION, build $PYROWAVE_BUILD_NUMBER)"
+echo "==> Done: $OUT (${PYROWAVE_BUILD_VERSION_TEXT})"
 echo "    Launch it with: open \"$OUT\""

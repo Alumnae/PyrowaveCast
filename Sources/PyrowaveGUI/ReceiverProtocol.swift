@@ -11,6 +11,8 @@ enum ReceiverMessageKind: UInt8 {
     case pong = 7
     case fecParity = 8
     case audioFrame = 9
+    /// Clipboard sync, both directions (`SPPWClipboardMessage`).
+    case clipboard = 10
 }
 
 struct ReceiverWireHeader {

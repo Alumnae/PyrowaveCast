@@ -174,6 +174,8 @@ typedef struct pyrowave_cpu_buffer
 // IOSurface input for the encoder. Two layouts are accepted:
 //   - one biplanar NV12 or P010 surface in planes[0], with planes[1] and planes[2] NULL.
 //     P010 samples are read as 16-bit UNORM, so the 10-bit values are slightly scaled.
+//     For a 4:4:4 encoder the biplanar surface carries full resolution chroma
+//     ('444f', or 16-bit 'xf44' as produced by ScreenCaptureKit). [PyrowaveKit]
 //   - three single plane R8 surfaces, one per YUV component
 // The library wraps these in MTLTextures itself, so the caller does not have to
 // match any particular pixel format or usage. For the NV12 case the chroma plane

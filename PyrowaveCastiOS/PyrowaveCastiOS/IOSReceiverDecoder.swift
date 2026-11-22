@@ -9,6 +9,8 @@ struct IOSDecodedReceiverFrame: @unchecked Sendable {
     let skippedWhileBusy: Int
     let recoveredWithFEC: Bool
     let isPartialHF: Bool
+    /// Server capture instant (`SPPWCaptureClock`), used for audio/video sync.
+    let senderTimestampNanoseconds: UInt64
 }
 
 /// Decodes PyroWave bitstream frames on a background actor using a 1-slot
@@ -29,6 +31,8 @@ actor IOSReceiverDecoder {
     private var skippedCount = 0
     private var session: PyrowaveDecoderSession?
     private var size: (width: Int, height: Int)?
+    /// NV12 for 4:2:0 streams, BGRA for 4:4:4 ones.
+    private var sessionPixelFormat: OSType?
     private var generation: UInt64 = 0
     private let outputHandler: OutputHandler
     private let errorHandler: ErrorHandler
@@ -63,17 +67,20 @@ actor IOSReceiverDecoder {
             skippedCount = 0
             let currentGeneration = generation
             do {
-                if session == nil || size?.width != frame.width || size?.height != frame.height {
+                let pixelFormat = PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: frame.data)
+                if session == nil || size?.width != frame.width || size?.height != frame.height
+                    || sessionPixelFormat != pixelFormat {
                     let descriptor = try PyrowaveSessionDescriptor(
                         width: frame.width,
                         height: frame.height,
-                        pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                        pixelFormat: pixelFormat,
                         videoSignal: VideoSignalMetadata(yCbCrRange: .full)
                     )
                     // Pre-warm 4 output buffers so triple-buffered display +
                     // in-flight Metal decode never exhausts the CVPixelBufferPool.
                     session = try PyrowaveDecoderSession(descriptor: descriptor, minimumOutputBufferCount: 4)
                     size = (frame.width, frame.height)
+                    sessionPixelFormat = pixelFormat
                 }
                 guard let session else { continue }
                 let start = DispatchTime.now()
@@ -94,7 +101,8 @@ actor IOSReceiverDecoder {
                     ageMilliseconds: ageMs,
                     skippedWhileBusy: skipped,
                     recoveredWithFEC: frame.recoveredWithFEC,
-                    isPartialHF: frame.isPartialHF
+                    isPartialHF: frame.isPartialHF,
+                    senderTimestampNanoseconds: frame.senderTimestampNanoseconds
                 ))
             } catch {
                 // Reset session on fatal errors so the next frame retries cleanly.

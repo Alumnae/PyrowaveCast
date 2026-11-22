@@ -133,6 +133,11 @@ struct PyrowaveApp: App {
                             .font(.caption2)
                     }
                 }
+
+                Text(SPPWBuildVersion.current)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 4)
             }
             .padding(.bottom, 12)
             .foregroundStyle(.secondary)

@@ -1191,7 +1191,11 @@ public final class SPPWMediaPacer: @unchecked Sendable {
     private let lock = NSLock()
     private var latestGeneration: UInt64 = 0
     private let microBurstSize = 4
-    private let frameSpreadFraction = 0.65
+    /// Share of the frame interval a frame is spread over. Wider spreading lowers the peak rate
+    /// a Wi-Fi access point has to absorb (bursts overflow its queues and cause loss bursts).
+    private let frameSpreadFraction = 0.80
+    /// Upper bound of the spread for low frame rates.
+    private let maximumSpreadNanos = 14_000_000.0
 
     private static let timebaseInfo: mach_timebase_info_data_t = {
         var info = mach_timebase_info_data_t()
@@ -1238,17 +1242,25 @@ public final class SPPWMediaPacer: @unchecked Sendable {
 
             let clampedFPS = Double(min(max(fps, 15), 240))
             let frameIntervalNanos = 1_000_000_000.0 / clampedFPS
-            let totalSpreadNanos = min(frameIntervalNanos * self.frameSpreadFraction, 10_000_000.0)
+            let totalSpreadNanos = min(frameIntervalNanos * self.frameSpreadFraction, self.maximumSpreadNanos)
             let burstCount = max(1, (count + self.microBurstSize - 1) / self.microBurstSize)
             let burstIntervalNanos = UInt64(max(25_000.0, totalSpreadNanos / Double(burstCount)))
             let burstIntervalMach = Self.nanosecondsToMachAbsolute(burstIntervalNanos)
 
-            var nextDeadlineMach = mach_absolute_time()
+            let startMach = mach_absolute_time()
+            var nextDeadlineMach = startMach
 
             var index = 0
             while index < count {
                 if self.isGenerationSuperseded(generation) {
-                    // Newer frame is ready; pre-empt trailing HF packets of the old frame.
+                    // Newer frame is ready: finish a frame that is only slightly late (capture
+                    // jitter) at full speed, pre-empt the trailing HF packets of a real backlog.
+                    if Self.shouldFlushSupersededFrame(startMach: startMach, frameIntervalNanos: frameIntervalNanos) {
+                        while index < count {
+                            sendDatagram(datagrams[index])
+                            index += 1
+                        }
+                    }
                     return
                 }
 
@@ -1298,15 +1310,24 @@ public final class SPPWMediaPacer: @unchecked Sendable {
 
             let clampedFPS = Double(min(max(fps, 15), 240))
             let frameIntervalNanos = 1_000_000_000.0 / clampedFPS
-            let totalSpreadNanos = min(frameIntervalNanos * self.frameSpreadFraction, 10_000_000.0)
+            let totalSpreadNanos = min(frameIntervalNanos * self.frameSpreadFraction, self.maximumSpreadNanos)
             let burstCount = max(1, (count + bSize - 1) / bSize)
             let burstIntervalNanos = UInt64(max(25_000.0, totalSpreadNanos / Double(burstCount)))
             let burstIntervalMach = Self.nanosecondsToMachAbsolute(burstIntervalNanos)
 
-            var nextDeadlineMach = mach_absolute_time()
+            let startMach = mach_absolute_time()
+            var nextDeadlineMach = startMach
             var index = 0
             while index < count {
                 if self.isGenerationSuperseded(generation) {
+                    // See `paceFrame`: finish a slightly late frame, drop a real backlog.
+                    if Self.shouldFlushSupersededFrame(startMach: startMach, frameIntervalNanos: frameIntervalNanos) {
+                        while index < count {
+                            let burstEnd = min(index + bSize, count)
+                            sendBurst(Array(datagrams[index..<burstEnd]))
+                            index = burstEnd
+                        }
+                    }
                     return
                 }
 
@@ -1336,6 +1357,17 @@ public final class SPPWMediaPacer: @unchecked Sendable {
 
     public func cancelPending() {
         cancelAll()
+    }
+
+    /// A superseded frame is finished when it started less than one frame interval ago:
+    /// the next frame merely arrived early (uneven capture timing). Cutting it would turn
+    /// every early capture into a partial-HF frame on the receiver.
+    static func shouldFlushSupersededFrame(startMach: UInt64, frameIntervalNanos: Double) -> Bool {
+        let elapsedMach = mach_absolute_time() &- startMach
+        let numer = UInt64(max(timebaseInfo.numer, 1))
+        let denom = UInt64(max(timebaseInfo.denom, 1))
+        let elapsedNanos = Double(elapsedMach * numer / denom)
+        return elapsedNanos < frameIntervalNanos
     }
 
     @inline(__always)
@@ -1624,6 +1656,16 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
     private var cleanSecondsSinceLastChange: Int = 0
     private var probingFromBitrateBps: Int?
     private var probeStartedAtNanoseconds: UInt64 = 0
+    /// Timestamps of recent impaired windows (any loss, partial-HF, late drop, heavy FEC),
+    /// used to tell persistent congestion from isolated Wi-Fi blips.
+    private var recentImpairedWindowNanos: [UInt64] = []
+    private var lockedSinceNanoseconds: UInt64 = 0
+
+    /// A locked ceiling is released after this long without trouble at the locked bitrate,
+    /// so a link that recovered (the user moved closer to the access point) can climb again.
+    public static let ceilingLockReleaseNanoseconds: UInt64 = 120_000_000_000
+    /// Impaired windows within this span (including the current one) count as persistent.
+    public static let persistenceWindowNanoseconds: UInt64 = 3_000_000_000
 
     /// Computes the natural automatic bitrate ceiling matching the server's
     /// `width * height * 1.4 * quality` per-frame budget, rounded up to 1 Mb/s.
@@ -1684,6 +1726,8 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
         cleanSecondsSinceLastChange = 0
         probingFromBitrateBps = nil
         probeStartedAtNanoseconds = 0
+        recentImpairedWindowNanos = []
+        lockedSinceNanoseconds = 0
     }
 
     /// Evaluates a 1-second network health window and returns the bitrate adjustment.
@@ -1706,24 +1750,38 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
         let fecRatio = totalFrames > 0
             ? Double(sample.fecRecoveredFramesDelta) / Double(totalFrames)
             : 0.0
+        let frameBase = Double(max(totalFrames, 1))
+        let lostFrames = sample.llDroppedFramesDelta + sample.expiredFramesDelta
+        let lossRatio = Double(lostFrames) / frameBase
+        let partialRatio = Double(sample.partialHFFramesDelta) / frameBase
 
-        let isSevere = sample.llDroppedFramesDelta > 0
-            || sample.expiredFramesDelta > 0
-            || sample.lateDroppedFramesDelta >= 2
+        // Wi-Fi loses isolated packets and stalls for tens of milliseconds (retries, AWDL,
+        // power save, scans) without being short of capacity. A bitrate cut only helps when the
+        // link is congested, which shows up as heavy loss in one window or loss that persists.
+        let isImpaired = lostFrames > 0
+            || sample.partialHFFramesDelta > 0
+            || sample.lateDroppedFramesDelta > 0
+            || (totalFrames >= 10 && fecRatio > 0.20)
+        recentImpairedWindowNanos.removeAll {
+            sample.timestampNanoseconds &- $0 >= Self.persistenceWindowNanoseconds
+        }
+        if isImpaired {
+            recentImpairedWindowNanos.append(sample.timestampNanoseconds)
+        }
+        let isPersistent = isImpaired && recentImpairedWindowNanos.count >= 2
 
+        let heavyLoss = lossRatio >= 0.03 || sample.lateDroppedFramesDelta >= 3
+        let heavyPartial = partialRatio >= 0.10 || (sample.jitterMs >= 25.0 && partialRatio >= 0.05)
+        let lossInvolved = lostFrames > 0 || sample.lateDroppedFramesDelta >= 2
+
+        let isSevere = heavyLoss || (isPersistent && lossInvolved)
         let isModerate = !isSevere && (
-            sample.partialHFFramesDelta >= 2
-                || (totalFrames >= 10 && fecRatio > 0.20)
-                || (sample.jitterMs >= 25.0 && (
-                    sample.partialHFFramesDelta > 0
-                        || sample.fecRecoveredFramesDelta > 0
-                        || sample.lateDroppedFramesDelta > 0
-                ))
+            heavyPartial
+                || (totalFrames >= 10 && fecRatio > 0.35)
+                || (isPersistent && (sample.partialHFFramesDelta >= 2 || fecRatio > 0.20))
         )
 
-        let isClean = !isSevere && !isModerate
-            && sample.partialHFFramesDelta == 0
-            && sample.lateDroppedFramesDelta == 0
+        let isClean = !isImpaired
             && (sample.fecRecoveredFramesDelta == 0 || (totalFrames >= 20 && fecRatio < 0.05))
             && sample.jitterMs < 20.0
 
@@ -1747,6 +1805,7 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
                 if failedProbeCount >= 2 {
                     learnedSafeCeilingBps = min(learnedSafeCeilingBps, stableBps)
                     isCeilingLocked = true
+                    lockedSinceNanoseconds = sample.timestampNanoseconds
                 }
                 return .revertToStable(
                     newBitrateBps: stableBps,
@@ -1756,7 +1815,7 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
             }
 
             // Step down every 1 second until the network stabilizes.
-            let factor = isSevere ? 0.75 : 0.85
+            let factor = isSevere ? 0.80 : 0.90
             let minStepBps = isSevere ? 2_000_000 : 1_000_000
             let scaled = Int((Double(currentBitrateBps) * factor).rounded(.down))
             let candidate = min(scaled, currentBitrateBps - minStepBps)
@@ -1786,6 +1845,16 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
                 lastStableBitrateBps = currentBitrateBps
             }
 
+            // Release a locked ceiling after a long clean stretch (conditions change on Wi-Fi);
+            // the next probe still waits out the doubled backoff of one failed probe.
+            if isCeilingLocked,
+               sample.timestampNanoseconds &- max(cleanWindowStartNanoseconds, lockedSinceNanoseconds)
+                   >= Self.ceilingLockReleaseNanoseconds {
+                isCeilingLocked = false
+                learnedSafeCeilingBps = maxCeilingBitrateBps
+                failedProbeCount = 1
+            }
+
             let effectiveCeiling = min(maxCeilingBitrateBps, learnedSafeCeilingBps)
             guard !isCeilingLocked, currentBitrateBps < effectiveCeiling else {
                 return .hold
@@ -1805,7 +1874,18 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
                 return .hold
             }
 
-            let growthFactor = failedProbeCount == 0 ? 1.10 : 1.05
+            // Far below the ceiling (after cuts for a bad patch), climb back in bigger steps.
+            let headroom = Double(currentBitrateBps) / Double(max(effectiveCeiling, 1))
+            let growthFactor: Double
+            if failedProbeCount > 0 {
+                growthFactor = 1.05
+            } else if headroom < 0.5 {
+                growthFactor = 1.25
+            } else if headroom < 0.8 {
+                growthFactor = 1.15
+            } else {
+                growthFactor = 1.10
+            }
             let minStepBps = failedProbeCount == 0 ? 2_000_000 : 1_000_000
             let grown = Int((Double(currentBitrateBps) * growthFactor).rounded(.up))
             let candidate = max(grown, currentBitrateBps + minStepBps)
@@ -1950,6 +2030,302 @@ public enum SPPWAppLanguage: String, CaseIterable, Identifiable, Sendable {
 /// Lightweight cross-platform localization helper backed by `Localizable.xcstrings` and an embedded dictionary
 /// for the 7 required languages: Italian (`it`), Chinese (`zh` / `zh-Hans`), English (`en`), French (`fr`),
 /// German (`de`), Japanese (`ja`), and Spanish (`es`).
+// MARK: - Resolution ladder (client-chosen scaling)
+
+/// Stream sizes derived from the server's native size by *short side* ("p" = lines on the
+/// shorter dimension), so every level keeps the server screen's aspect ratio — 16:9, 16:10,
+/// iPhone, iPad, landscape or portrait — and is never larger than native.
+///
+/// Wire semantics of `ClientConfiguration.width/height`:
+/// - `0 × 0`: native (server screen size; 1920×1080 for generated test content);
+/// - `0 × S`: short side `S`, long side from the server's aspect ratio;
+/// - `W × H`: fit inside `W × H` keeping the server's aspect ratio (legacy explicit sizes).
+public enum SPPWResolutionLadder {
+    /// Levels offered to the user, high to low.
+    public static let shortSides: [Int] = [2160, 1440, 1080, 720, 480, 360, 320]
+    public static let maximumWidth = 3840
+    public static let maximumHeight = 2160
+
+    /// Nearest even value, at least 2.
+    public static func even(_ value: Double) -> Int {
+        max(2, Int((value / 2).rounded()) * 2)
+    }
+
+    /// Size whose short side is `shortSide`, with `native`'s aspect ratio; native when the
+    /// level is not below the native short side.
+    public static func size(shortSide: Int, native: (width: Int, height: Int)) -> (width: Int, height: Int) {
+        let nativeWidth = max(native.width, 2)
+        let nativeHeight = max(native.height, 2)
+        let nativeShort = min(nativeWidth, nativeHeight)
+        guard shortSide > 0, shortSide < nativeShort else { return (nativeWidth, nativeHeight) }
+        let scale = Double(shortSide) / Double(nativeShort)
+        if nativeWidth >= nativeHeight {
+            return (even(Double(nativeWidth) * scale), even(Double(shortSide)))
+        }
+        return (even(Double(shortSide)), even(Double(nativeHeight) * scale))
+    }
+
+    /// Resolves a client request against the server's native size (see type docs).
+    public static func resolve(
+        requestedWidth: Int,
+        requestedHeight: Int,
+        native: (width: Int, height: Int)
+    ) -> (width: Int, height: Int) {
+        if requestedWidth <= 0 && requestedHeight <= 0 {
+            return (max(native.width, 2), max(native.height, 2))
+        }
+        if requestedWidth <= 0 {
+            return size(shortSide: requestedHeight, native: native)
+        }
+        let nativeWidth = Double(max(native.width, 2))
+        let nativeHeight = Double(max(native.height, 2))
+        var scale = min(1, Double(requestedWidth) / nativeWidth)
+        if requestedHeight > 0 {
+            scale = min(scale, Double(requestedHeight) / nativeHeight)
+        }
+        return (even(nativeWidth * scale), even(nativeHeight * scale))
+    }
+
+    /// The ladder levels strictly below the native short side.
+    public static func availableShortSides(nativeShortSide: Int?) -> [Int] {
+        guard let nativeShortSide, nativeShortSide > 0 else { return shortSides }
+        return shortSides.filter { $0 < nativeShortSide }
+    }
+}
+
+/// The receiver's resolution choice.
+public enum SPPWResolutionMode: Hashable, Sendable, Identifiable {
+    /// Server's native size.
+    case native
+    /// Chosen automatically from the adaptive bitrate (`SPPWAutoResolutionController`).
+    case automatic
+    /// Fixed short side from `SPPWResolutionLadder.shortSides`.
+    case shortSide(Int)
+
+    /// Stable string for persistence.
+    public var id: String {
+        switch self {
+        case .native: "native"
+        case .automatic: "auto"
+        case .shortSide(let lines): "short:\(lines)"
+        }
+    }
+
+    public init(id: String) {
+        switch id {
+        case "auto": self = .automatic
+        case let value where value.hasPrefix("short:"):
+            let lines = Int(value.dropFirst("short:".count)) ?? 0
+            self = SPPWResolutionLadder.shortSides.contains(lines) ? .shortSide(lines) : .native
+        default: self = .native
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .native: SPPWLocalization.tr("settings.resolution_native")
+        case .automatic: SPPWLocalization.tr("settings.resolution_auto")
+        case .shortSide(let lines): Self.levelTitle(lines)
+        }
+    }
+
+    public static func levelTitle(_ lines: Int) -> String {
+        switch lines {
+        case 2160: "4K (2160p)"
+        case 1440: "2K (1440p)"
+        default: "\(lines)p"
+        }
+    }
+
+    /// Menu entries: native, automatic, then the levels below the native short side
+    /// (all levels while the native size is unknown).
+    public static func menuOptions(nativeShortSide: Int?) -> [SPPWResolutionMode] {
+        [.native, .automatic] + SPPWResolutionLadder.availableShortSides(nativeShortSide: nativeShortSide).map { .shortSide($0) }
+    }
+}
+
+/// Picks the resolution level for `SPPWResolutionMode.automatic` from the adaptive bitrate.
+///
+/// The adaptive bitrate is capped at the current level's ceiling, so the signals are relative
+/// to that ceiling: a link that keeps the bitrate below `stepDownBelowRatio` of it for
+/// `stepDownHold` cannot carry the level (step down); one that holds it at the ceiling for
+/// the step-up hold has room (try one level up). A step-up that fails within
+/// `failedProbeWindow` doubles the step-up hold (up to `maximumStepUpHold`), so a link at its
+/// limit does not oscillate.
+public struct SPPWAutoResolutionController: Sendable {
+    public enum Change: Equatable, Sendable {
+        case none
+        /// New short side, `nil` = native.
+        case changed(Int?)
+    }
+
+    public var stepDownBelowRatio = 0.5
+    public var stepDownHoldNanos: UInt64 = 3_000_000_000
+    public var stepUpAtRatio = 0.95
+    public var baseStepUpHoldNanos: UInt64 = 15_000_000_000
+    public var maximumStepUpHoldNanos: UInt64 = 120_000_000_000
+    public var failedProbeWindowNanos: UInt64 = 20_000_000_000
+
+    /// Current level, `nil` = native.
+    public private(set) var shortSide: Int?
+    private var belowSince: UInt64?
+    private var atCeilingSince: UInt64?
+    private var lastStepUpNanos: UInt64?
+    private var stepUpHoldNanos: UInt64
+
+    public init(shortSide: Int? = nil) {
+        self.shortSide = shortSide
+        self.stepUpHoldNanos = 15_000_000_000
+    }
+
+    public mutating func reset(shortSide: Int? = nil) {
+        self = SPPWAutoResolutionController(shortSide: shortSide)
+    }
+
+    /// Levels from highest (native, `nil`) to lowest.
+    private static func levels(nativeShortSide: Int) -> [Int?] {
+        [nil] + SPPWResolutionLadder.availableShortSides(nativeShortSide: nativeShortSide).map { Optional($0) }
+    }
+
+    public mutating func evaluate(
+        currentBitrateBps: Int,
+        ceilingBitrateBps: Int,
+        nativeShortSide: Int,
+        now: UInt64
+    ) -> Change {
+        let levels = Self.levels(nativeShortSide: nativeShortSide)
+        let index = levels.firstIndex(where: { $0 == shortSide }) ?? 0
+        let ratio = ceilingBitrateBps > 0 ? Double(currentBitrateBps) / Double(ceilingBitrateBps) : 1
+
+        if let lastUp = lastStepUpNanos, now &- lastUp > 60_000_000_000 {
+            // Held the higher level for a minute: the probe succeeded.
+            stepUpHoldNanos = baseStepUpHoldNanos
+            lastStepUpNanos = nil
+        }
+
+        if ratio < stepDownBelowRatio {
+            atCeilingSince = nil
+            let since = belowSince ?? now
+            belowSince = since
+            if now &- since >= stepDownHoldNanos, index + 1 < levels.count {
+                if let lastUp = lastStepUpNanos, now &- lastUp < failedProbeWindowNanos {
+                    stepUpHoldNanos = min(stepUpHoldNanos * 2, maximumStepUpHoldNanos)
+                }
+                lastStepUpNanos = nil
+                belowSince = nil
+                shortSide = levels[index + 1]
+                return .changed(shortSide)
+            }
+            return .none
+        }
+        belowSince = nil
+
+        if ratio >= stepUpAtRatio {
+            let since = atCeilingSince ?? now
+            atCeilingSince = since
+            if now &- since >= stepUpHoldNanos, index > 0 {
+                atCeilingSince = nil
+                lastStepUpNanos = now
+                shortSide = levels[index - 1]
+                return .changed(shortSide)
+            }
+            return .none
+        }
+        atCeilingSince = nil
+        return .none
+    }
+
+    /// Fixed (manual) bitrate: the highest level whose bitrate ceiling fits it.
+    public static func bestShortSide(
+        bitrateBps: Int,
+        fps: Int,
+        quality: Double,
+        native: (width: Int, height: Int)
+    ) -> Int? {
+        let nativeShort = min(native.width, native.height)
+        for level in levels(nativeShortSide: nativeShort) {
+            let size = level.map { SPPWResolutionLadder.size(shortSide: $0, native: native) } ?? native
+            let ceiling = SPPWAdaptiveBitrateController.recommendedCeilingBitrateBps(
+                width: size.width, height: size.height, fps: fps, quality: quality
+            )
+            if ceiling <= bitrateBps { return level }
+        }
+        return SPPWResolutionLadder.availableShortSides(nativeShortSide: nativeShort).last
+    }
+}
+
+// MARK: - Keep streaming processes responsive
+
+/// Process activity assertion held while a server streams or a receiver is connected.
+///
+/// Without it macOS puts a hidden/occluded app into App Nap after a while: timers are
+/// coalesced and threads throttled, which stalls packet pacing, capture and the UDP loop —
+/// the stream "stops after some time in the background". `latencyCritical` keeps timer
+/// precision, `userInitiated` prevents App Nap and idle system sleep, and
+/// `keepDisplayAwake` also stops the display from sleeping (a sleeping or locked display
+/// makes ScreenCaptureKit stop delivering frames).
+/// On iOS the assertion does not prevent suspension; the apps additionally disable the idle
+/// timer (auto-lock) while streaming.
+public final class SPPWStreamingActivity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var token: NSObjectProtocol?
+    private let reason: String
+
+    public init(reason: String) {
+        self.reason = reason
+    }
+
+    public var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return token != nil
+    }
+
+    /// Idempotent; calling again with a different `keepDisplayAwake` replaces the assertion.
+    public func begin(keepDisplayAwake: Bool) {
+        var options: ProcessInfo.ActivityOptions = [.userInitiated, .latencyCritical]
+        if keepDisplayAwake {
+            options.insert(.idleDisplaySleepDisabled)
+        }
+        let newToken = ProcessInfo.processInfo.beginActivity(options: options, reason: reason)
+        lock.lock()
+        let previous = token
+        token = newToken
+        lock.unlock()
+        if let previous {
+            ProcessInfo.processInfo.endActivity(previous)
+        }
+    }
+
+    public func end() {
+        lock.lock()
+        let previous = token
+        token = nil
+        lock.unlock()
+        if let previous {
+            ProcessInfo.processInfo.endActivity(previous)
+        }
+    }
+
+    deinit {
+        if let token {
+            ProcessInfo.processInfo.endActivity(token)
+        }
+    }
+}
+
+/// Retry delay for automatically restarting a capture source that stopped on its own:
+/// 1, 2, 4, 8 s, then every 10 s.
+public enum SPPWSourceRestartPolicy {
+    public static func delayNanoseconds(attempt: Int) -> UInt64 {
+        let seconds = min(10, 1 << min(max(attempt, 0), 4))
+        return UInt64(seconds) * 1_000_000_000
+    }
+
+    /// A source that ran at least this long before stopping resets the backoff.
+    public static let healthyRunNanoseconds: UInt64 = 10_000_000_000
+}
+
 public enum SPPWLocalization {
     public static let languageDefaultsKey = "sppwPreferredAppLanguage"
     public static let didChangeLanguageNotification = Notification.Name("SPPWLocalizationDidChangeLanguageNotification")
@@ -2000,6 +2376,105 @@ public enum SPPWLocalization {
     }
 
     public static let translations: [String: [String: String]] = [
+        "remote.title": [
+            "it": "Controllo remoto", "en": "Remote control", "zh": "远程控制", "fr": "Contrôle à distance", "de": "Fernsteuerung", "ja": "リモート操作", "es": "Control remoto"
+        ],
+        "remote.touch_mode": [
+            "it": "Modalità tocco", "en": "Touch mode", "zh": "触控模式", "fr": "Mode tactile", "de": "Touch-Modus", "ja": "タッチモード", "es": "Modo táctil"
+        ],
+        "remote.mode.trackpad": [
+            "it": "Trackpad", "en": "Trackpad", "zh": "触控板", "fr": "Trackpad", "de": "Trackpad", "ja": "トラックパッド", "es": "Trackpad"
+        ],
+        "remote.mode.direct": [
+            "it": "Tocco diretto", "en": "Direct touch", "zh": "直接触控", "fr": "Toucher direct", "de": "Direkte Berührung", "ja": "ダイレクトタッチ", "es": "Toque directo"
+        ],
+        "remote.pointer_speed": [
+            "it": "Velocità puntatore", "en": "Pointer speed", "zh": "指针速度", "fr": "Vitesse du pointeur", "de": "Zeigergeschwindigkeit", "ja": "ポインタの速度", "es": "Velocidad del puntero"
+        ],
+        "remote.natural_scroll": [
+            "it": "Scorrimento naturale", "en": "Natural scrolling", "zh": "自然滚动", "fr": "Défilement naturel", "de": "Natürliches Scrollen", "ja": "ナチュラルスクロール", "es": "Desplazamiento natural"
+        ],
+        "remote.clipboard_sync": [
+            "it": "Sincronizza appunti", "en": "Sync clipboard", "zh": "同步剪贴板", "fr": "Synchroniser le presse-papiers", "de": "Zwischenablage synchronisieren", "ja": "クリップボードを同期", "es": "Sincronizar portapapeles"
+        ],
+        "remote.clipboard_footer": [
+            "it": "Mac → iPhone automatico. iPhone → Mac con il pulsante appunti del dock. Con Appunti universali (stesso Apple ID) la copia passa già da sola. Serve il controllo remoto attivo sul Mac.", "en": "Mac → iPhone is automatic. iPhone → Mac with the dock's clipboard button. With Universal Clipboard (same Apple ID) copies already travel on their own. Remote control must be enabled on the Mac.", "zh": "Mac → iPhone 自动同步。iPhone → Mac 请使用程序坞中的剪贴板按钮。使用通用剪贴板（同一 Apple ID）时，复制内容会自动传递。需要在 Mac 上启用远程控制。", "fr": "Mac → iPhone automatique. iPhone → Mac avec le bouton presse-papiers du dock. Avec le presse-papiers universel (même identifiant Apple), les copies passent déjà seules. Le contrôle à distance doit être activé sur le Mac.", "de": "Mac → iPhone automatisch. iPhone → Mac mit der Zwischenablage-Taste im Dock. Mit der universellen Zwischenablage (gleiche Apple-ID) wird Kopiertes bereits automatisch übertragen. Die Fernsteuerung muss auf dem Mac aktiviert sein.", "ja": "Mac → iPhone は自動。iPhone → Mac は Dock のクリップボードボタンで送信します。ユニバーサルクリップボード（同じ Apple ID）では、コピーは自動で共有されます。Mac でリモート操作を有効にする必要があります。", "es": "Mac → iPhone automático. iPhone → Mac con el botón de portapapeles del dock. Con el portapapeles universal (mismo Apple ID) las copias ya pasan solas. El control remoto debe estar activado en el Mac."
+        ],
+        "remote.hint.trackpad": [
+            "it": "1 dito muove · tocco clic · 2 dita scorrono · tocco a 2 dita clic destro · tieni premuto e trascina", "en": "1 finger moves · tap clicks · 2 fingers scroll · 2-finger tap right-clicks · press and hold to drag", "zh": "单指移动 · 轻点点击 · 双指滚动 · 双指轻点右键 · 按住拖移", "fr": "1 doigt déplace · toucher clique · 2 doigts défilent · toucher à 2 doigts clic droit · maintenir pour glisser", "de": "1 Finger bewegt · Tippen klickt · 2 Finger scrollen · Tippen mit 2 Fingern Rechtsklick · gedrückt halten zum Ziehen", "ja": "1本指で移動 · タップでクリック · 2本指でスクロール · 2本指タップで右クリック · 長押しでドラッグ", "es": "1 dedo mueve · toque hace clic · 2 dedos desplazan · toque con 2 dedos clic derecho · mantén pulsado para arrastrar"
+        ],
+        "remote.hint.direct": [
+            "it": "Il dito è il puntatore · tocca per cliccare · trascina per spostare", "en": "Your finger is the pointer · tap to click · drag to move", "zh": "手指即指针 · 轻点点击 · 拖动移动", "fr": "Votre doigt est le pointeur · toucher pour cliquer · glisser pour déplacer", "de": "Der Finger ist der Zeiger · Tippen zum Klicken · Ziehen zum Bewegen", "ja": "指がポインタ · タップでクリック · ドラッグで移動", "es": "Tu dedo es el puntero · toca para hacer clic · arrastra para mover"
+        ],
+        "remote.dock.mode": [
+            "it": "Modalità tocco", "en": "Touch mode", "zh": "触控模式", "fr": "Mode tactile", "de": "Touch-Modus", "ja": "タッチモード", "es": "Modo táctil"
+        ],
+        "remote.dock.keyboard": [
+            "it": "Tastiera", "en": "Keyboard", "zh": "键盘", "fr": "Clavier", "de": "Tastatur", "ja": "キーボード", "es": "Teclado"
+        ],
+        "remote.dock.special_keys": [
+            "it": "Tasti speciali", "en": "Special keys", "zh": "特殊键", "fr": "Touches spéciales", "de": "Sondertasten", "ja": "特殊キー", "es": "Teclas especiales"
+        ],
+        "remote.dock.right_click": [
+            "it": "Prossimo tocco: clic destro", "en": "Next tap: right click", "zh": "下次轻点：右键", "fr": "Prochain toucher : clic droit", "de": "Nächstes Tippen: Rechtsklick", "ja": "次のタップ：右クリック", "es": "Siguiente toque: clic derecho"
+        ],
+        "remote.dock.hide": [
+            "it": "Nascondi controlli", "en": "Hide controls", "zh": "隐藏控制", "fr": "Masquer les commandes", "de": "Steuerung ausblenden", "ja": "コントロールを隠す", "es": "Ocultar controles"
+        ],
+        "remote.dock.show": [
+            "it": "Mostra controlli", "en": "Show controls", "zh": "显示控制", "fr": "Afficher les commandes", "de": "Steuerung einblenden", "ja": "コントロールを表示", "es": "Mostrar controles"
+        ],
+        "remote.keys.function": [
+            "it": "Tasti funzione", "en": "Function keys", "zh": "功能键", "fr": "Touches de fonction", "de": "Funktionstasten", "ja": "ファンクションキー", "es": "Teclas de función"
+        ],
+        "remote.keys.shortcuts": [
+            "it": "Scorciatoie", "en": "Shortcuts", "zh": "快捷键", "fr": "Raccourcis", "de": "Kurzbefehle", "ja": "ショートカット", "es": "Atajos"
+        ],
+        "remote.keys.editing": [
+            "it": "Modifica e navigazione", "en": "Editing and navigation", "zh": "编辑与导航", "fr": "Édition et navigation", "de": "Bearbeiten und Navigation", "ja": "編集とナビゲーション", "es": "Edición y navegación"
+        ],
+        "key.cut": [
+            "it": "Taglia", "en": "Cut", "zh": "剪切", "fr": "Couper", "de": "Ausschneiden", "ja": "カット", "es": "Cortar"
+        ],
+        "key.copy": [
+            "it": "Copia", "en": "Copy", "zh": "拷贝", "fr": "Copier", "de": "Kopieren", "ja": "コピー", "es": "Copiar"
+        ],
+        "key.paste": [
+            "it": "Incolla", "en": "Paste", "zh": "粘贴", "fr": "Coller", "de": "Einsetzen", "ja": "ペースト", "es": "Pegar"
+        ],
+        "key.select_all": [
+            "it": "Seleziona tutto", "en": "Select all", "zh": "全选", "fr": "Tout sélectionner", "de": "Alles auswählen", "ja": "すべてを選択", "es": "Seleccionar todo"
+        ],
+        "key.undo": [
+            "it": "Annulla", "en": "Undo", "zh": "撤销", "fr": "Annuler", "de": "Widerrufen", "ja": "取り消す", "es": "Deshacer"
+        ],
+        "key.redo": [
+            "it": "Ripristina", "en": "Redo", "zh": "重做", "fr": "Rétablir", "de": "Wiederholen", "ja": "やり直す", "es": "Rehacer"
+        ],
+        "key.spotlight": [
+            "it": "Spotlight", "en": "Spotlight", "zh": "聚焦搜索", "fr": "Spotlight", "de": "Spotlight", "ja": "Spotlight", "es": "Spotlight"
+        ],
+        "key.app_switcher": [
+            "it": "Cambia app", "en": "Switch apps", "zh": "切换应用", "fr": "Changer d’app", "de": "App wechseln", "ja": "アプリを切り替え", "es": "Cambiar de app"
+        ],
+        "key.minimize": [
+            "it": "Riduci a icona", "en": "Minimize", "zh": "最小化", "fr": "Placer dans le Dock", "de": "Im Dock ablegen", "ja": "しまう", "es": "Minimizar"
+        ],
+        "key.close_window": [
+            "it": "Chiudi finestra", "en": "Close window", "zh": "关闭窗口", "fr": "Fermer la fenêtre", "de": "Fenster schließen", "ja": "ウインドウを閉じる", "es": "Cerrar ventana"
+        ],
+        "key.quit": [
+            "it": "Esci dall’app", "en": "Quit app", "zh": "退出应用", "fr": "Quitter l’app", "de": "App beenden", "ja": "アプリを終了", "es": "Salir de la app"
+        ],
+        "key.mission_control": [
+            "it": "Mission Control", "en": "Mission Control", "zh": "调度中心", "fr": "Mission Control", "de": "Mission Control", "ja": "Mission Control", "es": "Mission Control"
+        ],
+        "key.show_desktop": [
+            "it": "Mostra scrivania", "en": "Show desktop", "zh": "显示桌面", "fr": "Afficher le bureau", "de": "Schreibtisch anzeigen", "ja": "デスクトップを表示", "es": "Mostrar escritorio"
+        ],
+        "key.forward_delete": [
+            "it": "Cancella avanti", "en": "Forward delete", "zh": "向前删除", "fr": "Supprimer vers la droite", "de": "Vorwärts löschen", "ja": "前方削除", "es": "Suprimir hacia delante"
+        ],
         "action.apply_resync": [
             "it": "Applica e risincronizza", "en": "Apply and resync", "zh": "应用并重新同步",
             "fr": "Appliquer et resynchroniser", "de": "Anwenden & synchronisieren", "ja": "適用して再同期", "es": "Aplicar y resincronizar"
@@ -2035,6 +2510,14 @@ public enum SPPWLocalization {
         "action.exit_fullscreen_help": [
             "it": "Esci da schermo intero (Esc)", "en": "Exit Full Screen (Esc)", "zh": "退出全屏 (Esc)",
             "fr": "Quitter le plein écran (Échap)", "de": "Vollbild beenden (Esc)", "ja": "フルスクリーン終了 (Esc)", "es": "Salir de pantalla completa (Esc)"
+        ],
+        "receiver.fullscreen_exit_help": [
+            "it": "Esci da schermo intero (⌃⌥: premi e rilascia Control+Opzione)", "en": "Exit Full Screen (⌃⌥: press and release Control+Option)", "zh": "退出全屏（⌃⌥：按下并松开 Control+Option）",
+            "fr": "Quitter le plein écran (⌃⌥ : appuyez puis relâchez Contrôle+Option)", "de": "Vollbild beenden (⌃⌥: Control+Wahl drücken und loslassen)", "ja": "フルスクリーン終了（⌃⌥：Control+Option を押して離す）", "es": "Salir de pantalla completa (⌃⌥: pulsa y suelta Control+Opción)"
+        ],
+        "receiver.fullscreen_exit_hint": [
+            "it": "Premi e rilascia ⌃⌥ per uscire dallo schermo intero", "en": "Press and release ⌃⌥ to exit full screen", "zh": "按下并松开 ⌃⌥ 退出全屏",
+            "fr": "Appuyez puis relâchez ⌃⌥ pour quitter le plein écran", "de": "⌃⌥ drücken und loslassen, um das Vollbild zu beenden", "ja": "⌃⌥ を押して離すとフルスクリーンを終了します", "es": "Pulsa y suelta ⌃⌥ para salir de pantalla completa"
         ],
         "action.fullscreen": [
             "it": "Schermo intero", "en": "Full Screen", "zh": "全屏",
@@ -2312,9 +2795,125 @@ public enum SPPWLocalization {
             "it": "In attesa del flusso video…", "en": "Waiting for video…", "zh": "正在等待视频流…",
             "fr": "En attente de la vidéo…", "de": "Warte auf Video…", "ja": "ビデオを待機中…", "es": "Esperando vídeo…"
         ],
+        "settings.resolution_native": [
+            "it": "Nativa (schermo del server)", "en": "Native (server screen)", "zh": "原生（服务器屏幕）",
+            "fr": "Native (écran du serveur)", "de": "Nativ (Serverbildschirm)", "ja": "ネイティブ（サーバー画面）", "es": "Nativa (pantalla del servidor)"
+        ],
+        "settings.resolution_auto": [
+            "it": "Automatica", "en": "Automatic", "zh": "自动",
+            "fr": "Automatique", "de": "Automatisch", "ja": "自動", "es": "Automática"
+        ],
+        "settings.resolution_current_fmt": [
+            "it": "Stream attuale: %@", "en": "Current stream: %@", "zh": "当前串流：%@",
+            "fr": "Flux actuel : %@", "de": "Aktueller Stream: %@", "ja": "現在のストリーム: %@", "es": "Transmisión actual: %@"
+        ],
+        "audio.source.none": [
+            "it": "Nessuna (solo video)", "en": "None (video only)", "zh": "无（仅视频）",
+            "fr": "Aucune (vidéo seule)", "de": "Keine (nur Video)", "ja": "なし（映像のみ）", "es": "Ninguna (solo vídeo)"
+        ],
+        "audio.source.system": [
+            "it": "Audio di sistema", "en": "System audio", "zh": "系统音频",
+            "fr": "Audio système", "de": "Systemaudio", "ja": "システムオーディオ", "es": "Audio del sistema"
+        ],
+        "audio.source.label": [
+            "it": "Sorgente audio", "en": "Audio source", "zh": "音频来源",
+            "fr": "Source audio", "de": "Audioquelle", "ja": "オーディオソース", "es": "Fuente de audio"
+        ],
+        "audio.input_volume": [
+            "it": "Volume ingresso", "en": "Input volume", "zh": "输入音量",
+            "fr": "Volume d’entrée", "de": "Eingangslautstärke", "ja": "入力音量", "es": "Volumen de entrada"
+        ],
+        "audio.refresh_sources": [
+            "it": "Aggiorna sorgenti audio", "en": "Refresh audio sources", "zh": "刷新音频来源",
+            "fr": "Actualiser les sources audio", "de": "Audioquellen aktualisieren", "ja": "オーディオソースを更新", "es": "Actualizar fuentes de audio"
+        ],
+        "server.chroma444": [
+            "it": "Colore pieno 4:4:4 (schermo)", "en": "Full color 4:4:4 (screen)", "zh": "全色度 4:4:4（屏幕）",
+            "fr": "Couleur complète 4:4:4 (écran)", "de": "Volle Farbe 4:4:4 (Bildschirm)", "ja": "フルカラー 4:4:4（画面）", "es": "Color completo 4:4:4 (pantalla)"
+        ],
+        "server.chroma444.help": [
+            "it": "Testo e interfacce colorate più nitidi; richiede più banda e GPU. Si applica al prossimo avvio del server.", "en": "Sharper coloured text and UI; uses more bandwidth and GPU. Applies the next time the server starts.", "zh": "彩色文字和界面更清晰；占用更多带宽和 GPU。下次启动服务器时生效。",
+            "fr": "Texte et interface colorés plus nets ; utilise plus de bande passante et de GPU. S’applique au prochain démarrage du serveur.", "de": "Schärferer farbiger Text und UI; benötigt mehr Bandbreite und GPU. Gilt beim nächsten Serverstart.", "ja": "色付きの文字やUIがより鮮明になりますが、帯域とGPUの負荷が増えます。次回サーバー起動時に適用されます。", "es": "Texto e interfaz en color más nítidos; usa más ancho de banda y GPU. Se aplica la próxima vez que se inicie el servidor."
+        ],
         "server.client_preview": [
             "it": "Anteprima client", "en": "Client preview", "zh": "客户端预览",
             "fr": "Aperçu client", "de": "Client-Vorschau", "ja": "クライアントプレビュー", "es": "Vista previa del cliente"
+        ],
+        "server.remote_control": [
+            "it": "Controllo remoto (mouse e tastiera)", "en": "Remote control (mouse & keyboard)", "zh": "远程控制（鼠标和键盘）",
+            "fr": "Contrôle à distance (souris et clavier)", "de": "Fernsteuerung (Maus & Tastatur)", "ja": "リモート操作（マウスとキーボード）", "es": "Control remoto (ratón y teclado)"
+        ],
+        "server.remote_control.help": [
+            "it": "Consente ai client connessi di controllare mouse e tastiera di questo Mac in modalità cattura schermo. Richiede il permesso Accessibilità di macOS.", "en": "Allows connected clients to control this Mac's mouse and keyboard in screen capture mode. Requires macOS Accessibility permission.", "zh": "允许已连接的客户端在屏幕共享模式下控制此 Mac 的鼠标和键盘。需要 macOS 辅助功能权限。",
+            "fr": "Autorise les clients connectés à contrôler la souris et le clavier de ce Mac en mode capture d’écran. Nécessite l’autorisation Accessibilité de macOS.", "de": "Erlaubt verbundenen Clients die Steuerung von Maus und Tastatur dieses Macs im Bildschirmmodus. Erfordert die macOS-Bedienungshilfen-Berechtigung.", "ja": "画面共有モードで接続中のクライアントからこのMacのマウスとキーボードを操作できるようにします。macOSのアクセシビリティ権限が必要です。", "es": "Permite a los clientes conectados controlar el ratón y el teclado de este Mac en modo captura de pantalla. Requiere el permiso de Accesibilidad de macOS."
+        ],
+        "server.accessibility_permission_active": [
+            "it": "Permesso Accessibilità attivo", "en": "Accessibility permission active", "zh": "辅助功能权限已激活",
+            "fr": "Autorisation Accessibilité active", "de": "Bedienungshilfen-Berechtigung aktiv", "ja": "アクセシビリティ権限が有効です", "es": "Permiso de Accesibilidad activo"
+        ],
+        "server.accessibility_permission_required": [
+            "it": "Permesso Accessibilità richiesto", "en": "Accessibility permission required", "zh": "需要辅助功能权限",
+            "fr": "Autorisation Accessibilité requise", "de": "Bedienungshilfen-Berechtigung erforderlich", "ja": "アクセシビリティ権限が必要です", "es": "Se requiere permiso de Accesibilidad"
+        ],
+        "server.accessibility_permission_hint": [
+            "it": "Abilita PyrowaveCast in Impostazioni di Sistema → Privacy e sicurezza → Accessibilità per iniettare mouse e tastiera.", "en": "Enable PyrowaveCast in System Settings → Privacy & Security → Accessibility to inject mouse and keyboard events.", "zh": "请在“系统设置 → 隐私与安全性 → 辅助功能”中启用 PyrowaveCast 以控制鼠标和键盘。",
+            "fr": "Activez PyrowaveCast dans Réglages Système → Confidentialité et sécurité → Accessibilité pour contrôler la souris et le clavier.", "de": "Aktivieren Sie PyrowaveCast unter Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen, um Maus- und Tastatureingaben zu senden.", "ja": "マウスとキーボードを操作するには「システム設定 → プライバシーとセキュリティ → アクセシビリティ」でPyrowaveCastを有効にしてください。", "es": "Activa PyrowaveCast en Ajustes del Sistema → Privacidad y seguridad → Accesibilidad para controlar el ratón y el teclado."
+        ],
+        "server.accessibility_guide_title": [
+            "it": "Guida Accessibilità (Impostazioni e Privacy)", "en": "Accessibility guide (Privacy & Security)", "zh": "辅助功能指南（隐私与安全性）",
+            "fr": "Guide Accessibilité (Confidentialité et sécurité)", "de": "Bedienungshilfen-Anleitung (Datenschutz & Sicherheit)", "ja": "アクセシビリティ設定ガイド（プライバシーとセキュリティ）", "es": "Guía de Accesibilidad (Privacidad y seguridad)"
+        ],
+        "server.accessibility_guide_step1": [
+            "it": "Clicca \"Apri Impostazioni di Sistema\" qui sotto: si aprirà direttamente Impostazioni di Sistema → Privacy e sicurezza → Accessibilità.", "en": "Click \"Open System Settings\" below to open System Settings → Privacy & Security → Accessibility.", "zh": "点击下方的“打开系统设置”：将直接打开“系统设置 → 隐私与安全性 → 辅助功能”。",
+            "fr": "Cliquez sur « Ouvrir les Réglages Système » ci-dessous pour ouvrir Réglages Système → Confidentialité et sécurité → Accessibilité.", "de": "Klicken Sie unten auf „Systemeinstellungen öffnen“, um Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen zu öffnen.", "ja": "下の「システム設定を開く」をクリックすると、「システム設定 → プライバシーとセキュリティ → アクセシビリティ」が開きます。", "es": "Haz clic en «Abrir Ajustes del Sistema» abajo para abrir Ajustes del Sistema → Privacidad y seguridad → Accesibilidad."
+        ],
+        "server.accessibility_guide_step2": [
+            "it": "Se \"PyrowaveCast\" è già nella lista, attiva l’interruttore accanto al nome. Se NON compare, clicca \"+\" in basso a sinistra, seleziona PyrowaveCast.app (usa \"Mostra nel Finder\") e clicca \"Apri\".", "en": "If \"PyrowaveCast\" is already listed, enable its toggle. If it is NOT listed, click the \"+\" button at the bottom left, select PyrowaveCast.app (use \"Show in Finder\"), and click \"Open\".", "zh": "如果列表中已有“PyrowaveCast”，请打开其开关。如果不在列表中，请点击左下角的“+”，选择 PyrowaveCast.app（可使用“在访达中显示”）并点击“打开”。",
+            "fr": "Si « PyrowaveCast » figure déjà dans la liste, activez son interrupteur. Sinon, cliquez sur « + » en bas à gauche, sélectionnez PyrowaveCast.app (utilisez « Afficher dans le Finder ») et cliquez sur « Ouvrir ».", "de": "Wenn „PyrowaveCast“ bereits aufgeführt ist, aktivieren Sie den Schalter. Andernfalls klicken Sie unten links auf „+“, wählen PyrowaveCast.app aus (nutzen Sie „Im Finder zeigen“) und klicken Sie auf „Öffnen“.", "ja": "一覧に「PyrowaveCast」がある場合はスイッチをオンにします。ない場合は左下の「+」をクリックし、PyrowaveCast.app（「Finderで表示」で確認可能）を選択して「開く」をクリックします。", "es": "Si «PyrowaveCast» ya aparece en la lista, activa su interruptor. Si NO aparece, haz clic en «+» abajo a la izquierda, selecciona PyrowaveCast.app (usa «Mostrar en el Finder») y haz clic en «Abrir»."
+        ],
+        "server.accessibility_guide_step3": [
+            "it": "Inserisci la password del Mac oppure usa Touch ID quando richiesto da macOS.", "en": "Enter your Mac password or use Touch ID when prompted by macOS.", "zh": "当 macOS 提示时，输入您的 Mac 密码或使用触控 ID。",
+            "fr": "Saisissez le mot de passe de votre Mac ou utilisez Touch ID lorsque macOS vous le demande.", "de": "Geben Sie Ihr Mac-Passwort ein oder verwenden Sie Touch ID, wenn macOS Sie dazu auffordert.", "ja": "macOSに求められたら、Macのパスワードを入力するかTouch IDを使用します。", "es": "Introduce la contraseña de tu Mac o usa Touch ID cuando macOS lo solicite."
+        ],
+        "server.accessibility_guide_step4": [
+            "it": "Torna in PyrowaveCast e clicca \"Verifica\": il controllo remoto di mouse e tastiera sarà attivo immediatamente (se hai aggiornato l’app, disattiva e riattiva l’interruttore).", "en": "Return to PyrowaveCast and click \"Verify\": remote mouse and keyboard control activates immediately (if you updated the app, toggle it off and back on).", "zh": "返回 PyrowaveCast 并点击“验证”：鼠标和键盘远程控制将立即生效（若刚更新应用，请先关闭再重新打开该开关）。",
+            "fr": "Revenez dans PyrowaveCast et cliquez sur « Vérifier » : le contrôle souris/clavier est actif immédiatement (après une mise à jour, désactivez puis réactivez l’interrupteur).", "de": "Kehren Sie zu PyrowaveCast zurück und klicken Sie auf „Überprüfen“: Die Fernsteuerung ist sofort aktiv (nach einem App-Update den Schalter aus- und wieder einschalten).", "ja": "PyrowaveCastに戻って「確認」をクリックすると、マウスとキーボードの操作がすぐ有効になります（アプリを更新した場合は一度オフにしてからオンにし直してください）。", "es": "Vuelve a PyrowaveCast y haz clic en «Verificar»: el control remoto de ratón y teclado se activará al instante (si actualizaste la app, desactiva y vuelve a activar el interruptor)."
+        ],
+        "server.log.accessibility_missing_warning": [
+            "it": "Controllo remoto attivo ma permesso \"Accessibilità\" non concesso. Abilita PyrowaveCast in Impostazioni di Sistema → Privacy e sicurezza → Accessibilità.", "en": "Remote control is enabled, but \"Accessibility\" permission is not granted. Enable PyrowaveCast in System Settings → Privacy & Security → Accessibility.", "zh": "远程控制已启用，但未授予“辅助功能”权限。请在“系统设置 → 隐私与安全性 → 辅助功能”中启用 PyrowaveCast。",
+            "fr": "Le contrôle à distance est actif, mais l’autorisation « Accessibilité » n’est pas accordée. Activez PyrowaveCast dans Réglages Système → Confidentialité et sécurité → Accessibilité.", "de": "Fernsteuerung ist aktiv, aber die Berechtigung „Bedienungshilfen“ fehlt. Aktivieren Sie PyrowaveCast unter Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen.", "ja": "リモート操作が有効ですが「アクセシビリティ」権限が付与されていません。「システム設定 → プライバシーとセキュリティ → アクセシビリティ」でPyrowaveCastを有効にしてください。", "es": "El control remoto está activo, pero falta el permiso de «Accesibilidad». Activa PyrowaveCast en Ajustes del Sistema → Privacidad y seguridad → Accesibilidad."
+        ],
+        "receiver.remote_control": [
+            "it": "Controllo remoto (mouse e tastiera)", "en": "Remote control (mouse & keyboard)", "zh": "远程控制（鼠标和键盘）",
+            "fr": "Contrôle à distance (souris et clavier)", "de": "Fernsteuerung (Maus & Tastatur)", "ja": "リモート操作（マウスとキーボード）", "es": "Control remoto (ratón y teclado)"
+        ],
+        "receiver.remote_control_short": [
+            "it": "Controllo", "en": "Control", "zh": "控制",
+            "fr": "Contrôle", "de": "Steuerung", "ja": "操作", "es": "Control"
+        ],
+        "receiver.remote_control_help": [
+            "it": "Invia mouse, rotella e tastiera al Mac remoto. Premi ⌃⌥Esc per rilasciare la tastiera.", "en": "Send mouse, scroll, and keyboard input to the remote Mac. Press ⌃⌥Esc to release keyboard focus.", "zh": "将鼠标、滚轮和键盘输入发送到远程 Mac。按 ⌃⌥Esc 释放键盘焦点。",
+            "fr": "Envoie la souris, le défilement et le clavier au Mac distant. Appuyez sur ⌃⌥Échap pour libérer le clavier.", "de": "Sendet Maus-, Scroll- und Tastatureingaben an den entfernten Mac. Mit ⌃⌥Esc Tastaturfokus freigeben.", "ja": "マウス、スクロール、キーボード入力をリモートMacへ送信します。⌃⌥Escでキーボードフォーカスを解除します。", "es": "Envía ratón, rueda y teclado al Mac remoto. Pulsa ⌃⌥Esc para liberar el teclado."
+        ],
+        "receiver.remote_control_hint": [
+            "it": "Clicca sul video per inviare mouse e tastiera al Mac remoto. Premi ⌃⌥Esc per rilasciare.", "en": "Click the video to send mouse and keyboard input to the remote Mac. Press ⌃⌥Esc to release.", "zh": "点击视频区域即可向远程 Mac 发送鼠标和键盘输入。按 ⌃⌥Esc 释放。",
+            "fr": "Cliquez sur la vidéo pour contrôler le Mac distant. Appuyez sur ⌃⌥Échap pour libérer.", "de": "Klicken Sie ins Video, um Maus und Tastatur an den entfernten Mac zu senden. Mit ⌃⌥Esc beenden.", "ja": "映像をクリックするとリモートMacを操作できます。⌃⌥Escで解除します。", "es": "Haz clic en el vídeo para controlar el Mac remoto. Pulsa ⌃⌥Esc para liberar."
+        ],
+        "receiver.remote_control_active_badge": [
+            "it": "Controllo attivo · ⌃⌥Esc per rilasciare", "en": "Control active · ⌃⌥Esc to release", "zh": "控制中 · 按 ⌃⌥Esc 释放",
+            "fr": "Contrôle actif · ⌃⌥Échap pour libérer", "de": "Steuerung aktiv · ⌃⌥Esc zum Freigeben", "ja": "操作中 · ⌃⌥Escで解除", "es": "Control activo · ⌃⌥Esc para liberar"
+        ],
+        "receiver.remote_control_click_badge": [
+            "it": "Clicca sul video per controllare", "en": "Click video to control", "zh": "点击视频开始控制",
+            "fr": "Cliquez sur la vidéo pour contrôler", "de": "Zum Steuern ins Video klicken", "ja": "クリックして操作開始", "es": "Haz clic en el vídeo para controlar"
+        ],
+        "receiver.log.remote_control_enabled": [
+            "it": "Controllo remoto abilitato (clicca sul video, ⌃⌥Esc per rilasciare)", "en": "Remote control enabled (click video, ⌃⌥Esc to release)", "zh": "已启用远程控制（点击视频区域，按 ⌃⌥Esc 释放）",
+            "fr": "Contrôle à distance activé (cliquez sur la vidéo, ⌃⌥Échap pour libérer)", "de": "Fernsteuerung aktiviert (ins Video klicken, ⌃⌥Esc zum Freigeben)", "ja": "リモート操作を有効にしました（映像をクリック、⌃⌥Escで解除）", "es": "Control remoto activado (haz clic en el vídeo, ⌃⌥Esc para liberar)"
+        ],
+        "receiver.log.remote_control_disabled": [
+            "it": "Controllo remoto disabilitato", "en": "Remote control disabled", "zh": "已禁用远程控制",
+            "fr": "Contrôle à distance désactivé", "de": "Fernsteuerung deaktiviert", "ja": "リモート操作を無効にしました", "es": "Control remoto desactivado"
         ],
         "server.error.file_import_fmt": [
             "it": "Impossibile importare il file selezionato: %@", "en": "Could not import the selected file: %@", "zh": "无法导入所选文件：%@",
@@ -2642,3 +3241,42 @@ public enum SPPWLocalization {
         ]
     ]
 }
+
+
+// MARK: - App & Build Version Information
+
+public enum SPPWBuildVersion: Sendable {
+    public static let fallbackVersion = "0.6.5"
+    public static let fallbackBuildNumber = "605"
+    public static let fallbackCommit = "6de2f17"
+
+    /// Formatted build version string, e.g. "v0.6.4 (build 604, c778763)".
+    /// If commit information is not available, falls back to "v0.6.4 (build 604)".
+    public static var current: String {
+        let bundle = Bundle.main
+        if let explicit = bundle.object(forInfoDictionaryKey: "PyrowaveBuildVersion") as? String,
+           !explicit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return explicit
+        }
+
+        let version = (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? fallbackVersion
+        let build = (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? fallbackBuildNumber
+        let commit = (bundle.object(forInfoDictionaryKey: "PyrowaveGitCommit") as? String)
+            ?? (bundle.object(forInfoDictionaryKey: "GitCommit") as? String)
+            ?? fallbackCommit
+
+        return formatted(version: version, build: build, commit: commit)
+    }
+
+    public static func formatted(version: String, build: String, commit: String?) -> String {
+        let trimmedCommit = commit?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedCommit, !trimmedCommit.isEmpty {
+            return "v\(version) (build \(build), \(trimmedCommit))"
+        } else if !build.isEmpty {
+            return "v\(version) (build \(build))"
+        } else {
+            return "v\(version)"
+        }
+    }
+}
+

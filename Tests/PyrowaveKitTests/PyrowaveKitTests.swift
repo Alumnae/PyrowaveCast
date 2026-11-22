@@ -902,6 +902,75 @@ private extension String {
     #expect(metrics.weightedPSNR > 38.0)
 }
 
+@Test func sessionDecodes444StreamToBGRA() async throws {
+    let frame = try TestFrames.synthetic444(width: 128, height: 96)
+    let codec = try PyrowaveCodec()
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+    let reference = try codec.decode(encoded)
+
+    #expect(PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: encoded.data) == kCVPixelFormatType_32BGRA)
+
+    let descriptor = try PyrowaveSessionDescriptor(
+        width: frame.width,
+        height: frame.height,
+        pixelFormat: kCVPixelFormatType_32BGRA,
+        videoSignal: VideoSignalMetadata(yCbCrRange: .full)
+    )
+    let session = try PyrowaveDecoderSession(descriptor: descriptor)
+    let decoded = try await session.decode(encoded)
+    let pixelBuffer = decoded.pixelBuffer
+    #expect(CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA)
+    #expect(CVPixelBufferGetWidth(pixelBuffer) == frame.width)
+    #expect(CVPixelBufferGetHeight(pixelBuffer) == frame.height)
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    let base = try #require(CVPixelBufferGetBaseAddress(pixelBuffer)).assumingMemoryBound(to: UInt8.self)
+    let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    var maxError = 0
+    for row in 0..<frame.height {
+        for column in 0..<frame.width {
+            let index = row * frame.width + column
+            let luma = Double(reference.y.data[index]) / 255.0
+            let cb = Double(reference.cb.data[index]) / 255.0 - 0.5
+            let cr = Double(reference.cr.data[index]) / 255.0 - 0.5
+            let expected = [
+                luma + 1.8556 * cb,                // B
+                luma - 0.1873 * cb - 0.4681 * cr,  // G
+                luma + 1.5748 * cr                 // R
+            ].map { Int((min(max($0, 0), 1) * 255).rounded()) }
+            let pixel = base + row * stride + column * 4
+            for channel in 0..<3 {
+                maxError = max(maxError, abs(Int(pixel[channel]) - expected[channel]))
+            }
+            #expect(pixel[3] == 255)
+        }
+    }
+    // The reference planes are already rounded to 8 bits; the GPU converts from
+    // the float iDWT output, so allow a few LSB of difference.
+    #expect(maxError <= 4)
+}
+
+@Test func sessionRejects444FrameOnNV12OutputAndPicksNV12For420() async throws {
+    let frame444 = try TestFrames.synthetic444(width: 64, height: 64)
+    let frame420 = try TestFrames.synthetic420(width: 64, height: 64)
+    let codec = try PyrowaveCodec()
+    let encoded444 = try codec.encode(frame444, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+    let encoded420 = try codec.encode(frame420, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+
+    #expect(PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: encoded420.data) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+    #expect(PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: encoded420.data, yCbCrRange: .limited) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    #expect(PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: Data()) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+
+    let nv12Session = try PyrowaveDecoderSession(descriptor: try PyrowaveSessionDescriptor(width: 64, height: 64))
+    do {
+        _ = try await nv12Session.decode(encoded444)
+        Issue.record("A 4:4:4 frame must not decode into an NV12 session")
+    } catch let error as PyrowaveSessionError {
+        #expect(error.isRecoverable)
+    }
+}
+
 @Test func waveletPaddingExtendsSourceEdgesBeforeDWTMirrorFiltering() throws {
     let plane = try Plane8(width: 3, height: 2, data: [
         0, 50, 100,

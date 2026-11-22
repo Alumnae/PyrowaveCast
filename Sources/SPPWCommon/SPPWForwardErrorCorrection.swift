@@ -119,6 +119,36 @@ public struct SPPWPyrowaveSubbandBoundary: Sendable, Equatable {
     }
 }
 
+/// Result of inspecting a contiguous byte prefix `[0 ..< contiguousByteLength]` of a
+/// PyroWave bitstream for block alignment and coarse LL subband completeness.
+public struct SPPWPyrowavePrefixInspection: Sendable, Equatable {
+    public let validByteLength: Int
+    public let validBlockCount: Int
+    public let expectedTotalBlocks: Int
+    public let maxBlockIndex: Int
+    public let hasSequenceHeader: Bool
+    /// `true` when `[0 ..< validByteLength]` is guaranteed to contain all non-zero
+    /// coarsest LL subband blocks (`level == 4, band == 0` across Y, Cb, Cr) emitted
+    /// by the encoder, even if some all-zero LL blocks (e.g. solid chroma) were omitted.
+    public let hasCompleteLLSubband: Bool
+
+    public init(
+        validByteLength: Int,
+        validBlockCount: Int,
+        expectedTotalBlocks: Int,
+        maxBlockIndex: Int,
+        hasSequenceHeader: Bool,
+        hasCompleteLLSubband: Bool
+    ) {
+        self.validByteLength = validByteLength
+        self.validBlockCount = validBlockCount
+        self.expectedTotalBlocks = expectedTotalBlocks
+        self.maxBlockIndex = maxBlockIndex
+        self.hasSequenceHeader = hasSequenceHeader
+        self.hasCompleteLLSubband = hasCompleteLLSubband
+    }
+}
+
 /// Zero-allocation parser for upstream PyroWave bitstreams (`Vendor/pyrowave-metal/src/pyrowave_bitstream.cpp`).
 ///
 /// Upstream PyroWave packet layout:
@@ -265,22 +295,35 @@ public enum SPPWPyrowaveSubbandInspector {
         inspect(bitstream)
     }
 
-    /// Computes the byte length of the longest valid 4-byte-aligned prefix of complete
-    /// PyroWave wavelet blocks within `bitstream[0 ..< contiguousByteLength]`.
-    ///
-    /// Used when decoding a partial frame whose LL subband is 100% intact (`allowPartialFrame = true`)
-    /// so that a truncated trailing HF block at a missing fragment boundary is cleanly stripped
-    /// before passing the buffer to `pyrowave_decoder_push_packet`.
-    public static func validBlockAlignedPrefixLength(
+    /// Scans a contiguous byte prefix `[0 ..< contiguousByteLength]` to compute both the
+    /// longest valid 4-byte-aligned block prefix and whether all emitted coarse LL blocks
+    /// (`level == 4, band == 0` across Y, Cb, Cr) have been completely received.
+    public static func inspectContiguousPrefix(
         bitstream: Data,
         contiguousByteLength: Int
-    ) -> Int {
+    ) -> SPPWPyrowavePrefixInspection {
         let limit = min(bitstream.count, contiguousByteLength)
-        guard limit >= 8 else { return 0 }
+        guard limit >= 8 else {
+            return SPPWPyrowavePrefixInspection(
+                validByteLength: 0,
+                validBlockCount: 0,
+                expectedTotalBlocks: 0,
+                maxBlockIndex: -1,
+                hasSequenceHeader: false,
+                hasCompleteLLSubband: false
+            )
+        }
 
-        return bitstream.withUnsafeBytes { rawBuffer -> Int in
+        return bitstream.withUnsafeBytes { rawBuffer -> SPPWPyrowavePrefixInspection in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return 0
+                return SPPWPyrowavePrefixInspection(
+                    validByteLength: 0,
+                    validBlockCount: 0,
+                    expectedTotalBlocks: 0,
+                    maxBlockIndex: -1,
+                    hasSequenceHeader: false,
+                    hasCompleteLLSubband: false
+                )
             }
 
             @inline(__always)
@@ -293,31 +336,93 @@ public enum SPPWPyrowaveSubbandInspector {
             }
 
             var offset = 0
+            var hasSeqHeader = false
+            var width = 0
+            var height = 0
+            var headerSequence: UInt32 = 0
+            var expectedTotalBlocks = 0
+
             let firstWord = readU32LE(0)
             if (firstWord & 0x8000_0000) != 0 {
                 let secondWord = readU32LE(4)
                 let code = (secondWord >> 24) & 0x3
-                guard code == 0 else { return 0 }
+                guard code == 0 else {
+                    return SPPWPyrowavePrefixInspection(
+                        validByteLength: 0,
+                        validBlockCount: 0,
+                        expectedTotalBlocks: 0,
+                        maxBlockIndex: -1,
+                        hasSequenceHeader: false,
+                        hasCompleteLLSubband: false
+                    )
+                }
+                hasSeqHeader = true
+                width = Int(firstWord & 0x3FFF) + 1
+                height = Int((firstWord >> 14) & 0x3FFF) + 1
+                headerSequence = (firstWord >> 28) & 0x7
+                expectedTotalBlocks = Int(secondWord & 0x00FF_FFFF)
                 offset = 8
             }
 
             var validBlocks = 0
+            var maxBlockIndex = -1
             while offset + 8 <= limit {
                 let word0 = readU32LE(offset)
                 if (word0 & 0x8000_0000) != 0 {
                     break
                 }
+                if hasSeqHeader && ((word0 >> 28) & 0x7) != headerSequence {
+                    break
+                }
+                let word1 = readU32LE(offset + 4)
                 let payloadWords = Int((word0 >> 16) & 0x0FFF)
                 let blockByteCount = payloadWords * 4
                 guard payloadWords >= 2, offset + blockByteCount <= limit else {
                     break
                 }
+                let blockIndex = Int(word1 >> 8)
+                if blockIndex > maxBlockIndex {
+                    maxBlockIndex = blockIndex
+                }
                 offset += blockByteCount
                 validBlocks += 1
             }
 
-            return validBlocks > 0 ? offset : 0
+            let blocksPerCoarsestBand = coarsestBandBlockCount(width: width, height: height)
+            // At level 4, Y occupies [0 ..< 4B), Cb occupies [4B ..< 8B), Cr LL occupies [8B ..< 9B),
+            // and Cr HF / finer levels start at 9B. Reaching blockIndex >= 9B guarantees all
+            // non-empty LL blocks across Y, Cb, Cr have already appeared in ascending order.
+            let postLLStartBlockIndex = componentCount * 3 * blocksPerCoarsestBand
+            let hasCompleteLL: Bool
+            if hasSeqHeader {
+                hasCompleteLL = validBlocks >= expectedTotalBlocks || maxBlockIndex >= postLLStartBlockIndex
+            } else {
+                hasCompleteLL = validBlocks > 0
+            }
+
+            let validByteLength = validBlocks > 0 ? offset : 0
+            return SPPWPyrowavePrefixInspection(
+                validByteLength: validByteLength,
+                validBlockCount: validBlocks,
+                expectedTotalBlocks: expectedTotalBlocks,
+                maxBlockIndex: maxBlockIndex,
+                hasSequenceHeader: hasSeqHeader,
+                hasCompleteLLSubband: hasCompleteLL
+            )
         }
+    }
+
+    /// Computes the byte length of the longest valid 4-byte-aligned prefix of complete
+    /// PyroWave wavelet blocks within `bitstream[0 ..< contiguousByteLength]`.
+    ///
+    /// Used when decoding a partial frame whose LL subband is 100% intact (`allowPartialFrame = true`)
+    /// so that a truncated trailing HF block at a missing fragment boundary is cleanly stripped
+    /// before passing the buffer to `pyrowave_decoder_push_packet`.
+    public static func validBlockAlignedPrefixLength(
+        bitstream: Data,
+        contiguousByteLength: Int
+    ) -> Int {
+        inspectContiguousPrefix(bitstream: bitstream, contiguousByteLength: contiguousByteLength).validByteLength
     }
 
     /// Convenience overload checking the longest valid block-aligned prefix across the entire `Data`.

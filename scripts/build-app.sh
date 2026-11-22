@@ -16,7 +16,7 @@
 # Usage:
 #   ./scripts/build-app.sh [--patch|--minor|--major-fix|--no-bump] [output.app path]
 #
-# Default output: build/PyrowaveCast-v<VERSION>-build<BUILD_NUMBER>.app
+# Default output: build/PyrowaveCast-v<VERSION>-build<BUILD_NUMBER>-<COMMIT>.app
 #                 (with convenience symlink build/PyrowaveCast.app)
 
 set -euo pipefail
@@ -53,12 +53,13 @@ if [[ ! -d "$BUNDLE" ]]; then
     exit 1
 fi
 
-echo "==> Packaging $OUT (v$PYROWAVE_VERSION, build $PYROWAVE_BUILD_NUMBER)"
+echo "==> Packaging $OUT (${PYROWAVE_BUILD_VERSION_TEXT})"
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 
 cp "$BIN" "$OUT/Contents/MacOS/PyrowaveCast"
 cp -R "$BUNDLE" "$OUT/Contents/Resources/"
+cp "$ROOT/Resources/AppIcon/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -75,6 +76,12 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <string>${PYROWAVE_BUILD_NUMBER}</string>
     <key>CFBundleShortVersionString</key>
     <string>${PYROWAVE_VERSION}</string>
+    <key>PyrowaveGitCommit</key>
+    <string>${PYROWAVE_COMMIT}</string>
+    <key>PyrowaveBuildVersion</key>
+    <string>${PYROWAVE_BUILD_VERSION_TEXT}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -85,6 +92,8 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>PyrowaveCast needs screen recording permission to stream your display.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>PyrowaveCast streams the selected microphone as the stream's audio when you choose it as audio source.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>PyrowaveCast needs local network access to connect to streaming servers.</string>
     <key>NSBonjourServices</key>
@@ -98,22 +107,12 @@ PLIST
 
 xattr -cr "$OUT" 2>/dev/null || true
 
-SIGN_IDENTITY="${PYROWAVE_CODESIGN_IDENTITY:-}"
-if [[ -z "$SIGN_IDENTITY" ]]; then
-    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-        | awk '/Apple Development:/ { print $2; exit }' || true)"
-fi
-
-if [[ -n "$SIGN_IDENTITY" ]]; then
-    echo "==> Signing $OUT with identity $SIGN_IDENTITY"
-    if ! codesign --force --deep --sign "$SIGN_IDENTITY" --identifier com.pyrowavecast.app "$OUT"; then
-        echo "warning: signing with $SIGN_IDENTITY failed; falling back to ad-hoc signature" >&2
-        codesign --force --deep --sign - --identifier com.pyrowavecast.app "$OUT"
-    fi
-else
-    echo "==> Signing $OUT with ad-hoc signature (set PYROWAVE_CODESIGN_IDENTITY for stable TCC across rebuilds)"
-    codesign --force --deep --sign - --identifier com.pyrowavecast.app "$OUT"
-fi
+# Always ad-hoc: the repositories are public, so builds must never carry a
+# personal Apple Development / Developer ID identity (name and team ID end up in
+# the signature of anything that gets shared). macOS may ask again for the
+# Screen Recording permission after a rebuild.
+echo "==> Signing $OUT with ad-hoc signature"
+codesign --force --deep --sign - --identifier com.pyrowavecast.app "$OUT"
 
 # Update convenience symlink build/PyrowaveCast.app if default output was used
 if [[ -z "${PYROWAVE_OUT_ARG:-}" ]]; then
@@ -121,5 +120,5 @@ if [[ -z "${PYROWAVE_OUT_ARG:-}" ]]; then
     ln -s "$(basename "$OUT")" "$ROOT/build/PyrowaveCast.app"
 fi
 
-echo "==> Done: $OUT (v$PYROWAVE_VERSION, build $PYROWAVE_BUILD_NUMBER)"
+echo "==> Done: $OUT (${PYROWAVE_BUILD_VERSION_TEXT})"
 echo "    Launch it with: open \"$OUT\""

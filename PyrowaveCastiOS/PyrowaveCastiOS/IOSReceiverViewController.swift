@@ -1,6 +1,7 @@
 import Combine
 import CoreVideo
 import UIKit
+import UniformTypeIdentifiers
 #if canImport(SPPWCommon)
 import SPPWCommon
 #endif
@@ -761,12 +762,38 @@ final class IOSFullscreenVideoViewController: UIViewController {
 
     private let videoSurfaceView = IOSVideoSurfaceView()
     private let placeholderLabel = UILabel()
-    private let hudContainer = UIView()
+    private let hudContainer = IOSPassthroughView()
     private let closeButton = UIButton(type: .system)
     private let orientationToolbar = UIStackView()
     private let statsBadge = UILabel()
     private var hudVisible = true
     private var hudHideTask: Task<Void, Never>?
+
+    // Remote control (keyboard, mouse, clipboard → Mac)
+    private let touchInputView = IOSTouchInputView()
+    private lazy var pasteControl: UIPasteControl = {
+        var config = UIPasteControl.Configuration()
+        config.displayMode = .iconOnly
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = IOSRemoteStyle.buttonBackground
+        config.baseForegroundColor = .white
+        let control = UIPasteControl(configuration: config)
+        control.target = self
+        return control
+    }()
+    private lazy var dock = IOSRemoteInputDock(pasteControl: pasteControl)
+    private let showControlsButton = UIButton(type: .system)
+    private let specialKeysPanel = IOSSpecialKeysPanel()
+    private let keyboardField = IOSRemoteKeyboardField()
+    private let compositionLabel = IOSPaddedLabel()
+    private let hintLabel = IOSPaddedLabel()
+    private let mouseInput = IOSHardwareMouseInput()
+    private let keyRepeater = IOSKeyRepeater()
+    private var rightClickArmed = false
+    private var specialKeysVisible = false
+    private var dockBottomToKeyboard: NSLayoutConstraint?
+    private var dockBottomToPanel: NSLayoutConstraint?
+    private var hintHideTask: Task<Void, Never>?
 
     init(model: IOSReceiverModel, onDismiss: @escaping () -> Void) {
         self.model = model
@@ -781,6 +808,12 @@ final class IOSFullscreenVideoViewController: UIViewController {
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
+    /// With an iPad mouse/trackpad connected the pointer is locked so all motion goes to the Mac.
+    override var prefersPointerLocked: Bool { mouseInput.isConnected }
+    /// First responder for hardware keyboards when the on-screen keyboard is not up.
+    override var canBecomeFirstResponder: Bool { true }
+    /// Keep system edge gestures from stealing trackpad drags near the screen edges.
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -799,6 +832,21 @@ final class IOSFullscreenVideoViewController: UIViewController {
         placeholderLabel.textAlignment = .center
         placeholderLabel.text = SPPWLocalization.tr("receiver.waiting_video")
         view.addSubview(placeholderLabel)
+
+        touchInputView.translatesAutoresizingMaskIntoConstraints = false
+        touchInputView.model = model
+        touchInputView.mode = model.remoteInputMode
+        touchInputView.consumeRightClickArm = { [weak self] in
+            guard let self, self.rightClickArmed else { return false }
+            self.rightClickArmed = false
+            self.refreshDock()
+            return true
+        }
+        touchInputView.onToggleControls = { [weak self] in
+            guard let self else { return }
+            self.setControlsVisible(!self.hudVisible)
+        }
+        view.addSubview(touchInputView)
 
         hudContainer.translatesAutoresizingMaskIntoConstraints = false
         hudContainer.backgroundColor = .clear
@@ -864,9 +912,17 @@ final class IOSFullscreenVideoViewController: UIViewController {
             statsBadge.heightAnchor.constraint(equalToConstant: 28)
         ])
 
-        let tap = UITapGestureRecognizer(target: self, action: #selector(toggleHUD))
-        tap.cancelsTouchesInView = false
-        view.addGestureRecognizer(tap)
+        NSLayoutConstraint.activate([
+            touchInputView.topAnchor.constraint(equalTo: view.topAnchor),
+            touchInputView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            touchInputView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            touchInputView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        // The HUD container covers the screen; touches outside its controls reach the touch surface.
+        pasteConfiguration = UIPasteConfiguration(acceptableTypeIdentifiers: [
+            UTType.plainText.identifier, UTType.text.identifier, UTType.image.identifier
+        ])
+        buildRemoteControls()
 
         model.pixelBufferSubject
             .receive(on: DispatchQueue.main)
@@ -889,9 +945,302 @@ final class IOSFullscreenVideoViewController: UIViewController {
             }
             .store(in: &cancellables)
 
+        model.$stickyModifiers
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshDock() }
+            .store(in: &cancellables)
+
+        model.$remoteInputMode
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] mode in
+                guard let self else { return }
+                self.touchInputView.mode = mode
+                self.refreshDock()
+                self.syncRemoteCursorVisibility(mode: mode)
+            }
+            .store(in: &cancellables)
+
         render(model.currentPixelBuffer)
         refreshStatsBadge()
-        scheduleHUDAutoHide()
+        refreshDock()
+        showHint()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        mouseInput.model = model
+        mouseInput.onConnectionChange = { [weak self] _ in
+            self?.setNeedsUpdateOfPrefersPointerLocked()
+            self?.syncRemoteCursorVisibility()
+        }
+        mouseInput.start()
+        setNeedsUpdateOfPrefersPointerLocked()
+        syncRemoteCursorVisibility()
+        becomeFirstResponder()
+    }
+
+    /// In direct touch the finger is the pointer, so the Mac leaves its delayed cursor out of
+    /// the video. Trackpad mode and a hardware mouse (pointer locked, iPad pointer hidden) need
+    /// the Mac cursor to see where the pointer is.
+    private func syncRemoteCursorVisibility(mode: IOSRemoteInputMode? = nil) {
+        let mode = mode ?? model.remoteInputMode
+        model.setRemoteCursorHidden(mode == .directTouch && !mouseInput.isConnected)
+    }
+
+    // MARK: Remote control
+
+    private func buildRemoteControls() {
+        keyboardField.translatesAutoresizingMaskIntoConstraints = false
+        keyboardField.onText = { [weak self] text in self?.model.sendTypedText(text) }
+        keyboardField.onDeleteBackward = { [weak self] in self?.model.sendDeleteBackward() }
+        keyboardField.onComposition = { [weak self] marked in self?.showComposition(marked) }
+        keyboardField.onHardwareKey = { [weak self] key, isDown in self?.handleHardwareKey(key, isDown: isDown) }
+        view.addSubview(keyboardField)
+
+        specialKeysPanel.translatesAutoresizingMaskIntoConstraints = false
+        specialKeysPanel.isHidden = true
+        specialKeysPanel.onKey = { [weak self] key in self?.model.sendSpecialKey(key) }
+        specialKeysPanel.onShowName = { [weak self] name in self?.showHint(name) }
+        view.addSubview(specialKeysPanel)
+
+        dock.translatesAutoresizingMaskIntoConstraints = false
+        dock.onAction = { [weak self] action in self?.handleDockAction(action) }
+        hudContainer.addSubview(dock)
+
+        var showConfig = UIButton.Configuration.filled()
+        showConfig.image = UIImage(systemName: "chevron.up")
+        showConfig.cornerStyle = .capsule
+        showConfig.baseBackgroundColor = IOSRemoteStyle.dockBackground
+        showConfig.baseForegroundColor = .white
+        showControlsButton.configuration = showConfig
+        showControlsButton.accessibilityLabel = SPPWLocalization.tr("remote.dock.show")
+        showControlsButton.translatesAutoresizingMaskIntoConstraints = false
+        showControlsButton.alpha = 0
+        showControlsButton.isHidden = true
+        showControlsButton.addAction(UIAction { [weak self] _ in self?.setControlsVisible(true) }, for: .touchUpInside)
+        view.addSubview(showControlsButton)
+
+        for label in [compositionLabel, hintLabel] {
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.backgroundColor = IOSRemoteStyle.dockBackground
+            label.textColor = UIColor(white: 0.85, alpha: 1)
+            label.font = .systemFont(ofSize: 12, weight: .medium)
+            label.textAlignment = .center
+            label.numberOfLines = 2
+            label.layer.cornerRadius = 14
+            label.layer.cornerCurve = .continuous
+            label.clipsToBounds = true
+            label.alpha = 0
+            label.isUserInteractionEnabled = false
+            view.addSubview(label)
+        }
+        compositionLabel.font = .systemFont(ofSize: 17, weight: .regular)
+        compositionLabel.textColor = .white
+
+        // The system keyboard can also be dismissed by its own hide key.
+        NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.viewIfLoaded?.window != nil else { return }
+                self.showComposition(nil)
+                if !self.keyboardField.isFirstResponder { self.becomeFirstResponder() }
+                self.refreshDock()
+            }
+            .store(in: &cancellables)
+
+        let keyboardTop = view.keyboardLayoutGuide.topAnchor
+        let safe = view.safeAreaLayoutGuide
+        let toKeyboard = dock.bottomAnchor.constraint(equalTo: keyboardTop, constant: -12)
+        let toPanel = dock.bottomAnchor.constraint(equalTo: specialKeysPanel.topAnchor, constant: -8)
+        dockBottomToKeyboard = toKeyboard
+        dockBottomToPanel = toPanel
+        NSLayoutConstraint.activate([
+            keyboardField.widthAnchor.constraint(equalToConstant: 1),
+            keyboardField.heightAnchor.constraint(equalToConstant: 1),
+            keyboardField.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            keyboardField.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            specialKeysPanel.leadingAnchor.constraint(equalTo: safe.leadingAnchor),
+            specialKeysPanel.trailingAnchor.constraint(equalTo: safe.trailingAnchor),
+            specialKeysPanel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            specialKeysPanel.heightAnchor.constraint(lessThanOrEqualTo: view.heightAnchor, multiplier: 0.6),
+
+            toKeyboard,
+            dock.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
+            dock.leadingAnchor.constraint(greaterThanOrEqualTo: safe.leadingAnchor, constant: 12),
+            dock.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -12),
+
+            showControlsButton.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
+            showControlsButton.bottomAnchor.constraint(equalTo: keyboardTop, constant: -12),
+            showControlsButton.widthAnchor.constraint(equalToConstant: 44),
+            showControlsButton.heightAnchor.constraint(equalToConstant: 30),
+
+            compositionLabel.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
+            compositionLabel.bottomAnchor.constraint(equalTo: dock.topAnchor, constant: -8),
+            compositionLabel.widthAnchor.constraint(lessThanOrEqualTo: safe.widthAnchor, constant: -32),
+
+            hintLabel.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
+            hintLabel.bottomAnchor.constraint(equalTo: dock.topAnchor, constant: -10),
+            hintLabel.widthAnchor.constraint(lessThanOrEqualTo: safe.widthAnchor, constant: -32)
+        ])
+    }
+
+    private func handleDockAction(_ action: IOSRemoteInputDock.Action) {
+        switch action {
+        case .toggleMode:
+            model.remoteInputMode = model.remoteInputMode == .trackpad ? .directTouch : .trackpad
+            showHint()
+        case .toggleKeyboard:
+            if keyboardField.isFirstResponder {
+                keyboardField.resignFirstResponder()
+                becomeFirstResponder()
+            } else {
+                setSpecialKeysVisible(false)
+                keyboardField.becomeFirstResponder()
+            }
+        case .toggleSpecialKeys:
+            if !specialKeysVisible, keyboardField.isFirstResponder {
+                keyboardField.resignFirstResponder()
+                becomeFirstResponder()
+            }
+            setSpecialKeysVisible(!specialKeysVisible)
+        case .toggleRightClick:
+            rightClickArmed.toggle()
+        case .collapse:
+            setControlsVisible(false)
+        case let .modifierTap(modifier):
+            model.stickyModifiers.tap(modifier)
+        case let .modifierLock(modifier):
+            model.stickyModifiers.lock(modifier)
+        }
+        refreshDock()
+    }
+
+    private func refreshDock() {
+        dock.update(
+            mode: model.remoteInputMode,
+            keyboardActive: keyboardField.isFirstResponder,
+            specialKeysVisible: specialKeysVisible,
+            modifiers: model.stickyModifiers,
+            rightClickArmed: rightClickArmed
+        )
+    }
+
+    private func setSpecialKeysVisible(_ visible: Bool) {
+        guard specialKeysVisible != visible else { return }
+        specialKeysVisible = visible
+        if visible {
+            specialKeysPanel.refreshTexts()
+            specialKeysPanel.isHidden = false
+            specialKeysPanel.transform = CGAffineTransform(translationX: 0, y: 40)
+            specialKeysPanel.alpha = 0
+        }
+        dockBottomToKeyboard?.isActive = !visible
+        dockBottomToPanel?.isActive = visible
+        UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
+            self.specialKeysPanel.transform = visible ? .identity : CGAffineTransform(translationX: 0, y: 40)
+            self.specialKeysPanel.alpha = visible ? 1 : 0
+            self.view.layoutIfNeeded()
+        } completion: { _ in
+            if !self.specialKeysVisible { self.specialKeysPanel.isHidden = true }
+        }
+        refreshDock()
+    }
+
+    /// Dock, top buttons and stats come and go together (dock chevron, handle, three-finger tap).
+    private func setControlsVisible(_ visible: Bool) {
+        hudVisible = visible
+        if !visible {
+            setSpecialKeysVisible(false)
+            if keyboardField.isFirstResponder {
+                keyboardField.resignFirstResponder()
+                becomeFirstResponder()
+            }
+        }
+        showControlsButton.isHidden = false
+        UIView.animate(withDuration: 0.2) {
+            self.hudContainer.alpha = visible ? 1 : 0
+            self.showControlsButton.alpha = visible ? 0 : 1
+        } completion: { _ in
+            self.showControlsButton.isHidden = self.hudVisible
+        }
+        refreshDock()
+    }
+
+    private func showComposition(_ marked: String?) {
+        let text = marked ?? ""
+        compositionLabel.text = text
+        UIView.animate(withDuration: 0.12) {
+            self.compositionLabel.alpha = text.isEmpty ? 0 : 1
+        }
+    }
+
+    /// Gesture hint for the current touch mode, or a key name from the special keys sheet.
+    private func showHint(_ text: String? = nil) {
+        hintLabel.text = text ?? (model.remoteInputMode == .trackpad
+            ? SPPWLocalization.tr("remote.hint.trackpad")
+            : SPPWLocalization.tr("remote.hint.direct"))
+        hintHideTask?.cancel()
+        UIView.animate(withDuration: 0.15) { self.hintLabel.alpha = 1 }
+        hintHideTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: text == nil ? 4_000_000_000 : 1_500_000_000) } catch { return }
+            UIView.animate(withDuration: 0.3) { self?.hintLabel.alpha = 0 }
+        }
+    }
+
+    // MARK: Hardware keyboard
+
+    private func handleHardwareKey(_ key: UIKey, isDown: Bool) {
+        guard let keyCode = IOSHardwareKeys.macKeyCode(key) else { return }
+        let modifiers = IOSHardwareKeys.modifiers(key.modifierFlags)
+        model.sendHardwareKey(keyCode: keyCode, isDown: isDown, modifiers: modifiers)
+        if isDown {
+            keyRepeater.send = { [weak self] event in self?.model.sendInputEvent(event) }
+            keyRepeater.keyDown(keyCode: keyCode, modifiers: modifiers)
+        } else {
+            keyRepeater.keyUp(keyCode: keyCode)
+        }
+    }
+
+    /// Without the on-screen keyboard, every hardware key goes to the Mac as a key code, so the
+    /// Mac's own keyboard layout and input source apply.
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = Set<UIPress>()
+        for press in presses {
+            if let key = press.key, IOSHardwareKeys.macKeyCode(key) != nil {
+                handleHardwareKey(key, isDown: true)
+            } else {
+                unhandled.insert(press)
+            }
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = Set<UIPress>()
+        for press in presses {
+            if let key = press.key, IOSHardwareKeys.macKeyCode(key) != nil {
+                handleHardwareKey(key, isDown: false)
+            } else {
+                unhandled.insert(press)
+            }
+        }
+        if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        keyRepeater.stop()
+        pressesEnded(presses, with: event)
+    }
+
+    // MARK: Clipboard (iPhone → Mac on an explicit paste)
+
+    override func paste(itemProviders: [NSItemProvider]) {
+        Task { @MainActor [weak self] in
+            guard let content = await IOSClipboardBridge.content(from: itemProviders) else { return }
+            self?.model.sendClipboardToHost(content)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
     }
 
     func syncVideoOrientation(_ orientation: SPPWVideoOrientation) {
@@ -915,6 +1264,12 @@ final class IOSFullscreenVideoViewController: UIViewController {
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         hudHideTask?.cancel()
+        hintHideTask?.cancel()
+        keyRepeater.stop()
+        mouseInput.stop()
+        model.stickyModifiers.reset()
+        model.sendInputEvent(.releaseAll)
+        model.setRemoteCursorHidden(false)
         if isBeingDismissed {
             onDismiss()
         }
@@ -942,35 +1297,6 @@ final class IOSFullscreenVideoViewController: UIViewController {
         statsBadge.text = text
     }
 
-    @objc private func toggleHUD(_ recognizer: UITapGestureRecognizer) {
-        let closeLoc = recognizer.location(in: closeButton)
-        if closeButton.bounds.contains(closeLoc) { return }
-        let toolbarLoc = recognizer.location(in: orientationToolbar)
-        if orientationToolbar.bounds.contains(toolbarLoc) { return }
-        hudVisible.toggle()
-        UIView.animate(withDuration: 0.2) {
-            self.hudContainer.alpha = self.hudVisible ? 1 : 0
-        }
-        if hudVisible {
-            scheduleHUDAutoHide()
-        } else {
-            hudHideTask?.cancel()
-        }
-    }
-
-    private func scheduleHUDAutoHide() {
-        hudHideTask?.cancel()
-        hudHideTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(nanoseconds: 3_500_000_000) }
-            catch { return }
-            guard let self, self.hudVisible else { return }
-            self.hudVisible = false
-            UIView.animate(withDuration: 0.25) {
-                self.hudContainer.alpha = 0
-            }
-        }
-    }
-
     @objc private func closePressed() {
         dismiss(animated: true)
     }
@@ -993,11 +1319,10 @@ final class IOSSettingsViewController: UIViewController {
     private let networkHeaderLabel = UILabel()
     private let diagnosticsHeaderLabel = UILabel()
 
-    private var presetButtons: [UIButton] = []
-    private let widthTitleLabel = UILabel()
-    private let widthField = UITextField()
-    private let heightTitleLabel = UILabel()
-    private let heightField = UITextField()
+    private let resolutionTitleLabel = UILabel()
+    private let resolutionButton = UIButton(type: .system)
+    private let resolutionCurrentLabel = UILabel()
+    private var lastResolutionMenuSignature = ""
     private let serverResolutionNoticeLabel = UILabel()
     private let fpsTitleLabel = UILabel()
     private let fpsOptions = [30, 60, 90, 120]
@@ -1084,7 +1409,9 @@ final class IOSSettingsViewController: UIViewController {
         contentStack.addArrangedSubview(makeGeneralLanguageSection())
         contentStack.addArrangedSubview(makeStreamParametersSection())
         contentStack.addArrangedSubview(makeNetworkAndFECSection())
+        contentStack.addArrangedSubview(remoteControlCard)
         contentStack.addArrangedSubview(makeDiagnosticsSection())
+        contentStack.addArrangedSubview(makeVersionFooter())
     }
 
     private func makeGeneralLanguageSection() -> UIView {
@@ -1142,69 +1469,25 @@ final class IOSSettingsViewController: UIViewController {
             tint: .systemBlue
         ))
 
-        let presetsRow = UIStackView()
-        presetsRow.axis = .horizontal
-        presetsRow.distribution = .fillEqually
-        presetsRow.spacing = 6
-        for (label, w, h) in [("720p", 1280, 720), ("1080p", 1920, 1080), ("1440p", 2560, 1440), ("4K", 3840, 2160)] {
-            var config = UIButton.Configuration.tinted()
-            config.title = label
-            config.buttonSize = .small
-            let btn = UIButton(configuration: config, primaryAction: UIAction { [weak self] _ in
-                guard let self else { return }
-                let swapped = self.receiverModel.videoOrientation.swapsDimensions
-                let targetW = swapped ? h : w
-                let targetH = swapped ? w : h
-                self.receiverModel.width = targetW
-                self.receiverModel.height = targetH
-                self.widthField.text = String(targetW)
-                self.heightField.text = String(targetH)
-            })
-            presetButtons.append(btn)
-            presetsRow.addArrangedSubview(btn)
-        }
-        stack.addArrangedSubview(presetsRow)
+        // Native, automatic, or a short-side level derived from the server's aspect ratio.
+        let resolutionRow = UIStackView()
+        resolutionRow.axis = .horizontal
+        resolutionRow.alignment = .center
+        resolutionRow.spacing = 8
+        resolutionTitleLabel.text = SPPWLocalization.tr("settings.resolution_preset")
+        resolutionTitleLabel.font = .preferredFont(forTextStyle: .subheadline)
+        resolutionButton.showsMenuAsPrimaryAction = true
+        resolutionButton.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
+        resolutionButton.contentHorizontalAlignment = .trailing
+        resolutionRow.addArrangedSubview(resolutionTitleLabel)
+        resolutionRow.addArrangedSubview(UIView())
+        resolutionRow.addArrangedSubview(resolutionButton)
+        stack.addArrangedSubview(resolutionRow)
 
-        let dimRow = UIStackView()
-        dimRow.axis = .horizontal
-        dimRow.alignment = .center
-        dimRow.spacing = 8
-
-        widthTitleLabel.text = SPPWLocalization.tr("settings.width")
-        widthTitleLabel.font = .preferredFont(forTextStyle: .subheadline)
-        widthField.borderStyle = .roundedRect
-        widthField.keyboardType = .numberPad
-        widthField.textAlignment = .right
-        widthField.text = String(receiverModel.width)
-        widthField.widthAnchor.constraint(equalToConstant: 82).isActive = true
-        widthField.addTarget(self, action: #selector(widthChanged), for: .editingChanged)
-
-        let swapBtn = UIButton(type: .system, primaryAction: UIAction(image: UIImage(systemName: "arrow.left.arrow.right")) { [weak self] _ in
-            guard let self else { return }
-            let oldW = self.receiverModel.width
-            self.receiverModel.width = self.receiverModel.height
-            self.receiverModel.height = oldW
-            self.widthField.text = String(self.receiverModel.width)
-            self.heightField.text = String(self.receiverModel.height)
-        })
-
-        heightTitleLabel.text = SPPWLocalization.tr("settings.height")
-        heightTitleLabel.font = .preferredFont(forTextStyle: .subheadline)
-        heightField.borderStyle = .roundedRect
-        heightField.keyboardType = .numberPad
-        heightField.textAlignment = .right
-        heightField.text = String(receiverModel.height)
-        heightField.widthAnchor.constraint(equalToConstant: 82).isActive = true
-        heightField.addTarget(self, action: #selector(heightChanged), for: .editingChanged)
-
-        dimRow.addArrangedSubview(widthTitleLabel)
-        dimRow.addArrangedSubview(widthField)
-        dimRow.addArrangedSubview(UIView())
-        dimRow.addArrangedSubview(swapBtn)
-        dimRow.addArrangedSubview(UIView())
-        dimRow.addArrangedSubview(heightTitleLabel)
-        dimRow.addArrangedSubview(heightField)
-        stack.addArrangedSubview(dimRow)
+        resolutionCurrentLabel.font = .preferredFont(forTextStyle: .caption1)
+        resolutionCurrentLabel.textColor = .secondaryLabel
+        resolutionCurrentLabel.isHidden = true
+        stack.addArrangedSubview(resolutionCurrentLabel)
 
         serverResolutionNoticeLabel.font = .preferredFont(forTextStyle: .caption1)
         serverResolutionNoticeLabel.textColor = .secondaryLabel
@@ -1324,6 +1607,16 @@ final class IOSSettingsViewController: UIViewController {
         return card(stack)
     }
 
+    private func makeVersionFooter() -> UIView {
+        let label = UILabel()
+        label.text = "PyrowaveCast " + SPPWBuildVersion.current
+        label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        label.textColor = .tertiaryLabel
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        return label
+    }
+
     private func makeDiagnosticsSection() -> UIView {
         let stack = UIStackView()
         stack.axis = .vertical
@@ -1391,14 +1684,18 @@ final class IOSSettingsViewController: UIViewController {
         return container
     }
 
+    private lazy var remoteControlCard = IOSRemoteControlSettingsCard(model: receiverModel)
+
     private func refreshSettingsUI() {
         title = SPPWLocalization.tr("tab.settings")
+        remoteControlCard.refreshTexts()
+        remoteControlCard.syncFromModel()
         languageHeaderLabel.text = SPPWLocalization.tr("settings.language")
         streamRequestHeaderLabel.text = SPPWLocalization.tr("settings.stream_request")
         networkHeaderLabel.text = SPPWLocalization.tr("settings.wifi_and_fec")
         diagnosticsHeaderLabel.text = SPPWLocalization.tr("settings.diagnostics")
-        widthTitleLabel.text = SPPWLocalization.tr("settings.width")
-        heightTitleLabel.text = SPPWLocalization.tr("settings.height")
+        resolutionTitleLabel.text = SPPWLocalization.tr("settings.resolution_preset")
+        lastResolutionMenuSignature = "" // rebuild the menu with the new language
         fpsTitleLabel.text = SPPWLocalization.tr("settings.frame_rate")
         qualityTitleLabel.text = SPPWLocalization.tr("settings.quality")
         autoBitrateTitleLabel.text = SPPWLocalization.tr("settings.automatic_bitrate")
@@ -1414,23 +1711,15 @@ final class IOSSettingsViewController: UIViewController {
         applySettingsButton.configuration = applyConfig
 
         let connected = receiverModel.isConnected
-        let resolutionLocked = receiverModel.serverControlledResolution && connected
-        widthField.isEnabled = !resolutionLocked
-        heightField.isEnabled = !resolutionLocked
-        for btn in presetButtons { btn.isEnabled = !resolutionLocked }
+        updateResolutionControls(connected: connected)
 
-        if resolutionLocked {
-            serverResolutionNoticeLabel.text = SPPWLocalization.tr("settings.server_resolution_timeout_fmt", receiverModel.agreedTimeoutSeconds)
-            serverResolutionNoticeLabel.isHidden = false
-        } else if connected {
+        if connected {
             serverResolutionNoticeLabel.text = SPPWLocalization.tr("settings.agreed_timeout_fmt", receiverModel.agreedTimeoutSeconds)
             serverResolutionNoticeLabel.isHidden = false
         } else {
             serverResolutionNoticeLabel.isHidden = true
         }
 
-        if !widthField.isFirstResponder { widthField.text = String(receiverModel.width) }
-        if !heightField.isFirstResponder { heightField.text = String(receiverModel.height) }
         if let fpsIndex = fpsOptions.firstIndex(of: receiverModel.fps), fpsControl.selectedSegmentIndex != fpsIndex {
             fpsControl.selectedSegmentIndex = fpsIndex
         }
@@ -1459,15 +1748,31 @@ final class IOSSettingsViewController: UIViewController {
         }
     }
 
-    @objc private func widthChanged() {
-        if let val = Int(widthField.text ?? ""), val >= 240, val <= 3840 {
-            receiverModel.width = val
+    private func updateResolutionControls(connected: Bool) {
+        var options = SPPWResolutionMode.menuOptions(nativeShortSide: receiverModel.nativeShortSide)
+        if !options.contains(receiverModel.resolutionMode) {
+            options.append(receiverModel.resolutionMode)
         }
-    }
-
-    @objc private func heightChanged() {
-        if let val = Int(heightField.text ?? ""), val >= 240, val <= 3840 {
-            receiverModel.height = val
+        resolutionButton.setTitle(receiverModel.resolutionMode.title, for: .normal)
+        let signature = options.map(\.id).joined(separator: "|") + "#" + receiverModel.resolutionMode.id
+        if signature != lastResolutionMenuSignature {
+            lastResolutionMenuSignature = signature
+            resolutionButton.menu = UIMenu(children: options.map { option in
+                UIAction(
+                    title: option.title,
+                    state: option == receiverModel.resolutionMode ? .on : .off
+                ) { [weak self] _ in
+                    self?.receiverModel.resolutionMode = option
+                }
+            })
+        }
+        let frameWidth = receiverModel.statistics.frameWidth
+        let frameHeight = receiverModel.statistics.frameHeight
+        if connected && frameWidth > 0 && frameHeight > 0 {
+            resolutionCurrentLabel.text = SPPWLocalization.tr("settings.resolution_current_fmt", "\(frameWidth)×\(frameHeight)")
+            resolutionCurrentLabel.isHidden = false
+        } else {
+            resolutionCurrentLabel.isHidden = true
         }
     }
 

@@ -156,11 +156,15 @@ private final class ServerEncodeWorker: @unchecked Sendable {
                 continue
             }
 
-            encodeSingleFrame(frame.frame.buffer, snapshot: currentSnapshot)
+            encodeSingleFrame(
+                frame.frame.buffer,
+                captureTimestampNanoseconds: frame.frame.captureTimestampNanoseconds,
+                snapshot: currentSnapshot
+            )
         }
     }
 
-    private func encodeSingleFrame(_ pixelBuffer: CVPixelBuffer, snapshot: Snapshot) {
+    private func encodeSingleFrame(_ pixelBuffer: CVPixelBuffer, captureTimestampNanoseconds: UInt64, snapshot: Snapshot) {
         let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
         let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
         guard width > 0, height > 0, width.isMultiple(of: 2), height.isMultiple(of: 2) else { return }
@@ -201,7 +205,10 @@ private final class ServerEncodeWorker: @unchecked Sendable {
                 return
             }
 
-            let frameTimestamp = DispatchTime.now().uptimeNanoseconds
+            // Capture instant, the clock audio packets are stamped with too (A/V sync).
+            let frameTimestamp = captureTimestampNanoseconds != 0
+                ? captureTimestampNanoseconds
+                : SPPWCaptureClock.nowNanoseconds()
             let datagrams = buildPacedFrameDatagrams(
                 streamID: latestSnapshot.streamID,
                 frameID: frameID,
@@ -260,13 +267,25 @@ public actor StreamServer {
     private var udpSocket: SPPWUDPServerSocket?
     private var bonjourAdvertiser: SPPWBonjourAdvertiser?
     private let mediaPacer = SPPWMediaPacer(label: "it.screenspan.pyrowave.server.pacer")
-    private let audioPacketizer = SPPWAudioPacketizer()
+    private nonisolated let audioPacketizer = SPPWAudioPacketizer()
+    /// Audio packets in capture order; `audioSendTask` is their only consumer.
+    private nonisolated let audioSendQueue = SPPWOrderedPacketQueue<[SPPWAudioPacketizer.PacketTuple]>()
+    private var audioSendTask: Task<Void, Never>?
+    /// Held while the server runs: no App Nap / idle sleep; in screen capture mode also no
+    /// display sleep (a sleeping or locked display stops ScreenCaptureKit).
+    private nonisolated let streamingActivity = SPPWStreamingActivity(reason: "PyrowaveCast server streaming")
+    /// Automatic restart of a capture source that stopped on its own while clients remain.
+    private var sourceRestartTask: Task<Void, Never>?
+    private var sourceRestartAttempts = 0
+    private var sourceStartedAtNanos: UInt64 = 0
     private var encodeWorker: ServerEncodeWorker?
     private var clients: [UInt32: ClientSession] = [:]
     private var nextStreamID: UInt32 = 1
     private var sessionReaperTask: Task<Void, Never>?
     private let clientSessionTimeoutNanos: UInt64 = 30_000_000_000
     private var captureEngine: ScreenCaptureEngine?
+    /// `showsCursor` currently applied to the capture (`applyCursorVisibility`).
+    private var captureShowsCursor = true
     private var testSource: TestContentSource?
     /// The task that pumps frames out of the shared source.
     private var sourceTask: Task<Void, Never>?
@@ -283,9 +302,86 @@ public actor StreamServer {
     private var startingGeneration: UInt64?
     private var sharedConfig: ClientConfiguration?
     private let testContentMode: TestContentMode?
+    /// Capture the screen as full resolution chroma (ScreenCaptureKit 'xf44',
+    /// 10-bit 4:4:4) and encode PyroWave 4:4:4. Test content stays 4:2:0.
+    private let fullChroma444: Bool
+    /// What the screen capture mode streams as audio.
+    private let audioSource: SPPWAudioSourceOption.Kind
     private var pendingVideoSeekSeconds: Double?
     private let stats = StreamStats()
     private var runningPort: UInt16 = 0
+    #if os(macOS)
+    private final class RemoteInputState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var enabled: Bool
+        private var displayID: CGDirectDisplayID = CGMainDisplayID()
+        private var loggedMissingAccessibility = false
+
+        init(enabled: Bool) {
+            self.enabled = enabled
+        }
+
+        func setEnabled(_ value: Bool) -> (wasEnabled: Bool, displayID: CGDirectDisplayID) {
+            lock.lock()
+            defer { lock.unlock() }
+            let previous = enabled
+            enabled = value
+            if value {
+                loggedMissingAccessibility = false
+            }
+            return (previous, displayID)
+        }
+
+        func snapshot() -> (enabled: Bool, displayID: CGDirectDisplayID) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (enabled, displayID)
+        }
+
+        func setDisplayID(_ id: CGDirectDisplayID) {
+            lock.lock()
+            displayID = id
+            lock.unlock()
+        }
+
+        private var sequenceFilters: [UInt32: SPPWInputSequenceFilter] = [:]
+
+        /// Drops the redundant copy of a `.sequenced` event from client `streamID`.
+        func filter(_ event: SPPWInputEvent, streamID: UInt32) -> SPPWInputEvent? {
+            lock.lock()
+            defer { lock.unlock() }
+            var filter = sequenceFilters[streamID] ?? SPPWInputSequenceFilter()
+            let result = filter.filter(event)
+            sequenceFilters[streamID] = filter
+            return result
+        }
+
+        func forget(streamID: UInt32?) {
+            lock.lock()
+            if let streamID {
+                sequenceFilters.removeValue(forKey: streamID)
+            } else {
+                sequenceFilters.removeAll()
+            }
+            lock.unlock()
+        }
+
+        func shouldLogMissingAccessibilityWarning() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !loggedMissingAccessibility else { return false }
+            loggedMissingAccessibility = true
+            return true
+        }
+    }
+
+    private nonisolated let remoteInputState: RemoteInputState
+    private nonisolated let inputController = SPPWMacInputController()
+    /// Clients that asked (`.cursorVisibility(hidden: true)`) to keep the host cursor out of the
+    /// video because they draw a local pointer. Honoured only while remote input is enabled.
+    private var cursorHiddenClients: Set<UInt32> = []
+    private nonisolated let clipboardSync = RemoteClipboardSync()
+    #endif
 
     /// Receives every log line the server produces.
     private let logHandler: (@Sendable (ServerLogEntry) -> Void)?
@@ -298,10 +394,21 @@ public actor StreamServer {
     /// ScreenCaptureKit, so no screen recording permission is involved.
     public init(
         testContentMode: TestContentMode? = nil,
+        fullChroma444: Bool = false,
+        audioSource: SPPWAudioSourceOption.Kind = .system,
+        audioInputGain: Float = 1,
+        remoteInputEnabled: Bool = false,
         logHandler: (@Sendable (ServerLogEntry) -> Void)? = nil,
         previewHandler: (@Sendable (Data, Int, Int) -> Void)? = nil
     ) {
         self.testContentMode = testContentMode
+        self.fullChroma444 = fullChroma444
+        self.audioSource = audioSource
+        audioPacketizer.gain = audioInputGain
+        #if os(macOS)
+        self.remoteInputState = RemoteInputState(enabled: remoteInputEnabled)
+        self.clipboardSync.setEnabled(remoteInputEnabled)
+        #endif
         self.logHandler = logHandler
         self.previewHandler = previewHandler
     }
@@ -323,6 +430,66 @@ public actor StreamServer {
             isError: isError
         )
         logHandler?(entry)
+    }
+
+    /// Input volume applied to the streamed audio (0 = silence, 1 = unchanged, 2 = +6 dB).
+    /// Takes effect immediately, also while streaming.
+    public nonisolated func setAudioInputGain(_ gain: Float) {
+        audioPacketizer.gain = gain
+    }
+
+    /// Enables or disables remote mouse/keyboard input injection (screen capture mode only).
+    /// Takes effect immediately while streaming; disabling releases any currently held keys/buttons.
+    public nonisolated func setRemoteInputEnabled(_ enabled: Bool) {
+        #if os(macOS)
+        let (wasEnabled, displayID) = remoteInputState.setEnabled(enabled)
+        if wasEnabled && !enabled {
+            inputController.releaseAll(displayID: displayID)
+        }
+        clipboardSync.setEnabled(enabled)
+        Task { await self.applyCursorVisibility() }
+        #endif
+    }
+
+    #if os(macOS)
+    /// Whether the captured video should include the host cursor right now.
+    private var desiredCaptureShowsCursor: Bool {
+        !(remoteInputState.snapshot().enabled && !cursorHiddenClients.isEmpty)
+    }
+
+    private func setCursorHidden(_ hidden: Bool, streamID: UInt32) {
+        if hidden {
+            cursorHiddenClients.insert(streamID)
+        } else {
+            cursorHiddenClients.remove(streamID)
+        }
+        applyCursorVisibility()
+    }
+
+    /// Updates the running capture's `showsCursor` when the desired value changed.
+    private func applyCursorVisibility() {
+        let shows = desiredCaptureShowsCursor
+        guard shows != captureShowsCursor else { return }
+        captureShowsCursor = shows
+        log(shows ? "Cursore del Mac di nuovo visibile nel video" : "Cursore del Mac nascosto nel video (il client mostra il proprio puntatore)")
+        guard let engine = captureEngine else { return }
+        Task { await engine.setShowsCursor(shows) }
+    }
+    #endif
+
+    /// Forgets per-client remote control state (input sequence filter, clipboard channel).
+    /// `nil` forgets every client.
+    private func forgetRemoteClient(_ streamID: UInt32?) {
+        #if os(macOS)
+        remoteInputState.forget(streamID: streamID)
+        clipboardSync.remove(streamID: streamID)
+        if let streamID {
+            cursorHiddenClients.remove(streamID)
+        } else {
+            cursorHiddenClients.removeAll()
+        }
+        applyCursorVisibility()
+        #endif
     }
 
     /// The current state of the server.
@@ -420,6 +587,16 @@ public actor StreamServer {
         guard udpSocket == nil else {
             throw NSError(domain: "PyrowaveServer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Server is already running"])
         }
+
+        streamingActivity.begin(keepDisplayAwake: isScreenCaptureMode)
+        let audioPackets = audioSendQueue.makeStream()
+        audioSendTask?.cancel()
+        audioSendTask = Task { [weak self] in
+            for await packets in audioPackets {
+                guard let self else { return }
+                await self.broadcastAudioPackets(packets)
+            }
+        }
         let socket = try SPPWUDPServerSocket(
             port: port,
             sendBufferBytes: SPPWSocketBufferTuning.defaultSendBufferBytes,
@@ -493,6 +670,16 @@ public actor StreamServer {
 
     /// Stops the listener and the frame source.
     public func stop() async {
+        #if os(macOS)
+        inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
+        #endif
+        streamingActivity.end()
+        sourceRestartTask?.cancel()
+        sourceRestartTask = nil
+        sourceRestartAttempts = 0
+        audioSendTask?.cancel()
+        audioSendTask = nil
+        audioSendQueue.finish()
         sessionReaperTask?.cancel()
         sessionReaperTask = nil
         mediaPacer.cancelPending()
@@ -503,6 +690,7 @@ public actor StreamServer {
         sourceTask?.cancel()
         sourceTask = nil
         clients.removeAll()
+        forgetRemoteClient(nil)
         bonjourAdvertiser?.stop()
         bonjourAdvertiser = nil
         udpSocket?.stop()
@@ -543,8 +731,12 @@ public actor StreamServer {
                 .map(\.streamID)
             for id in replacedIDs {
                 clients.removeValue(forKey: id)
+                forgetRemoteClient(id)
             }
             if !replacedIDs.isEmpty {
+                #if os(macOS)
+                inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
+                #endif
                 log("Replacing stale client session(s) \(replacedIDs) for \(peerAddress)")
                 let compatibleRunningStream = (sourceTask != nil || startingGeneration != nil)
                     && sharedConfig != nil
@@ -607,6 +799,7 @@ public actor StreamServer {
             var responseStreamID = header.streamID
             if isResync {
                 clients.removeValue(forKey: header.streamID)
+                forgetRemoteClient(header.streamID)
                 responseStreamID = allocateStreamID()
                 client = ClientSession(
                     streamID: responseStreamID,
@@ -655,17 +848,66 @@ public actor StreamServer {
             udpSocket?.send(pong, to: peer)
 
         case .input:
-            handleClientInputPayload(payload)
+            handleClientInputPayload(payload, streamID: client.streamID)
+
+        case .clipboard:
+            handleClientClipboardPayload(payload, client: client)
 
         case .clientHello, .pong, .serverHello, .frameFragment, .fecParity, .audioFrame:
             break
         }
     }
 
-    private func handleClientInputPayload(_ payload: Data) {
+    /// Clipboard sync (`kind = 10`): only in screen capture mode with remote control enabled.
+    private func handleClientClipboardPayload(_ payload: Data, client: ClientSession) {
         #if os(macOS)
-        if let event = SPPWInputEvent.decode(from: payload) {
-            SPPWMacInputInjector.inject(event)
+        guard isScreenCaptureMode, let socket = udpSocket else { return }
+        let streamID = client.streamID
+        let peer = client.peer
+        let result = clipboardSync.receive(
+            payload,
+            streamID: streamID,
+            mtu: client.config.mtu
+        ) { clipboardPayload in
+            socket.send(
+                makeWireDatagram(kind: .clipboard, streamID: streamID, payload: clipboardPayload),
+                to: peer
+            )
+        }
+        switch result {
+        case let .subscription(enabled):
+            log("Appunti condivisi \(enabled ? "attivi" : "disattivati") per il client \(streamID)")
+        case let .content(content):
+            log("Appunti ricevuti dal client \(streamID): \(content.format == .png ? "immagine" : "testo"), \(content.data.count) B")
+        case .none:
+            break
+        }
+        #endif
+    }
+
+    private func handleClientInputPayload(_ payload: Data, streamID: UInt32) {
+        #if os(macOS)
+        guard isScreenCaptureMode else { return }
+        let state = remoteInputState.snapshot()
+        guard state.enabled else { return }
+        let decoded = SPPWInputEvent.decode(from: payload)
+        if let decoded, case let .cursorVisibility(hidden) = decoded.unwrapped {
+            // A capture setting, not an injected event: no Accessibility permission needed.
+            if remoteInputState.filter(decoded, streamID: streamID) != nil {
+                setCursorHidden(hidden, streamID: streamID)
+            }
+            return
+        }
+        guard SPPWMacInputInjector.isAccessibilityTrusted else {
+            if remoteInputState.shouldLogMissingAccessibilityWarning() {
+                log(SPPWLocalization.tr("server.log.accessibility_missing_warning"), isError: true)
+            }
+            return
+        }
+        if let event = decoded {
+            if let accepted = remoteInputState.filter(event, streamID: streamID) {
+                inputController.inject(accepted, displayID: state.displayID)
+            }
             return
         }
         // Backwards compatibility with legacy 2 + N*16 touch format (`count: UInt16`, `(id, phase, x, y)`).
@@ -677,7 +919,10 @@ public actor StreamServer {
                 let yBits = UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 14, as: UInt32.self) })
                 let x = Float(bitPattern: xBits)
                 let y = Float(bitPattern: yBits)
-                SPPWMacInputInjector.inject(.touch([SPPWTouchPoint(id: 0, phase: phase, normalizedX: x, normalizedY: y)]))
+                inputController.inject(
+                    .touch([SPPWTouchPoint(id: 0, phase: phase, normalizedX: x, normalizedY: y)]),
+                    displayID: state.displayID
+                )
             }
         }
         #endif
@@ -715,12 +960,30 @@ public actor StreamServer {
 
     /// In screen capture mode the server's own display decides the stream size,
     /// so the size requested by the client is replaced before it is stored.
+    /// Resolves the client's requested size (`SPPWResolutionLadder` semantics: `0×0` native,
+    /// `0×S` short side `S`, `W×H` fit inside) against the display in screen capture mode —
+    /// ScreenCaptureKit scales the capture itself — or against 1920×1080 16:9 test content.
+    /// Idempotent: resolving an already resolved size returns it unchanged.
     private func applyingServerResolution(to config: ClientConfiguration) -> ClientConfiguration {
-        guard isScreenCaptureMode,
-              let size = ScreenCaptureEngine.primaryDisplayResolution() else { return config }
         var resolved = config
-        resolved.width = size.width
-        resolved.height = size.height
+        if isScreenCaptureMode {
+            guard let native = ScreenCaptureEngine.primaryDisplayResolution() else { return config }
+            let size = SPPWResolutionLadder.resolve(
+                requestedWidth: config.width,
+                requestedHeight: config.height,
+                native: native
+            )
+            resolved.width = size.width
+            resolved.height = size.height
+        } else if config.width <= 0 && config.height > 0 {
+            // Generated content is 16:9; native (0×0) keeps the 1920×1080 default downstream.
+            let size = SPPWResolutionLadder.size(
+                shortSide: config.height,
+                native: (SPPWResolutionLadder.maximumWidth, SPPWResolutionLadder.maximumHeight)
+            )
+            resolved.width = size.width
+            resolved.height = size.height
+        }
         return resolved
     }
 
@@ -732,6 +995,7 @@ public actor StreamServer {
 
         for session in staleSessions {
             clients.removeValue(forKey: session.streamID)
+            forgetRemoteClient(session.streamID)
         }
         syncEncodeWorkerSnapshot()
         log("Expired \(staleSessions.count) inactive client session(s) after \(clientSessionTimeoutNanos / 1_000_000_000)s timeout: \(staleSessions.map(\.streamID))")
@@ -741,6 +1005,9 @@ public actor StreamServer {
     }
 
     private func discardSharedStream(reason: String) async {
+        #if os(macOS)
+        inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
+        #endif
         stopSessionReaper()
         mediaPacer.cancelPending()
         sharedGeneration &+= 1
@@ -790,13 +1057,21 @@ public actor StreamServer {
         let startedTestSource: TestContentSource?
 
         if let testContentMode {
+            let packetizer = audioPacketizer
             let source = TestContentSource(
                 width: captureWidth,
                 height: captureHeight,
                 fps: fps,
                 mode: testContentMode,
                 stats: stats,
-                initialVideoSeekSeconds: pendingVideoSeekSeconds ?? 0
+                initialVideoSeekSeconds: pendingVideoSeekSeconds ?? 0,
+                audioHandler: { [weak self] buffer, capturedAt in
+                    // Video file mode: stream the file's audio track, stamped on the
+                    // same timeline as its frames.
+                    let packets = packetizer.packetize(pcmBuffer: buffer, captureNanoseconds: capturedAt)
+                    guard !packets.isEmpty, let self else { return }
+                    self.audioSendQueue.yield(packets)
+                }
             )
             log("Starting shared test source: \(captureWidth)x\(captureHeight) @ \(fps)fps")
             frameStream = await source.start()
@@ -804,20 +1079,32 @@ public actor StreamServer {
             startedTestSource = source
         } else {
             let packetizer = audioPacketizer
+            #if os(macOS)
+            let inputState = remoteInputState
+            let displayHandler: (@Sendable (CGDirectDisplayID) -> Void)? = { displayID in
+                inputState.setDisplayID(displayID)
+            }
+            #else
+            let displayHandler: (@Sendable (CGDirectDisplayID) -> Void)? = nil
+            #endif
             let engine = ScreenCaptureEngine(
                 width: captureWidth,
                 height: captureHeight,
                 fps: fps,
+                fullChroma444: fullChroma444,
+                showsCursor: captureShowsCursor,
+                audioSource: audioSource,
                 audioHandler: { [weak self] sampleBuffer in
                     let packets = packetizer.packetize(sampleBuffer: sampleBuffer)
                     guard !packets.isEmpty, let self else { return }
-                    Task { await self.broadcastAudioPackets(packets) }
+                    self.audioSendQueue.yield(packets)
                 },
+                displayHandler: displayHandler,
                 logHandler: { [weak self] message, isError in
                     Task { await self?.log(message, isError: isError) }
                 }
             )
-            log("Starting shared ScreenCaptureKit source: \(captureWidth)x\(captureHeight) @ \(fps)fps")
+            log("Starting shared ScreenCaptureKit source: \(captureWidth)x\(captureHeight) @ \(fps)fps, chroma \(fullChroma444 ? "4:4:4 (10-bit capture)" : "4:2:0")")
             frameStream = await engine.start()
             startedCaptureEngine = engine
             startedTestSource = nil
@@ -838,6 +1125,7 @@ public actor StreamServer {
         let worker = encodeWorker
         // Pump frames directly into the dedicated serial Metal encode worker
         // without re-entering the StreamServer actor on every frame.
+        sourceStartedAtNanos = SPPWCaptureClock.nowNanoseconds()
         sourceTask = Task.detached(priority: .userInitiated) { [weak self, weak worker] in
             for await pixelBuffer in frameStream {
                 guard !Task.isCancelled else { return }
@@ -865,11 +1153,45 @@ public actor StreamServer {
 
     private func handleSourceEnded(generation: UInt64) {
         guard generation == sharedGeneration else { return }
+        #if os(macOS)
+        inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
+        #endif
         sourceTask = nil
         captureEngine = nil
         testSource = nil
         sourceGeometry = nil
-        log("Sorgente video terminata; in attesa di nuova connessione/riconnessione", isError: true)
+        let now = SPPWCaptureClock.nowNanoseconds()
+        if now &- sourceStartedAtNanos >= SPPWSourceRestartPolicy.healthyRunNanoseconds {
+            sourceRestartAttempts = 0
+        }
+        log("Sorgente video terminata", isError: true)
+        scheduleSourceRestart()
+    }
+
+    /// Restarts a source that stopped on its own (ScreenCaptureKit stops when the display
+    /// sleeps or locks, or when the system interrupts capture) as long as clients are still
+    /// connected. Before this, the stream stayed dead until a client reconnected, because
+    /// only a READY ping (sent once on connect) starts the source.
+    private func scheduleSourceRestart() {
+        guard sourceRestartTask == nil, udpSocket != nil, !clients.isEmpty else { return }
+        let delay = SPPWSourceRestartPolicy.delayNanoseconds(attempt: sourceRestartAttempts)
+        sourceRestartAttempts += 1
+        log("Riavvio automatico della sorgente tra \(delay / 1_000_000_000) s")
+        sourceRestartTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            await self?.performSourceRestart()
+        }
+    }
+
+    private func performSourceRestart() async {
+        sourceRestartTask = nil
+        guard udpSocket != nil, sourceTask == nil,
+              let streamID = sharedStreamID != 0 ? sharedStreamID : clients.values.first?.streamID else { return }
+        guard !clients.isEmpty else {
+            sourceRestartAttempts = 0
+            return
+        }
+        await startStreaming(streamID: streamID)
     }
 
     private func restartSharedSource(streamID: UInt32) async {
@@ -897,13 +1219,22 @@ public actor StreamServer {
 /// and not mutated after wrapping.
 struct SendablePixelBuffer: @unchecked Sendable {
     let buffer: CVPixelBuffer
+    /// Capture instant on `SPPWCaptureClock` (0 = unknown, stamped when encoded). Video frames
+    /// and audio packets share this clock so receivers can lip-sync them.
+    var captureTimestampNanoseconds: UInt64 = 0
 }
 
 actor ScreenCaptureEngine {
     private let width: Int
     private let height: Int
     private let fps: Int
+    private let fullChroma444: Bool
+    /// Draw the host cursor into the video; changed live by `setShowsCursor`.
+    private var showsCursor: Bool
+    private var activeConfiguration: SCStreamConfiguration?
+    private let audioSource: SPPWAudioSourceOption.Kind
     private let audioHandler: (@Sendable (CMSampleBuffer) -> Void)?
+    private let displayHandler: (@Sendable (CGDirectDisplayID) -> Void)?
     private let logHandler: @Sendable (String, Bool) -> Void
     private var stream: SCStream?
     private var outputDelegate: CaptureOutputDelegate?
@@ -916,13 +1247,21 @@ actor ScreenCaptureEngine {
         width: Int,
         height: Int,
         fps: Int,
+        fullChroma444: Bool = false,
+        showsCursor: Bool = true,
+        audioSource: SPPWAudioSourceOption.Kind = .system,
         audioHandler: (@Sendable (CMSampleBuffer) -> Void)? = nil,
+        displayHandler: (@Sendable (CGDirectDisplayID) -> Void)? = nil,
         logHandler: @escaping @Sendable (String, Bool) -> Void = { _, _ in }
     ) {
         self.width = width
         self.height = height
         self.fps = fps
+        self.fullChroma444 = fullChroma444
+        self.showsCursor = showsCursor
+        self.audioSource = audioSource
         self.audioHandler = audioHandler
+        self.displayHandler = displayHandler
         self.logHandler = logHandler
         outputQueue = DispatchQueue(label: "it.screenspan.pyrowave.server.capture", qos: .userInteractive)
         audioQueue = DispatchQueue(label: "it.screenspan.pyrowave.server.audio", qos: .userInteractive)
@@ -969,6 +1308,7 @@ actor ScreenCaptureEngine {
                 continuation.finish()
                 return stream
             }
+            displayHandler?(display.displayID)
 
             let streamConfig = SCStreamConfiguration()
             streamConfig.width = width
@@ -979,10 +1319,31 @@ actor ScreenCaptureEngine {
             // buffer is in flight in ScreenCaptureKit, 1 in AsyncStream, and 1
             // in UpstreamMetalEncoder.
             streamConfig.queueDepth = 5
-            streamConfig.showsCursor = true
-            streamConfig.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            streamConfig.showsCursor = showsCursor
+            // 'xf44' is ScreenCaptureKit's only 4:4:4 YCbCr output (10-bit samples in
+            // 16-bit words). The vendored encoder reads it as RG16/R16 UNORM and
+            // UpstreamMetalEncoder switches to a 4:4:4 encoder on the full
+            // resolution chroma plane.
+            streamConfig.pixelFormat = fullChroma444
+                ? kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+                : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             streamConfig.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
-            streamConfig.capturesAudio = true
+            var capturesMicrophone = false
+            switch audioSource {
+            case .none:
+                streamConfig.capturesAudio = false
+            case .system:
+                streamConfig.capturesAudio = true
+            case .input(let deviceID):
+                streamConfig.capturesAudio = false
+                if #available(macOS 15.0, *) {
+                    streamConfig.captureMicrophone = true
+                    streamConfig.microphoneCaptureDeviceID = deviceID
+                    capturesMicrophone = true
+                } else {
+                    logHandler("La cattura del microfono richiede macOS 15; audio disattivato.", true)
+                }
+            }
             streamConfig.sampleRate = SPPWAudioPacketHeader.sampleRate
             streamConfig.channelCount = SPPWAudioPacketHeader.channelCount
             streamConfig.excludesCurrentProcessAudio = true
@@ -1008,7 +1369,10 @@ actor ScreenCaptureEngine {
                         return
                     }
                     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-                    continuation.yield(SendablePixelBuffer(buffer: pixelBuffer))
+                    continuation.yield(SendablePixelBuffer(
+                        buffer: pixelBuffer,
+                        captureTimestampNanoseconds: SPPWCaptureClock.captureNanoseconds(of: sampleBuffer)
+                    ))
                 },
                 audioHandler: { sampleBuffer in
                     audioCallback?(sampleBuffer)
@@ -1020,16 +1384,28 @@ actor ScreenCaptureEngine {
                 type: .screen,
                 sampleHandlerQueue: outputQueue
             )
-            try? scStream.addStreamOutput(
-                output,
-                type: .audio,
-                sampleHandlerQueue: audioQueue
-            )
+            if streamConfig.capturesAudio {
+                try? scStream.addStreamOutput(
+                    output,
+                    type: .audio,
+                    sampleHandlerQueue: audioQueue
+                )
+            }
+            if capturesMicrophone, #available(macOS 15.0, *) {
+                // Microphone buffers arrive in the device's native format; the packetizer
+                // resamples them to 48 kHz stereo.
+                try? scStream.addStreamOutput(
+                    output,
+                    type: .microphone,
+                    sampleHandlerQueue: audioQueue
+                )
+            }
 
             // Retain both delegates strongly for the lifetime of the stream.
             self.streamDelegate = sDelegate
             self.outputDelegate = output
             self.stream = scStream
+            self.activeConfiguration = streamConfig
             try await scStream.startCapture()
             logHandler("Cattura schermo avviata: \(width)x\(height) @ \(fps) fps", false)
         } catch {
@@ -1040,7 +1416,21 @@ actor ScreenCaptureEngine {
         return stream
     }
 
+    /// Shows or hides the host cursor in the running capture without restarting it.
+    func setShowsCursor(_ shows: Bool) async {
+        guard shows != showsCursor else { return }
+        showsCursor = shows
+        guard let stream, let configuration = activeConfiguration else { return }
+        configuration.showsCursor = shows
+        do {
+            try await stream.updateConfiguration(configuration)
+        } catch {
+            logHandler("Impossibile aggiornare la visibilità del cursore: \(error.localizedDescription)", true)
+        }
+    }
+
     func stop() async {
+        activeConfiguration = nil
         do {
             try await stream?.stopCapture()
         } catch {
@@ -1094,8 +1484,10 @@ final class CaptureOutputDelegate: NSObject, SCStreamOutput, @unchecked Sendable
             screenHandler(sampleBuffer)
         case .audio:
             audioHandler?(sampleBuffer)
-        @unknown default:
-            break
+        default:
+            if #available(macOS 15.0, *), type == .microphone {
+                audioHandler?(sampleBuffer)
+            }
         }
     }
 }
@@ -1121,7 +1513,8 @@ actor TestContentSource {
         fps: Int,
         mode: TestContentMode,
         stats: StreamStats,
-        initialVideoSeekSeconds: Double = 0
+        initialVideoSeekSeconds: Double = 0,
+        audioHandler: TestVideoAudioHandler? = nil
     ) {
         self.width = width
         self.height = height
@@ -1131,6 +1524,7 @@ actor TestContentSource {
 
         if case .video(let url) = mode {
             self.videoSource = try? TestVideoSource(url: url, initialTimeSeconds: initialVideoSeekSeconds)
+            self.videoSource?.audioHandler = audioHandler
         } else {
             self.videoSource = nil
         }
@@ -1179,7 +1573,12 @@ actor TestContentSource {
                 }
 
                 if let pixelBuffer {
-                    continuation.yield(SendablePixelBuffer(buffer: pixelBuffer))
+                    // Stamped when sampled: video files are sampled at the host time the
+                    // audio tap uses, so file audio and video stay in sync.
+                    continuation.yield(SendablePixelBuffer(
+                        buffer: pixelBuffer,
+                        captureTimestampNanoseconds: SPPWCaptureClock.nowNanoseconds()
+                    ))
                 }
 
                 frameIdx += 1
@@ -1227,3 +1626,106 @@ actor TestContentSource {
         }
     }
 }
+
+#if os(macOS)
+/// Clipboard sync between the Mac pasteboard and subscribed receivers (`kind = 10`).
+/// Thread-safe; lives outside the server actor so pasteboard polling never blocks streaming.
+final class RemoteClipboardSync: @unchecked Sendable {
+    private struct Peer {
+        let channel: SPPWClipboardChannel
+        var subscribed: Bool
+    }
+
+    private let lock = NSLock()
+    private var enabled = false
+    private var peers: [UInt32: Peer] = [:]
+    private lazy var bridge = SPPWMacPasteboardBridge { [weak self] content in
+        self?.localPasteboardChanged(content)
+    }
+
+    func setEnabled(_ value: Bool) {
+        lock.lock()
+        enabled = value
+        if !value {
+            peers.values.forEach { $0.channel.cancel() }
+        }
+        lock.unlock()
+        updateBridge()
+    }
+
+    /// Handles a clipboard payload from `streamID`; `send` transmits a payload back to that client.
+    func receive(
+        _ payload: Data,
+        streamID: UInt32,
+        mtu: Int,
+        send: @escaping @Sendable (Data) -> Void
+    ) -> SPPWClipboardChannel.Incoming {
+        lock.lock()
+        guard enabled else {
+            lock.unlock()
+            return .none
+        }
+        let channel: SPPWClipboardChannel
+        if let existing = peers[streamID] {
+            channel = existing.channel
+        } else {
+            channel = SPPWClipboardChannel(maxChunkBytes: SPPWClipboardChannel.chunkBytes(forMTU: mtu), send: send)
+            peers[streamID] = Peer(channel: channel, subscribed: false)
+        }
+        lock.unlock()
+
+        let incoming = channel.receive(payload)
+        switch incoming {
+        case let .subscription(isOn):
+            lock.lock()
+            peers[streamID]?.subscribed = isOn
+            if !isOn { channel.cancel() }
+            lock.unlock()
+            if isOn, let current = SPPWMacPasteboardBridge.readCurrent() {
+                // What is already on the Mac stays private until it changes.
+                channel.noteLocalContent(current)
+            }
+            updateBridge()
+        case let .content(content):
+            bridge.write(content)
+            lock.lock()
+            let others = peers.filter { $0.key != streamID && $0.value.subscribed }.map(\.value.channel)
+            lock.unlock()
+            others.forEach { $0.offer(content) }
+        case .none:
+            break
+        }
+        return incoming
+    }
+
+    func remove(streamID: UInt32?) {
+        lock.lock()
+        if let streamID {
+            peers.removeValue(forKey: streamID)?.channel.cancel()
+        } else {
+            peers.values.forEach { $0.channel.cancel() }
+            peers.removeAll()
+        }
+        lock.unlock()
+        updateBridge()
+    }
+
+    private func localPasteboardChanged(_ content: SPPWClipboardContent) {
+        lock.lock()
+        let targets = enabled ? peers.values.filter(\.subscribed).map(\.channel) : []
+        lock.unlock()
+        targets.forEach { $0.offer(content) }
+    }
+
+    private func updateBridge() {
+        lock.lock()
+        let active = enabled && peers.values.contains(where: \.subscribed)
+        lock.unlock()
+        if active {
+            bridge.start()
+        } else {
+            bridge.stop()
+        }
+    }
+}
+#endif

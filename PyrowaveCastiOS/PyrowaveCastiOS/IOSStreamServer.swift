@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreMedia
 import CoreVideo
 import Foundation
 import Network
@@ -7,6 +9,9 @@ import SPPWCommon
 
 struct IOSSendablePixelBuffer: @unchecked Sendable {
     let buffer: CVPixelBuffer
+    /// Capture instant on `SPPWCaptureClock` (0 = unknown, stamped when encoded). Audio packets
+    /// use the same clock so receivers can lip-sync them with the video.
+    var captureTimestampNanoseconds: UInt64 = 0
 }
 
 enum IOSServerSource: Equatable, Sendable {
@@ -44,6 +49,14 @@ actor IOSStreamServer {
     private let sessionTimeoutNanos: UInt64 = 30_000_000_000
 
     private var encoder: UpstreamMetalEncoder?
+    /// GPU downscaling of captured frames to the client-chosen level.
+    private let frameScaler = IOSFrameScaler()
+    /// Turns captured app/system audio into 5 ms SPPW/1 `.audioFrame` packets. Runs on the
+    /// capture queue (it is lock protected), only the send hops onto the actor.
+    private nonisolated let audioPacketizer = SPPWAudioPacketizer()
+    /// Audio packets in capture order; `audioSendTask` is their only consumer.
+    private nonisolated let audioSendQueue = SPPWOrderedPacketQueue<[SPPWAudioPacketizer.PacketTuple]>()
+    private var audioSendTask: Task<Void, Never>?
     private var captureTask: Task<Void, Never>?
     private var testProducerTask: Task<Void, Never>?
     private var activeVideoSource: TestVideoSource?
@@ -64,11 +77,13 @@ actor IOSStreamServer {
         source: IOSServerSource,
         screenResolution: (width: Int, height: Int) = (1920, 1080),
         previewEnabled: Bool = true,
+        audioInputGain: Float = 1,
         logHandler: (@Sendable (ServerLogEntry) -> Void)? = nil,
         previewHandler: (@Sendable (Data, Int, Int) -> Void)? = nil
     ) {
         self.source = source
         self.previewEnabled = previewEnabled
+        audioPacketizer.gain = audioInputGain
         self.serverScreenResolution = Self.clampedEvenResolution(
             width: screenResolution.width,
             height: screenResolution.height
@@ -98,11 +113,26 @@ actor IOSStreamServer {
         source == .screen
     }
 
+    /// Resolves the client's requested size (`SPPWResolutionLadder`: `0×0` native, `0×S`
+    /// short side, `W×H` fit inside) against the device screen in screen capture mode, or
+    /// against 16:9 for generated test content. Frames are scaled to it in `encodeAndSend`.
     private func resolvedConfiguration(for requested: ClientConfiguration) -> ClientConfiguration {
         var config = requested.sanitised()
         if isScreenCaptureMode {
-            config.width = serverScreenResolution.width
-            config.height = serverScreenResolution.height
+            let size = SPPWResolutionLadder.resolve(
+                requestedWidth: config.width,
+                requestedHeight: config.height,
+                native: serverScreenResolution
+            )
+            config.width = size.width
+            config.height = size.height
+        } else if config.width <= 0 && config.height > 0 {
+            let size = SPPWResolutionLadder.size(
+                shortSide: config.height,
+                native: (SPPWResolutionLadder.maximumWidth, SPPWResolutionLadder.maximumHeight)
+            )
+            config.width = size.width
+            config.height = size.height
         }
         return config
     }
@@ -126,6 +156,14 @@ actor IOSStreamServer {
     }
 
     func start(port: UInt16) async throws {
+        let audioPackets = audioSendQueue.makeStream()
+        audioSendTask?.cancel()
+        audioSendTask = Task { [weak self] in
+            for await packets in audioPackets {
+                guard let self else { return }
+                await self.broadcastAudioPackets(packets)
+            }
+        }
         guard port > 0, port < UInt16.max else {
             throw NSError(domain: "PyroWaveServer", code: 1, userInfo: [NSLocalizedDescriptionKey: "UDP port must be between 1 and 65534"])
         }
@@ -194,6 +232,9 @@ actor IOSStreamServer {
     }
 
     func stop() async {
+        audioSendTask?.cancel()
+        audioSendTask = nil
+        audioSendQueue.finish()
         sessionReaperTask?.cancel()
         sessionReaperTask = nil
         mediaPacer.cancelPending()
@@ -292,7 +333,7 @@ actor IOSStreamServer {
                 }
             }
             if isScreenCaptureMode {
-                log("Client session \(id) connected from \(peerAddress); screen capture uses server resolution \(config.width)x\(config.height) (client asked \(requested.width)x\(requested.height))")
+                log("Client session \(id) connected from \(peerAddress); screen capture at \(config.width)x\(config.height) (client asked \(requested.width)x\(requested.height), native \(serverScreenResolution.width)x\(serverScreenResolution.height))")
             } else {
                 log("Client session \(id) connected from \(peerAddress); shared stream \(sharedStreamID)")
             }
@@ -368,7 +409,7 @@ actor IOSStreamServer {
                 to: peer
             )
 
-        case .input, .clientHello, .pong, .serverHello, .frameFragment, .fecParity, .audioFrame:
+        case .input, .clipboard, .clientHello, .pong, .serverHello, .frameFragment, .fecParity, .audioFrame:
             break
         }
     }
@@ -384,8 +425,9 @@ actor IOSStreamServer {
 
     private func sendServerHello(to peer: SPPWUDPPeerAddress, controlID: UInt32) {
         let activeConfig = sharedConfig ?? clients[controlID]?.config
-        let resolvedWidth = isScreenCaptureMode ? (geometry?.width ?? serverScreenResolution.width) : (activeConfig?.width ?? 0)
-        let resolvedHeight = isScreenCaptureMode ? (geometry?.height ?? serverScreenResolution.height) : (activeConfig?.height ?? 0)
+        // The resolved stream size (client-chosen level, never above native).
+        let resolvedWidth = activeConfig?.width ?? (isScreenCaptureMode ? serverScreenResolution.width : 0)
+        let resolvedHeight = activeConfig?.height ?? (isScreenCaptureMode ? serverScreenResolution.height : 0)
         let flags: UInt16 = isScreenCaptureMode ? WireControlFlags.serverControlledResolution : 0
         let timeoutSeconds = UInt16(clamping: max(1, sessionTimeoutNanos / 1_000_000_000))
         let activeFPS = UInt16(clamping: activeConfig?.fps ?? 60)
@@ -478,7 +520,11 @@ actor IOSStreamServer {
         captureTask = Task { [weak self] in
             for await frame in frames {
                 guard !Task.isCancelled, let self else { return }
-                await self.encodeAndSend(frame.buffer, generation: currentGeneration)
+                await self.encodeAndSend(
+                    frame.buffer,
+                    captureTimestampNanoseconds: frame.captureTimestampNanoseconds,
+                    generation: currentGeneration
+                )
             }
             guard let self else { return }
             await self.sourceEnded(generation: currentGeneration)
@@ -520,6 +566,10 @@ actor IOSStreamServer {
         }
         activeVideoSource?.pause()
         activeVideoSource = videoSource
+        // Stream the file's audio track too (silenced on the server itself).
+        videoSource?.audioHandler = { [weak self] buffer, capturedAt in
+            self?.ingestAudio(pcmBuffer: buffer, captureNanoseconds: capturedAt)
+        }
 
         testProducerTask?.cancel()
         testProducerTask = Task { [weak self, stats] in
@@ -554,7 +604,13 @@ actor IOSStreamServer {
                         testLabel
                     ]
                 )
-                if let pixelBuffer { continuation.yield(IOSSendablePixelBuffer(buffer: pixelBuffer)) }
+                if let pixelBuffer {
+                    // Stamped when sampled, the timeline the file's audio tap uses (A/V sync).
+                    continuation.yield(IOSSendablePixelBuffer(
+                        buffer: pixelBuffer,
+                        captureTimestampNanoseconds: SPPWCaptureClock.nowNanoseconds()
+                    ))
+                }
                 index &+= 1
                 nextDeadline &+= frameIntervalNanos
                 let now = DispatchTime.now().uptimeNanoseconds
@@ -597,18 +653,70 @@ actor IOSStreamServer {
         await startStreamIfNeeded(controlID: controlID)
     }
 
-    private func encodeAndSend(_ pixelBuffer: CVPixelBuffer, generation frameGeneration: UInt64) async {
+    /// Entry point for captured audio (screen capture mode). Called on the capture queue.
+    nonisolated func ingestAudio(_ sampleBuffer: CMSampleBuffer) {
+        let packets = audioPacketizer.packetize(sampleBuffer: sampleBuffer)
+        guard !packets.isEmpty else { return }
+        audioSendQueue.yield(packets)
+    }
+
+    /// Entry point for microphone / media-file audio (`AVAudioPCMBuffer` + capture instant).
+    nonisolated func ingestAudio(pcmBuffer: AVAudioPCMBuffer, captureNanoseconds: UInt64) {
+        let packets = audioPacketizer.packetize(pcmBuffer: pcmBuffer, captureNanoseconds: captureNanoseconds)
+        guard !packets.isEmpty else { return }
+        audioSendQueue.yield(packets)
+    }
+
+    /// Input volume (0 = silence, 1 = unchanged, 2 = +6 dB); applies immediately.
+    nonisolated func setAudioInputGain(_ gain: Float) {
+        audioPacketizer.gain = gain
+    }
+
+    private func broadcastAudioPackets(_ packets: [SPPWAudioPacketizer.PacketTuple]) {
+        guard let socket = udpSocket, sharedStreamID != 0, captureTask != nil else { return }
+        let peers = clients.values.map(\.peer)
+        guard !peers.isEmpty else { return }
+        let datagrams = packets.map { packet in
+            makeWireAudioDatagram(
+                streamID: sharedStreamID,
+                sequence: packet.sequence,
+                timestampNanoseconds: packet.timestampNanoseconds,
+                audioPayload: packet.payload
+            )
+        }
+        socket.sendBatch(datagrams, to: peers)
+    }
+
+    private func encodeAndSend(
+        _ pixelBuffer: CVPixelBuffer,
+        captureTimestampNanoseconds: UInt64 = 0,
+        generation frameGeneration: UInt64
+    ) async {
         guard frameGeneration == generation,
               let config = sharedConfig,
               let socket = udpSocket else { return }
+        let sourceWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let sourceHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        guard sourceWidth > 0, sourceHeight > 0 else { return }
+        var pixelBuffer = pixelBuffer
+        if isScreenCaptureMode {
+            // Captured frames are native; the client may have chosen a lower level.
+            serverScreenResolution = (sourceWidth, sourceHeight)
+            let target = SPPWResolutionLadder.resolve(
+                requestedWidth: config.width,
+                requestedHeight: config.height,
+                native: (sourceWidth, sourceHeight)
+            )
+            if target.width != sourceWidth || target.height != sourceHeight {
+                guard let scaled = frameScaler.scale(pixelBuffer, to: target) else { return }
+                pixelBuffer = scaled
+            }
+        }
         let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
         let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
         guard width > 0, height > 0, width.isMultiple(of: 2), height.isMultiple(of: 2) else { return }
         if geometry?.width != width || geometry?.height != height {
             geometry = (width, height)
-            if isScreenCaptureMode {
-                serverScreenResolution = (width, height)
-            }
         }
 
         let peers = clients.values.map(\.peer)
@@ -650,7 +758,10 @@ actor IOSStreamServer {
 
             frameID &+= 1
             let currentFrameID = frameID
-            let frameTimestamp = DispatchTime.now().uptimeNanoseconds
+            // Capture instant, shared with the audio packets (A/V sync on the receiver).
+            let frameTimestamp = captureTimestampNanoseconds != 0
+                ? captureTimestampNanoseconds
+                : SPPWCaptureClock.nowNanoseconds()
 
             let datagrams = buildPacedFrameDatagrams(
                 streamID: sharedStreamID,

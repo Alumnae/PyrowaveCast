@@ -13,6 +13,8 @@ public enum SPPWMessageKind: UInt8, Sendable, Equatable {
     case pong = 7
     case fecParity = 8
     case audioFrame = 9
+    /// Clipboard sync, both directions (`SPPWClipboardMessage`).
+    case clipboard = 10
 }
 
 public struct SPPWDatagramHeader: Sendable, Equatable {
@@ -523,12 +525,21 @@ public struct SPPWFrameAssembler: Sendable {
             if partial.receivedFragmentCount == partial.expectedFragments {
                 return finalizeCompleteFrame(partial)
             }
-            if allowPartialHF, partial.hasCompleteLL, let salvaged = buildValidPartialHFFrame(partial) {
-                return salvaged
-            }
-            droppedFrames += 1
-            if !partial.hasCompleteLL {
-                llDroppedFrames += 1
+            if allowPartialHF, partial.hasCompleteLL {
+                switch buildValidPartialHFFrame(partial) {
+                case let .salvaged(salvaged):
+                    return salvaged
+                case .incompleteLL:
+                    droppedFrames += 1
+                    llDroppedFrames += 1
+                case .insufficientBlocks:
+                    droppedFrames += 1
+                }
+            } else {
+                droppedFrames += 1
+                if !partial.hasCompleteLL {
+                    llDroppedFrames += 1
+                }
             }
         }
         return nil
@@ -652,8 +663,16 @@ public struct SPPWFrameAssembler: Sendable {
             // 2. Partial-HF Salvage when coarse LL subband is 100% intact
             if frameLag >= 1 || ageNanos >= timeoutNanoseconds || partials.count > maxInFlightFrames {
                 partials.removeValue(forKey: id)
-                if allowPartialHF, let salvaged = buildValidPartialHFFrame(partial) {
-                    salvagedCandidate = salvaged
+                if allowPartialHF {
+                    switch buildValidPartialHFFrame(partial) {
+                    case let .salvaged(salvaged):
+                        salvagedCandidate = salvaged
+                    case .incompleteLL:
+                        droppedFrames += 1
+                        llDroppedFrames += 1
+                    case .insufficientBlocks:
+                        droppedFrames += 1
+                    }
                 } else {
                     droppedFrames += 1
                 }
@@ -661,6 +680,12 @@ public struct SPPWFrameAssembler: Sendable {
         }
 
         return salvagedCandidate
+    }
+
+    private enum PartialHFSalvageOutcome {
+        case salvaged(SPPWAssembledFrame)
+        case incompleteLL
+        case insufficientBlocks
     }
 
     private mutating func finalizeCompleteFrame(_ partial: PartialFrame) -> SPPWAssembledFrame? {
@@ -698,7 +723,7 @@ public struct SPPWFrameAssembler: Sendable {
         )
     }
 
-    private mutating func buildValidPartialHFFrame(_ partial: PartialFrame) -> SPPWAssembledFrame? {
+    private mutating func buildValidPartialHFFrame(_ partial: PartialFrame) -> PartialHFSalvageOutcome {
         var contiguousPrefix = Data(capacity: partial.receivedBytes)
 
         for fragment in partial.fragments {
@@ -708,18 +733,20 @@ public struct SPPWFrameAssembler: Sendable {
             contiguousPrefix.append(fragment)
         }
 
-        let validBytes = SPPWPyrowaveSubbandInspector.validBlockAlignedPrefixLength(
+        let inspection = SPPWPyrowaveSubbandInspector.inspectContiguousPrefix(
             bitstream: contiguousPrefix,
             contiguousByteLength: contiguousPrefix.count
         )
-        guard validBytes >= 16 else {
-            droppedFrames += 1
-            return nil
+        guard inspection.hasCompleteLLSubband else {
+            return .incompleteLL
+        }
+        guard inspection.validByteLength >= 16 else {
+            return .insufficientBlocks
         }
 
-        let cleanBitstream = validBytes == contiguousPrefix.count
+        let cleanBitstream = inspection.validByteLength == contiguousPrefix.count
             ? contiguousPrefix
-            : Data(contiguousPrefix.prefix(validBytes))
+            : Data(contiguousPrefix.prefix(inspection.validByteLength))
 
         completedFrames += 1
         partialHFDecodedFrames += 1
@@ -729,7 +756,7 @@ public struct SPPWFrameAssembler: Sendable {
         lastCompletedFrameID = partial.frameID
         hasCompletedFrame = true
 
-        return SPPWAssembledFrame(
+        return .salvaged(SPPWAssembledFrame(
             streamID: partial.streamID,
             frameID: partial.frameID,
             width: partial.width,
@@ -740,7 +767,7 @@ public struct SPPWFrameAssembler: Sendable {
             receivedAtNanoseconds: partial.firstArrivalNanoseconds,
             fecRecoveredFragments: partial.fecRecoveredCount,
             isPartialHF: true
-        )
+        ))
     }
 
     @inline(__always)

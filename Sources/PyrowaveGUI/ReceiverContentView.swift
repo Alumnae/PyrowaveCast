@@ -6,6 +6,12 @@ public struct ReceiverContentView: View {
     @EnvironmentObject private var model: ReceiverModel
     @State private var isVideoFullscreen = false
     @State private var enteredNativeFullscreen = false
+    /// Fullscreen top-right bar: shown on entry and on mouse movement, hidden after a pause.
+    @State private var fullscreenBarVisible = true
+    @State private var fullscreenBarHovered = false
+    @State private var fullscreenBarHideTask: Task<Void, Never>?
+    @State private var showFullscreenExitHint = false
+    @StateObject private var exitChordMonitor = FullscreenExitChordMonitor()
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
 
     public init() {}
@@ -45,7 +51,7 @@ public struct ReceiverContentView: View {
             model.stopDiscovery()
         }
         .onExitCommand {
-            if isVideoFullscreen {
+            if isVideoFullscreen && (!model.remoteControlEnabled || !model.isCapturingKeyboard) {
                 exitVideoFullscreen()
             }
         }
@@ -53,12 +59,39 @@ public struct ReceiverContentView: View {
             if isVideoFullscreen {
                 isVideoFullscreen = false
                 enteredNativeFullscreen = false
+                exitChordMonitor.stop()
+                fullscreenBarHideTask?.cancel()
+                fullscreenBarHideTask = nil
             }
+        }
+    }
+
+    /// Height of the top strip that brings the fullscreen bar back on hover.
+    static let fullscreenRevealBandHeight: CGFloat = 48
+
+    /// Shows the fullscreen bar and schedules it to slide up after 3 s away from it.
+    private func revealFullscreenBar() {
+        guard isVideoFullscreen else { return }
+        if !fullscreenBarVisible {
+            withAnimation(.easeOut(duration: 0.2)) { fullscreenBarVisible = true }
+        }
+        fullscreenBarHideTask?.cancel()
+        fullscreenBarHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, isVideoFullscreen, !fullscreenBarHovered else { return }
+            withAnimation(.easeInOut(duration: 0.35)) { fullscreenBarVisible = false }
         }
     }
 
     private func enterVideoFullscreen() {
         isVideoFullscreen = true
+        exitChordMonitor.start { exitVideoFullscreen() } onPointerNearTop: { revealFullscreenBar() }
+        revealFullscreenBar()
+        showFullscreenExitHint = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            withAnimation(.easeOut(duration: 0.4)) { showFullscreenExitHint = false }
+        }
         if let window = NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
             enteredNativeFullscreen = true
             window.toggleFullScreen(nil)
@@ -69,6 +102,10 @@ public struct ReceiverContentView: View {
 
     private func exitVideoFullscreen() {
         isVideoFullscreen = false
+        exitChordMonitor.stop()
+        fullscreenBarHideTask?.cancel()
+        fullscreenBarHideTask = nil
+        showFullscreenExitHint = false
         if enteredNativeFullscreen {
             enteredNativeFullscreen = false
             if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
@@ -351,58 +388,22 @@ public struct ReceiverContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Picker(SPPWLocalization.tr("settings.resolution_preset"), selection: resolutionPresetBinding) {
-                            if model.serverControlledResolution && model.isConnected {
-                                Text(SPPWLocalization.tr("settings.resolution_server_screen"))
-                                    .tag(ResolutionPreset.serverScreenCapture)
+                        Picker(SPPWLocalization.tr("settings.resolution_preset"), selection: $model.resolutionMode) {
+                            ForEach(resolutionOptions) { option in
+                                Text(option.title).tag(option)
                             }
-                            Text("720p (1280×720)").tag(ResolutionPreset.p720)
-                            Text("1080p (1920×1080)").tag(ResolutionPreset.p1080)
-                            Text("1440p (2560×1440)").tag(ResolutionPreset.p1440)
-                            Text("4K (3840×2160)").tag(ResolutionPreset.p4k)
-                            Text(SPPWLocalization.tr("settings.resolution_custom"))
-                                .tag(ResolutionPreset.custom)
                         }
                         .pickerStyle(.menu)
                         .labelsHidden()
-                        .disabled(model.serverControlledResolution && model.isConnected)
                     }
-
-                    HStack(spacing: 6) {
-                        ForEach([ResolutionPreset.p720, .p1080, .p1440, .p4k]) { preset in
-                            Button(preset.shortTitle) {
-                                applyResolutionPreset(preset)
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(currentResolutionPreset == preset ? .blue : nil)
-                            .controlSize(.small)
-                            .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .disabled(model.serverControlledResolution && model.isConnected)
-
-                    HStack(alignment: .bottom, spacing: 8) {
-                        dimensionField(SPPWLocalization.tr("settings.width"), value: $model.width)
-                            .disabled(model.serverControlledResolution && model.isConnected)
-                        Button {
-                            let oldW = model.width
-                            model.width = model.height
-                            model.height = oldW
-                        } label: {
-                            Image(systemName: "arrow.left.arrow.right")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .padding(.bottom, 2)
-                        .disabled(model.serverControlledResolution && model.isConnected)
-                        dimensionField(SPPWLocalization.tr("settings.height"), value: $model.height)
-                            .disabled(model.serverControlledResolution && model.isConnected)
-                    }
-                }
-                if model.serverControlledResolution && model.isConnected {
-                    Label(SPPWLocalization.tr("settings.server_controlled_resolution"), systemImage: "display.and.arrow.down")
+                    if model.isConnected, model.statistics.frameWidth > 0 {
+                        Text(SPPWLocalization.tr(
+                            "settings.resolution_current_fmt",
+                            "\(model.statistics.frameWidth)×\(model.statistics.frameHeight)"
+                        ))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                    }
                 }
                 if model.isConnected {
                     Text(SPPWLocalization.tr("settings.agreed_timeout_fmt", model.agreedTimeoutSeconds))
@@ -482,6 +483,19 @@ public struct ReceiverContentView: View {
                 .disabled(!model.isConnected)
 
                 Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(SPPWLocalization.tr("receiver.remote_control"), isOn: $model.remoteControlEnabled)
+                        .font(.subheadline)
+                        .help(SPPWLocalization.tr("receiver.remote_control_help"))
+                    if model.remoteControlEnabled {
+                        Text(SPPWLocalization.tr("receiver.remote_control_hint"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Label(SPPWLocalization.tr("orientation.title"), systemImage: "rotate.right")
@@ -547,77 +561,14 @@ public struct ReceiverContentView: View {
         }
     }
 
-    private enum ResolutionPreset: String, CaseIterable, Identifiable {
-        case serverScreenCapture
-        case p720
-        case p1080
-        case p1440
-        case p4k
-        case custom
-
-        var id: String { rawValue }
-
-        var shortTitle: String {
-            switch self {
-            case .serverScreenCapture: SPPWLocalization.tr("settings.resolution_server_screen")
-            case .p720: "720p"
-            case .p1080: "1080p"
-            case .p1440: "1440p"
-            case .p4k: "4K"
-            case .custom: SPPWLocalization.tr("settings.resolution_custom")
-            }
+    /// Native, automatic and the short-side levels below the server's native size; the
+    /// current choice stays listed even if the server is smaller than it.
+    private var resolutionOptions: [SPPWResolutionMode] {
+        var options = SPPWResolutionMode.menuOptions(nativeShortSide: model.nativeShortSide)
+        if !options.contains(model.resolutionMode) {
+            options.append(model.resolutionMode)
         }
-
-        var landscapeDimensions: (width: Int, height: Int)? {
-            switch self {
-            case .p720: (1280, 720)
-            case .p1080: (1920, 1080)
-            case .p1440: (2560, 1440)
-            case .p4k: (3840, 2160)
-            case .serverScreenCapture, .custom: nil
-            }
-        }
-    }
-
-    private var currentResolutionPreset: ResolutionPreset {
-        if model.serverControlledResolution && model.isConnected {
-            return .serverScreenCapture
-        }
-        let swapped = model.videoOrientation.swapsDimensions
-        for preset in [ResolutionPreset.p720, .p1080, .p1440, .p4k] {
-            if let dims = preset.landscapeDimensions {
-                let expectedW = swapped ? dims.height : dims.width
-                let expectedH = swapped ? dims.width : dims.height
-                if model.width == expectedW && model.height == expectedH {
-                    return preset
-                }
-            }
-        }
-        return .custom
-    }
-
-    private var resolutionPresetBinding: Binding<ResolutionPreset> {
-        Binding(
-            get: { currentResolutionPreset },
-            set: { newPreset in
-                applyResolutionPreset(newPreset)
-            }
-        )
-    }
-
-    private func applyResolutionPreset(_ preset: ResolutionPreset) {
-        guard let dims = preset.landscapeDimensions else { return }
-        let swapped = model.videoOrientation.swapsDimensions
-        model.width = swapped ? dims.height : dims.width
-        model.height = swapped ? dims.width : dims.height
-    }
-
-    private func dimensionField(_ label: String, value: Binding<Int>) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            TextField(label, value: value, format: .number)
-                .textFieldStyle(.roundedBorder)
-        }
+        return options
     }
 
     private var preview: some View {
@@ -632,7 +583,14 @@ public struct ReceiverContentView: View {
                 MetalVideoSurface(
                     framePublisher: model.pixelBufferSubject,
                     initialPixelBuffer: model.currentPixelBuffer,
-                    orientation: model.videoOrientation
+                    orientation: model.videoOrientation,
+                    remoteControlEnabled: model.remoteControlEnabled && model.isConnected,
+                    onInputEvent: { event in
+                        model.sendInputEvent(event)
+                    },
+                    onCaptureFocusChanged: { focused in
+                        model.isCapturingKeyboard = focused
+                    }
                 ) { message in
                     DispatchQueue.main.async { model.noteDisplayError(message) }
                 }
@@ -659,13 +617,52 @@ public struct ReceiverContentView: View {
             }
         }
         .contentShape(Rectangle())
+        .onContinuousHover { phase in
+            // Mouse-moved events only reach the monitor while remote control tracks the
+            // pointer; hover covers the view-only case. Only the top edge brings the bar back.
+            if case let .active(location) = phase, isVideoFullscreen,
+               location.y <= Self.fullscreenRevealBandHeight {
+                revealFullscreenBar()
+            }
+        }
         .onTapGesture(count: 2) {
-            toggleVideoFullscreen()
+            if !model.remoteControlEnabled {
+                toggleVideoFullscreen()
+            }
+        }
+        .overlay(alignment: .top) {
+            if isVideoFullscreen && showFullscreenExitHint {
+                Label(SPPWLocalization.tr("receiver.fullscreen_exit_hint"), systemImage: "keyboard")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.72), in: Capsule())
+                    .padding(.top, 18)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
         }
         .overlay(alignment: .topTrailing) {
-            if !isVideoFullscreen {
+            if !isVideoFullscreen || fullscreenBarVisible {
                 HStack(spacing: 8) {
                     if hasVideo {
+                        Button {
+                            model.remoteControlEnabled.toggle()
+                        } label: {
+                            Label(
+                                SPPWLocalization.tr("receiver.remote_control_short"),
+                                systemImage: model.remoteControlEnabled ? "cursorarrow.click.2" : "cursorarrow"
+                            )
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(model.remoteControlEnabled ? .green : .white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.black.opacity(0.65), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help(SPPWLocalization.tr("receiver.remote_control_help"))
+
                         HStack(spacing: 8) {
                             Button { model.rotateVideo() } label: {
                                 Label(SPPWLocalization.tr("orientation.rotate"), systemImage: "rotate.right")
@@ -694,8 +691,12 @@ public struct ReceiverContentView: View {
                         toggleVideoFullscreen()
                     } label: {
                         Label(
-                            SPPWLocalization.tr("action.fullscreen"),
-                            systemImage: "arrow.up.left.and.arrow.down.right"
+                            isVideoFullscreen
+                                ? SPPWLocalization.tr("action.exit_fullscreen")
+                                : SPPWLocalization.tr("action.fullscreen"),
+                            systemImage: isVideoFullscreen
+                                ? "arrow.down.right.and.arrow.up.left"
+                                : "arrow.up.left.and.arrow.down.right"
                         )
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 10)
@@ -704,19 +705,44 @@ public struct ReceiverContentView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.white)
-                    .help(SPPWLocalization.tr("action.fullscreen_help"))
+                    .help(isVideoFullscreen
+                        ? SPPWLocalization.tr("receiver.fullscreen_exit_help")
+                        : SPPWLocalization.tr("action.fullscreen_help"))
                 }
                 .padding(14)
+                .onHover { hovering in
+                    fullscreenBarHovered = hovering
+                    if !hovering { revealFullscreenBar() }
+                }
+                // Slides up out of the screen when it hides, and back down when the pointer
+                // reaches the top edge.
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .overlay(alignment: .bottomLeading) {
             if hasVideo && !isVideoFullscreen {
-                Text("LIVE  ·  PyrowaveCast SPPW/1")
-                    .font(.caption2.monospaced().weight(.semibold))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(.black.opacity(0.65), in: Capsule())
-                    .padding(14)
+                HStack(spacing: 8) {
+                    Text("LIVE  ·  PyrowaveCast SPPW/1")
+                        .font(.caption2.monospaced().weight(.semibold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.65), in: Capsule())
+
+                    if model.remoteControlEnabled {
+                        Label(
+                            model.isCapturingKeyboard
+                                ? SPPWLocalization.tr("receiver.remote_control_active_badge")
+                                : SPPWLocalization.tr("receiver.remote_control_click_badge"),
+                            systemImage: model.isCapturingKeyboard ? "keyboard.fill" : "cursorarrow.click"
+                        )
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(model.isCapturingKeyboard ? .green : .white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.72), in: Capsule())
+                    }
+                }
+                .padding(14)
             }
         }
     }
@@ -760,5 +786,55 @@ public struct ReceiverContentView: View {
         case .connecting, .waiting, .reconnecting: .orange
         case .disconnected, .failed: .secondary
         }
+    }
+}
+
+/// While the receiver is in fullscreen, watches local keyboard and mouse events for a clean
+/// ⌃⌥ press-and-release (exit) and for pointer motion (reveal the bar). Events pass through
+/// unchanged, so the remote Mac still receives Control and Option.
+@MainActor
+final class FullscreenExitChordMonitor: ObservableObject {
+    private var monitor: Any?
+    private var detector = SPPWModifierChordDetector(required: [.control, .option])
+
+    func start(onExit: @escaping @MainActor () -> Void, onPointerNearTop: @escaping @MainActor () -> Void) {
+        stop()
+        detector.reset()
+        let mask: NSEvent.EventTypeMask = [
+            .flagsChanged, .keyDown,
+            .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+        ]
+        monitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self else { return event }
+            switch event.type {
+            case .flagsChanged:
+                let flags = SPPWKeyModifiers(rawValue: UInt32(truncatingIfNeeded:
+                    event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue))
+                if self.detector.modifiersChanged(flags) {
+                    // Let Control/Option reach the remote first, then leave fullscreen.
+                    DispatchQueue.main.async { onExit() }
+                }
+            case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+                if Self.isNearTopEdge(event) { onPointerNearTop() }
+            default:
+                self.detector.otherInput()
+            }
+            return event
+        }
+    }
+
+    /// True when the pointer is in the top strip of the event's window.
+    private static func isNearTopEdge(_ event: NSEvent) -> Bool {
+        guard let height = event.window?.contentView?.bounds.height else { return false }
+        return height - event.locationInWindow.y <= ReceiverContentView.fullscreenRevealBandHeight
+    }
+
+    func stop() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        monitor = nil
+        detector.reset()
     }
 }

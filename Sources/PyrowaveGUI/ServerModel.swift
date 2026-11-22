@@ -20,6 +20,7 @@ struct SendablePreviewBuffer: @unchecked Sendable {
 actor PreviewDecoder {
     private var session: PyrowaveDecoderSession?
     private var size: (width: Int, height: Int)?
+    private var sessionPixelFormat: OSType?
     /// `PyrowaveDecoderSession` is not reentrant, so only one decode may run at
     /// a time. While a frame is being decoded the next ones are dropped — the
     /// preview only cares about the newest frame anyway.
@@ -73,15 +74,17 @@ actor PreviewDecoder {
         defer { isDecoding = false }
 
         do {
-            if session == nil || size?.width != width || size?.height != height {
+            let pixelFormat = PyrowaveSessionDescriptor.preferredPixelFormat(forBitstream: bitstream)
+            if session == nil || size?.width != width || size?.height != height || sessionPixelFormat != pixelFormat {
                 let descriptor = try PyrowaveSessionDescriptor(
                     width: width,
                     height: height,
-                    pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                    pixelFormat: pixelFormat,
                     videoSignal: VideoSignalMetadata(yCbCrRange: .full)
                 )
                 session = try PyrowaveDecoderSession(descriptor: descriptor, minimumOutputBufferCount: 4)
                 size = (width, height)
+                sessionPixelFormat = pixelFormat
                 loggedFailure = false
             }
             guard let session else { return nil }
@@ -184,6 +187,36 @@ public final class ServerModel: ObservableObject {
             previewPublisher.send(previewPixelBuffer)
         }
     }
+    /// Screen capture in full resolution chroma (PyroWave 4:4:4). Read when the
+    /// server starts; test sources always stay 4:2:0.
+    @Published public var fullChroma444: Bool = UserDefaults.standard.bool(forKey: "serverFullChroma444") {
+        didSet {
+            UserDefaults.standard.set(fullChroma444, forKey: "serverFullChroma444")
+        }
+    }
+    /// Audio sources read from the system (none, system audio, microphones).
+    @Published public private(set) var audioSources: [SPPWAudioSourceOption] = SPPWAudioSourceCatalog.availableSources()
+    /// Persisted choice (`SPPWAudioSourceOption.id`); applies to screen capture, read at start.
+    @Published public var audioSourceID: String = UserDefaults.standard.string(forKey: "serverAudioSource") ?? SPPWAudioSourceOption.system.id {
+        didSet {
+            UserDefaults.standard.set(audioSourceID, forKey: "serverAudioSource")
+        }
+    }
+    /// Input volume, 0...2 (100% = unchanged). Applied live, also to video file audio.
+    @Published public var audioInputVolume: Double = UserDefaults.standard.object(forKey: "serverAudioInputVolume") as? Double ?? 1 {
+        didSet {
+            UserDefaults.standard.set(audioInputVolume, forKey: "serverAudioInputVolume")
+            server?.setAudioInputGain(Float(audioInputVolume))
+        }
+    }
+
+    public func refreshAudioSources() {
+        audioSources = SPPWAudioSourceCatalog.availableSources()
+        if !audioSources.contains(where: { $0.id == audioSourceID }) {
+            audioSourceID = SPPWAudioSourceOption.system.id
+        }
+    }
+
     @Published public var previewEnabled: Bool = UserDefaults.standard.object(forKey: "serverPreviewEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(previewEnabled, forKey: "serverPreviewEnabled")
@@ -193,8 +226,20 @@ public final class ServerModel: ObservableObject {
             }
         }
     }
+    /// Allow connected clients to control this Mac's mouse and keyboard (screen capture mode only).
+    /// Takes effect immediately, also while streaming; requires macOS Accessibility permission.
+    @Published public var remoteControlEnabled: Bool = UserDefaults.standard.bool(forKey: "serverRemoteControlEnabled") {
+        didSet {
+            UserDefaults.standard.set(remoteControlEnabled, forKey: "serverRemoteControlEnabled")
+            server?.setRemoteInputEnabled(remoteControlEnabled)
+            if remoteControlEnabled {
+                refreshAccessibilityPermission()
+            }
+        }
+    }
     @Published public var errorMessage: String?
     @Published public var hasScreenRecordingPermission: Bool = CGPreflightScreenCaptureAccess()
+    @Published public var hasAccessibilityPermission: Bool = SPPWMacInputInjector.isAccessibilityTrusted
     @Published public var serverScreenResolutionText: String = ServerDisplay.streamResolutionText
 
     private var server: StreamServer?
@@ -212,6 +257,7 @@ public final class ServerModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.refreshScreenRecordingPermission()
+                self?.refreshAccessibilityPermission()
             }
     }
 
@@ -223,6 +269,27 @@ public final class ServerModel: ObservableObject {
         let resolutionText = ServerDisplay.streamResolutionText
         if serverScreenResolutionText != resolutionText {
             serverScreenResolutionText = resolutionText
+        }
+    }
+
+    public func refreshAccessibilityPermission() {
+        let granted = SPPWMacInputInjector.isAccessibilityTrusted
+        if hasAccessibilityPermission != granted {
+            hasAccessibilityPermission = granted
+        }
+    }
+
+    public func requestAccessibilityPermission() {
+        let granted = SPPWMacInputInjector.requestAccessibilityPermission()
+        refreshAccessibilityPermission()
+        if !granted && !hasAccessibilityPermission {
+            openAccessibilitySettings()
+        }
+    }
+
+    public func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -260,6 +327,7 @@ public final class ServerModel: ObservableObject {
 
         if mode == .screen {
             refreshScreenRecordingPermission()
+            refreshAccessibilityPermission()
             if !hasScreenRecordingPermission {
                 _ = CGRequestScreenCaptureAccess()
                 refreshScreenRecordingPermission()
@@ -267,6 +335,14 @@ public final class ServerModel: ObservableObject {
                     id: logs.count + 1,
                     timestamp: Date(),
                     text: SPPWLocalization.tr("server.log.permission_missing_warning"),
+                    isError: true
+                ))
+            }
+            if remoteControlEnabled && !hasAccessibilityPermission {
+                append(ServerLogEntry(
+                    id: logs.count + 1,
+                    timestamp: Date(),
+                    text: SPPWLocalization.tr("server.log.accessibility_missing_warning"),
                     isError: true
                 ))
             }
@@ -288,6 +364,10 @@ public final class ServerModel: ObservableObject {
         let decoder = previewDecoder
         let server = StreamServer(
             testContentMode: contentMode,
+            fullChroma444: fullChroma444,
+            audioSource: SPPWAudioSourceCatalog.source(withID: audioSourceID, in: audioSources).kind,
+            audioInputGain: Float(audioInputVolume),
+            remoteInputEnabled: remoteControlEnabled,
             logHandler: { [weak self] entry in
                 Task { @MainActor in self?.append(entry) }
             },

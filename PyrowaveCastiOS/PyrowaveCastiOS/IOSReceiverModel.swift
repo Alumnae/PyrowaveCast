@@ -100,6 +100,25 @@ final class IOSReceiverModel: ObservableObject {
     @Published private(set) var events: [String] = []
     @Published private(set) var agreedTimeoutSeconds: Int = 30
     @Published private(set) var serverControlledResolution: Bool = false
+    /// Requested stream resolution: native, automatic or a short-side level
+    /// (`SPPWResolutionLadder`). The server derives the exact size from its own aspect ratio.
+    @Published var resolutionMode: SPPWResolutionMode = SPPWResolutionMode(
+        id: UserDefaults.standard.string(forKey: "iosReceiverResolutionMode") ?? "native"
+    ) {
+        didSet {
+            guard resolutionMode != oldValue else { return }
+            UserDefaults.standard.set(resolutionMode.id, forKey: "iosReceiverResolutionMode")
+            autoResolution.reset()
+            appendEvent("Risoluzione richiesta: \(resolutionMode.title)")
+            if isConnected {
+                applySettings()
+            }
+        }
+    }
+    /// Short side of the server's native size (learned while streaming native).
+    @Published private(set) var nativeShortSide: Int?
+    private var nativeSize: (width: Int, height: Int)?
+    private var autoResolution = SPPWAutoResolutionController()
     /// Active bitrate target (Mb/s) chosen by the 1-second ABR loop when `automaticBitrate` is enabled.
     @Published private(set) var activeAutoBitrateMbps: Double = 0
     /// Video orientation (0°/90°/180°/270° rotation + horizontal/vertical flip).
@@ -119,6 +138,38 @@ final class IOSReceiverModel: ObservableObject {
         }
     }
 
+    // MARK: Remote control settings
+
+    @Published var remoteInputMode: IOSRemoteInputMode = IOSRemoteInputMode(
+        rawValue: UserDefaults.standard.string(forKey: "iosReceiverRemoteInputMode") ?? ""
+    ) ?? .trackpad {
+        didSet { UserDefaults.standard.set(remoteInputMode.rawValue, forKey: "iosReceiverRemoteInputMode") }
+    }
+
+    /// Trackpad pointer speed, `1...10`.
+    @Published var pointerSpeed: Double = UserDefaults.standard.object(forKey: "iosReceiverPointerSpeed") as? Double ?? 5 {
+        didSet { UserDefaults.standard.set(pointerSpeed, forKey: "iosReceiverPointerSpeed") }
+    }
+
+    /// Two-finger scrolling moves the content with the fingers (like iOS).
+    @Published var naturalScrolling: Bool = UserDefaults.standard.object(forKey: "iosReceiverNaturalScrolling") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(naturalScrolling, forKey: "iosReceiverNaturalScrolling") }
+    }
+
+    /// Clipboard sync with the Mac (Mac → iPhone automatic, iPhone → Mac on explicit paste).
+    @Published var clipboardSyncEnabled: Bool = UserDefaults.standard.object(forKey: "iosReceiverClipboardSync") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(clipboardSyncEnabled, forKey: "iosReceiverClipboardSync")
+            clipboardSession.setEnabled(clipboardSyncEnabled)
+        }
+    }
+
+    /// Sticky modifier bar state shared by the on-screen keyboard and the special keys panel.
+    @Published var stickyModifiers = SPPWStickyModifiers()
+
+    nonisolated let clipboardSession = IOSClipboardSession()
+    private var inputSequencer = SPPWInputSequencer()
+
     func rotateVideo() {
         let swapped = videoOrientation.rotate()
         handleOrientationDimensionChange(swappedDimensions: swapped)
@@ -130,20 +181,9 @@ final class IOSReceiverModel: ObservableObject {
     }
 
     private func handleOrientationDimensionChange(swappedDimensions: Bool) {
-        if swappedDimensions {
-            let oldW = width
-            let oldH = height
-            width = oldH
-            height = oldW
-            UserDefaults.standard.set(width, forKey: "iosReceiverWidth")
-            UserDefaults.standard.set(height, forKey: "iosReceiverHeight")
-            appendEvent("Video orientation \(videoOrientation.summaryLabel): resolution swapped \(oldW)x\(oldH) -> \(width)x\(height)")
-            if isConnected && !serverControlledResolution {
-                applySettings()
-            }
-        } else {
-            appendEvent("Video orientation: \(videoOrientation.summaryLabel)")
-        }
+        // Rotation is display-only: the request is a short side, so nothing is renegotiated.
+        _ = swappedDimensions
+        appendEvent("Video orientation: \(videoOrientation.summaryLabel)")
     }
 
     struct ReceiverStatistics: Equatable {
@@ -185,6 +225,8 @@ final class IOSReceiverModel: ObservableObject {
     nonisolated(unsafe) private var assembler = IOSReceiverFrameAssembler()
     nonisolated(unsafe) private var adaptiveBuffer = SPPWAdaptiveWiFiBuffer(mode: .wifiResilient)
     private let audioPlayer = SPPWAudioPlayer()
+    /// Lip-sync timeline: video presentation feeds it, audio playout follows it.
+    private let avSyncClock = SPPWAVSyncClock()
     nonisolated(unsafe) private var decoder: IOSReceiverDecoder!
     private var heartbeatTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
@@ -228,6 +270,7 @@ final class IOSReceiverModel: ObservableObject {
         byteWindowStartNanos = nowNanos
         lastStatFlushNanos = nowNanos
         loadFavorites()
+        audioPlayer.syncClock = avSyncClock
         decoder = IOSReceiverDecoder(
             outputHandler: { [weak self] decoded in self?.receive(decoded) },
             errorHandler: { [weak self] frameID, message in self?.receiveDecodeError(frameID: frameID, message: message) }
@@ -511,6 +554,8 @@ final class IOSReceiverModel: ObservableObject {
         shouldAutoReconnect = true
         reconnectDeadlineNanos = nil
         reconnectAttempt = 0
+        // No auto-lock while connected (also across automatic reconnects).
+        IOSKeepAwake.shared.acquire(.receiver)
         openConnection(endpoint: endpoint, isReconnectAttempt: false)
     }
 
@@ -653,6 +698,7 @@ final class IOSReceiverModel: ObservableObject {
         socketOpenTask = nil
         isOpeningSocket = false
         if clearAutoReconnect {
+            IOSKeepAwake.shared.release(.receiver)
             shouldAutoReconnect = false
             reconnectTask?.cancel()
             reconnectTask = nil
@@ -675,6 +721,8 @@ final class IOSReceiverModel: ObservableObject {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         audioPlayer.stop()
+        avSyncClock.reset()
+        clipboardSession.stop()
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
@@ -705,10 +753,68 @@ final class IOSReceiverModel: ObservableObject {
 
     func clearEvents() { events.removeAll() }
 
-    /// Sends a normalized touch or input event to the macOS/iOS host.
+    /// Sends an input event to the macOS host. Discrete events (keys, text, clicks) are wrapped in
+    /// `.sequenced` and sent twice, 12 ms apart; the server applies each sequence number once.
     func sendInputEvent(_ event: SPPWInputEvent) {
         guard (udpSocket != nil || controlConnection != nil), controlStreamID != 0 else { return }
-        send(IOSReceiverWireHeader.control(.input, streamID: controlStreamID, payload: event.encode()))
+        guard SPPWInputSequencer.needsRedundancy(event) else {
+            send(IOSReceiverWireHeader.control(.input, streamID: controlStreamID, payload: event.encode()))
+            return
+        }
+        let datagram = IOSReceiverWireHeader.control(
+            .input,
+            streamID: controlStreamID,
+            payload: inputSequencer.wrap(event).encode()
+        )
+        send(datagram)
+        let streamID = controlStreamID
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(12)) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.controlStreamID == streamID else { return }
+                self.send(datagram)
+            }
+        }
+    }
+
+    /// Whether the Mac should leave its cursor out of the video (set by the fullscreen view).
+    /// Resent with every heartbeat while hidden and after each `serverHello`: the server
+    /// forgets it per session and plain UDP may lose both redundant copies.
+    private(set) var remoteCursorHidden = false
+
+    func setRemoteCursorHidden(_ hidden: Bool) {
+        guard hidden != remoteCursorHidden else { return }
+        remoteCursorHidden = hidden
+        sendInputEvent(.cursorVisibility(hidden: hidden))
+    }
+
+    /// Committed keyboard text (after IME composition) with the sticky modifiers applied once.
+    func sendTypedText(_ text: String) {
+        let modifiers = stickyModifiers.consume()
+        for event in SPPWKeyboardTranslator.events(forCommittedText: text, modifiers: modifiers) {
+            sendInputEvent(event)
+        }
+    }
+
+    func sendDeleteBackward() {
+        sendInputEvent(SPPWKeyboardTranslator.deleteBackward(modifiers: stickyModifiers.consume()))
+    }
+
+    func sendSpecialKey(_ key: SPPWSpecialKey) {
+        sendInputEvent(key.event(adding: stickyModifiers.consume()))
+    }
+
+    /// Hardware keyboard key (macOS key code) with the device's own modifiers plus sticky ones.
+    func sendHardwareKey(keyCode: UInt16, isDown: Bool, modifiers: SPPWKeyModifiers) {
+        let combined = isDown ? modifiers.union(stickyModifiers.consume()) : modifiers
+        sendInputEvent(.key(keyCode: keyCode, isDown: isDown, modifiers: combined.rawValue))
+    }
+
+    /// Sends the item the user explicitly pasted into the dock's paste control to the Mac.
+    func sendClipboardToHost(_ content: SPPWClipboardContent) {
+        guard controlStreamID != 0 else { return }
+        if clipboardSession.offer(content) {
+            appendEvent("Appunti inviati al Mac (\(content.format == .png ? "immagine" : "testo"), \(content.data.count) B)")
+        }
     }
 
     func sendTouch(phase: UInt8, normalizedX: Float, normalizedY: Float, id: UInt32 = 0) {
@@ -803,12 +909,24 @@ final class IOSReceiverModel: ObservableObject {
         case .pong:
             noteServerActivity(arrivalNanos)
 
+        case .clipboard:
+            noteServerActivity(arrivalNanos)
+            let payload = data.count > IOSReceiverWireHeader.byteCount
+                ? data.subdata(in: IOSReceiverWireHeader.byteCount..<data.count)
+                : Data()
+            if let content = clipboardSession.receive(payload) {
+                Task { @MainActor [weak self] in
+                    IOSClipboardBridge.write(content)
+                    self?.appendEvent("Appunti dal Mac (\(content.format == .png ? "immagine" : "testo"), \(content.data.count) B)")
+                }
+            }
+
         case .audioFrame:
             noteServerActivity(arrivalNanos)
             let payload = data.count > IOSReceiverWireHeader.byteCount
                 ? data.subdata(in: IOSReceiverWireHeader.byteCount..<data.count)
                 : Data()
-            audioPlayer.enqueue(audioPayload: payload)
+            audioPlayer.enqueue(audioPayload: payload, senderTimestampNanoseconds: header.timestampNanoseconds)
 
         case .frameFragment, .fecParity:
             assemblyLock.lock()
@@ -972,24 +1090,25 @@ final class IOSReceiverModel: ObservableObject {
             }
             let serverDrivesResolution = (header.flags & 1) != 0
             serverControlledResolution = serverDrivesResolution
-            if serverDrivesResolution && header.width > 0 && header.height > 0 {
+            if header.width > 0 && header.height > 0 {
                 let serverW = Int(header.width)
                 let serverH = Int(header.height)
-                if width != serverW || height != serverH {
-                    width = serverW
-                    height = serverH
-                }
+                noteServerStreamSize(width: serverW, height: serverH)
                 var updated = statistics
                 updated.frameWidth = serverW
                 updated.frameHeight = serverH
                 statistics = updated
-                appendEvent("Risoluzione concordata dal server (cattura schermo): \(serverW)×\(serverH)")
+                appendEvent("Risoluzione concordata: \(serverW)×\(serverH) (\(resolutionMode.title))")
             }
             resetAdaptiveBitrate(nowNanos: nowNanos)
             startHeartbeat()
             startWatchdog()
             startAdaptiveBitrateLoop()
             sendReadinessPing()
+            startClipboardSession()
+            if remoteCursorHidden {
+                sendInputEvent(.cursorVisibility(hidden: true))
+            }
             if wasReconnecting {
                 appendEvent("Riconnesso automaticamente · sessione \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             } else {
@@ -999,13 +1118,12 @@ final class IOSReceiverModel: ObservableObject {
         case .streamConfiguration:
             let serverDrivesResolution = (header.flags & 1) != 0
             serverControlledResolution = serverDrivesResolution
-            if serverDrivesResolution && header.width > 0 && header.height > 0 {
+            if header.width > 0 && header.height > 0 {
                 let serverW = Int(header.width)
                 let serverH = Int(header.height)
                 if width != serverW || height != serverH {
-                    width = serverW
-                    height = serverH
-                    appendEvent("Risoluzione mantenuta dal server (cattura schermo): \(serverW)×\(serverH)")
+                    noteServerStreamSize(width: serverW, height: serverH)
+                    appendEvent("Risoluzione stream: \(serverW)×\(serverH) (\(resolutionMode.title))")
                 }
             }
             if isResynchronizing {
@@ -1030,15 +1148,42 @@ final class IOSReceiverModel: ObservableObject {
         ))
     }
 
+    /// What goes on the wire for the current resolution mode: `0×0` native, `0×S` short side.
+    private func requestedResolution(fps: Int, quality: Double, manualBitrateMbps: Double) -> (width: Int, height: Int) {
+        switch resolutionMode {
+        case .native:
+            return (0, 0)
+        case .shortSide(let lines):
+            return (0, lines)
+        case .automatic:
+            if !automaticBitrate {
+                let best = SPPWAutoResolutionController.bestShortSide(
+                    bitrateBps: Int(manualBitrateMbps * 1_000_000),
+                    fps: fps,
+                    quality: quality,
+                    native: nativeSize ?? (width, height)
+                )
+                if best != autoResolution.shortSide {
+                    autoResolution.reset(shortSide: best)
+                }
+            }
+            return autoResolution.shortSide.map { (0, $0) } ?? (0, 0)
+        }
+    }
+
     private func makeConfiguration() -> IOSReceiverWireSettings {
-        let safeWidth = max(320, min(width, 3840)) & ~1
-        let safeHeight = max(240, min(height, 2160)) & ~1
         let safeFPS = max(1, min(fps, 120))
         let safeQuality = max(0.1, min(1.0, quality))
         let safeBitrate = max(5.0, min(1000.0, bitrateMbps))
         let safeFEC = max(0, min(50, fecPercent))
-        UserDefaults.standard.set(safeWidth, forKey: "iosReceiverWidth")
-        UserDefaults.standard.set(safeHeight, forKey: "iosReceiverHeight")
+        let request = requestedResolution(fps: safeFPS, quality: safeQuality, manualBitrateMbps: safeBitrate)
+        let expected = SPPWResolutionLadder.resolve(
+            requestedWidth: request.width,
+            requestedHeight: request.height,
+            native: nativeSize ?? (max(width, 320), max(height, 240))
+        )
+        let safeWidth = expected.width
+        let safeHeight = expected.height
         UserDefaults.standard.set(safeFPS, forKey: "iosReceiverFPS")
         UserDefaults.standard.set(safeQuality, forKey: "iosReceiverQuality")
         UserDefaults.standard.set(safeBitrate, forKey: "iosReceiverBitrate")
@@ -1061,8 +1206,8 @@ final class IOSReceiverModel: ObservableObject {
             effectiveBitrateBps = UInt32(safeBitrate * 1_000_000)
         }
         return IOSReceiverWireSettings(
-            width: UInt16(safeWidth),
-            height: UInt16(safeHeight),
+            width: UInt16(clamping: request.width),
+            height: UInt16(clamping: request.height),
             fps: UInt16(safeFPS),
             automaticBitrate: automaticBitrate,
             latencyMode: latencyMode.rawValue,
@@ -1091,6 +1236,7 @@ final class IOSReceiverModel: ObservableObject {
         // pixelBufferSubject (without firing ObservableObject.objectWillChange
         // on every frame).
         currentPixelBuffer = decoded.pixelBuffer
+        avSyncClock.noteVideoPresented(senderCaptureNanos: decoded.senderTimestampNanoseconds)
         if state != .streaming {
             state = .streaming
         }
@@ -1154,6 +1300,9 @@ final class IOSReceiverModel: ObservableObject {
                     streamID: self.controlStreamID,
                     payload: Data("HB01".utf8)
                 ))
+                if self.remoteCursorHidden {
+                    self.sendInputEvent(.cursorVisibility(hidden: true))
+                }
             }
         }
     }
@@ -1228,6 +1377,41 @@ final class IOSReceiverModel: ObservableObject {
         )
     }
 
+    /// Records the size the server streams; while the request is native it is the server's
+    /// native size, which bounds the resolution menu and the automatic levels.
+    private func noteServerStreamSize(width serverW: Int, height serverH: Int) {
+        width = serverW
+        height = serverH
+        let requestIsNative: Bool
+        switch resolutionMode {
+        case .native: requestIsNative = true
+        case .automatic: requestIsNative = autoResolution.shortSide == nil
+        case .shortSide: requestIsNative = false
+        }
+        if !serverControlledResolution {
+            nativeSize = nil
+            nativeShortSide = nil
+        } else if requestIsNative {
+            nativeSize = (serverW, serverH)
+            nativeShortSide = min(serverW, serverH)
+        }
+    }
+
+    /// Automatic resolution, evaluated every adaptive-bitrate tick (`SPPWAutoResolutionController`).
+    private func evaluateAutomaticResolution(nowNanos: UInt64) {
+        guard resolutionMode == .automatic, automaticBitrate else { return }
+        let change = autoResolution.evaluate(
+            currentBitrateBps: abrController.currentBitrateBps,
+            ceilingBitrateBps: abrController.maxCeilingBitrateBps,
+            nativeShortSide: nativeShortSide ?? SPPWResolutionLadder.maximumHeight,
+            now: nowNanos
+        )
+        guard case .changed(let level) = change else { return }
+        let config = makeConfiguration()
+        send(IOSReceiverWireHeader.control(.streamConfiguration, streamID: controlStreamID, payload: config.payload))
+        appendEvent("Risoluzione automatica: \(level.map(SPPWResolutionMode.levelTitle) ?? SPPWLocalization.tr("settings.resolution_native"))")
+    }
+
     private func startAdaptiveBitrateLoop() {
         abrTask?.cancel()
         abrTask = Task { [weak self] in
@@ -1263,6 +1447,7 @@ final class IOSReceiverModel: ObservableObject {
                 self.abrPrevLateDroppedFrames = curLateDrop
 
                 let decision = self.abrController.evaluate(sample)
+                defer { self.evaluateAutomaticResolution(nowNanos: nowNanos) }
                 switch decision {
                 case .hold:
                     break
@@ -1367,6 +1552,22 @@ final class IOSReceiverModel: ObservableObject {
             flags: 1
         ))
         appendEvent(reason)
+    }
+
+    /// (Re)creates the clipboard channel for the current control session and sends the
+    /// subscription. Chunks are sent from the channel's queue straight to the socket.
+    private func startClipboardSession() {
+        let socket = udpSocket
+        let connection = controlConnection
+        let streamID = controlStreamID
+        clipboardSession.start(mtu: Int(makeConfiguration().mtu), enabled: clipboardSyncEnabled) { payload in
+            let datagram = IOSReceiverWireHeader.control(.clipboard, streamID: streamID, payload: payload)
+            if let socket {
+                socket.send(datagram)
+            } else {
+                connection?.send(content: datagram, completion: .idempotent)
+            }
+        }
     }
 
     private func send(_ data: Data) {

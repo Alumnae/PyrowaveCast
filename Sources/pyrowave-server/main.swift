@@ -10,6 +10,8 @@ var requestedPort = defaultPort
 var testMode = false
 var testImagePath: String?
 var testVideoPath: String?
+var fullChroma444 = false
+var remoteControl = false
 let args = CommandLine.arguments.dropFirst()
 var argIter = args.makeIterator()
 while let arg = argIter.next() {
@@ -29,17 +31,21 @@ while let arg = argIter.next() {
             testVideoPath = path
             testMode = true
         }
+    } else if arg == "--chroma444" {
+        fullChroma444 = true
+    } else if arg == "--remote-control" {
+        remoteControl = true
     } else if arg == "--help" || arg == "-h" {
         print("""
         PyrowaveKit SPPW/1 Server
 
-        Usage: pyrowave-server [--port <PORT>] [--test] [--test-image <PATH>] [--test-video <PATH>]
+        Usage: pyrowave-server [--port <PORT>] [--test] [--test-image <PATH>] [--test-video <PATH>] [--chroma444] [--remote-control]
 
         Default port: \(defaultPort) (UDP)
 
         Protocol: SPPW/1 (ScreenSpan PyroWire)
         Transport: UDP
-        Video: 8-bit YCbCr 4:2:0 PyroWave v1
+        Video: YCbCr 4:2:0 PyroWave v1 (4:4:4 with --chroma444)
         Codec: upstream PyroWave Metal implementation
                (https://github.com/Themaister/pyrowave)
 
@@ -51,6 +57,11 @@ while let arg = argIter.next() {
           --test              animated broadcast test card
           --test-image PATH   a still image (PNG, JPEG, ...)
           --test-video PATH   a video file, played back in a loop
+
+        --chroma444 captures the screen with full resolution chroma
+        (ScreenCaptureKit 10-bit 4:4:4) and encodes PyroWave 4:4:4: sharper
+        coloured text and UI at a higher bitrate and GPU cost. Test content
+        always stays 4:2:0.
         """)
         exit(0)
     }
@@ -87,7 +98,11 @@ if let testContentMode {
     print("Note: Screen recording permission will be requested on first capture.")
 }
 
-let server = StreamServer(testContentMode: testContentMode)
+let server = StreamServer(
+    testContentMode: testContentMode,
+    fullChroma444: fullChroma444,
+    remoteInputEnabled: remoteControl
+)
 
 Task {
     do {

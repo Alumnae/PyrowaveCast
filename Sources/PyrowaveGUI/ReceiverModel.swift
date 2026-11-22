@@ -112,6 +112,26 @@ public final class ReceiverModel: ObservableObject {
     /// True when connected to a server in Screen Capture mode where the server
     /// enforces its own display resolution.
     @Published public private(set) var serverControlledResolution: Bool = false
+    /// Requested stream resolution: native, automatic or a short-side level
+    /// (`SPPWResolutionLadder`). The server derives the exact size from its own aspect ratio.
+    @Published public var resolutionMode: SPPWResolutionMode = SPPWResolutionMode(
+        id: UserDefaults.standard.string(forKey: "receiverResolutionMode") ?? "native"
+    ) {
+        didSet {
+            guard resolutionMode != oldValue else { return }
+            UserDefaults.standard.set(resolutionMode.id, forKey: "receiverResolutionMode")
+            autoResolution.reset()
+            appendEvent("Risoluzione richiesta: \(resolutionMode.title)")
+            if isConnected {
+                applySettings()
+            }
+        }
+    }
+    /// Short side of the server's native size, learned from the server while streaming native;
+    /// limits the menu to levels below it.
+    @Published public private(set) var nativeShortSide: Int?
+    private var nativeSize: (width: Int, height: Int)?
+    private var autoResolution = SPPWAutoResolutionController()
     /// Active bitrate target (Mb/s) chosen by the 1-second ABR loop when `automaticBitrate` is enabled.
     @Published public private(set) var activeAutoBitrateMbps: Double = 0
     /// Video orientation (0°/90°/180°/270° rotation + horizontal/vertical flip).
@@ -130,6 +150,25 @@ public final class ReceiverModel: ObservableObject {
             }
         }
     }
+    /// Forward mouse and keyboard events from the video view to the remote macOS server.
+    @Published public var remoteControlEnabled: Bool = UserDefaults.standard.bool(forKey: "receiverRemoteControlEnabled") {
+        didSet {
+            guard remoteControlEnabled != oldValue else { return }
+            UserDefaults.standard.set(remoteControlEnabled, forKey: "receiverRemoteControlEnabled")
+            if !remoteControlEnabled {
+                isCapturingKeyboard = false
+                releaseAllRemoteInput()
+            }
+            syncRemoteCursorVisibility(force: true)
+            appendEvent(
+                remoteControlEnabled
+                    ? SPPWLocalization.tr("receiver.log.remote_control_enabled")
+                    : SPPWLocalization.tr("receiver.log.remote_control_disabled")
+            )
+        }
+    }
+    /// True while the video surface holds first-responder keyboard focus for remote control.
+    @Published public var isCapturingKeyboard: Bool = false
 
     public func rotateVideo() {
         let swapped = videoOrientation.rotate()
@@ -142,20 +181,10 @@ public final class ReceiverModel: ObservableObject {
     }
 
     private func handleOrientationDimensionChange(swappedDimensions: Bool) {
-        if swappedDimensions {
-            let oldW = width
-            let oldH = height
-            width = oldH
-            height = oldW
-            UserDefaults.standard.set(width, forKey: "receiverWidth")
-            UserDefaults.standard.set(height, forKey: "receiverHeight")
-            appendEvent("Video orientation \(videoOrientation.summaryLabel): resolution swapped \(oldW)x\(oldH) -> \(width)x\(height)")
-            if isConnected && !serverControlledResolution {
-                applySettings()
-            }
-        } else {
-            appendEvent("Video orientation: \(videoOrientation.summaryLabel)")
-        }
+        // Rotation is display-only: the request is a short side, so the server keeps its own
+        // aspect ratio and nothing has to be renegotiated.
+        _ = swappedDimensions
+        appendEvent("Video orientation: \(videoOrientation.summaryLabel)")
     }
 
     public struct ReceiverStatistics: Equatable {
@@ -197,6 +226,11 @@ public final class ReceiverModel: ObservableObject {
     nonisolated(unsafe) private var assembler = ReceiverFrameAssembler()
     nonisolated(unsafe) private var adaptiveBuffer = SPPWAdaptiveWiFiBuffer(mode: .balancedWiFi)
     private let audioPlayer = SPPWAudioPlayer()
+    /// Lip-sync timeline: video presentation feeds it, audio playout follows it.
+    private let avSyncClock = SPPWAVSyncClock()
+    /// Held while connected (also across automatic reconnects): no App Nap, timer precision
+    /// for heartbeats/decoding, and no display sleep while watching.
+    private let streamingActivity = SPPWStreamingActivity(reason: "PyrowaveCast receiver connected")
     nonisolated(unsafe) private var decoder: LatestFrameDecoder!
     private var heartbeatTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
@@ -239,6 +273,7 @@ public final class ReceiverModel: ObservableObject {
         byteWindowStartNanos = nowNanos
         lastStatFlushNanos = nowNanos
         loadFavorites()
+        audioPlayer.syncClock = avSyncClock
         decoder = LatestFrameDecoder(
             outputHandler: { [weak self] decoded in self?.receive(decoded) },
             errorHandler: { [weak self] message in self?.receiveDecodeError(message) }
@@ -524,6 +559,7 @@ public final class ReceiverModel: ObservableObject {
         shouldAutoReconnect = true
         reconnectDeadlineNanos = nil
         reconnectAttempt = 0
+        streamingActivity.begin(keepDisplayAwake: true)
         openConnection(endpoint: endpoint, isReconnectAttempt: false)
     }
 
@@ -664,11 +700,14 @@ public final class ReceiverModel: ObservableObject {
     }
 
     private func teardownActiveConnection(clearAutoReconnect: Bool) {
+        releaseAllRemoteInput()
+        isCapturingKeyboard = false
         connectAttemptGeneration &+= 1
         socketOpenTask?.cancel()
         socketOpenTask = nil
         isOpeningSocket = false
         if clearAutoReconnect {
+            streamingActivity.end()
             shouldAutoReconnect = false
             reconnectTask?.cancel()
             reconnectTask = nil
@@ -691,6 +730,7 @@ public final class ReceiverModel: ObservableObject {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         audioPlayer.stop()
+        avSyncClock.reset()
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
@@ -728,9 +768,43 @@ public final class ReceiverModel: ObservableObject {
     }
 
     /// Sends a mouse, keyboard, or touch event over the active SPPW/1 control channel.
+    /// Release events are sent twice over UDP (deduplicated server-side) so a single
+    /// dropped datagram cannot leave a mouse button or key stuck on the remote Mac.
     public func sendInputEvent(_ event: SPPWInputEvent) {
         guard (udpSocket != nil || controlConnection != nil), controlStreamID != 0 else { return }
-        send(ReceiverWireHeader.control(.input, streamID: controlStreamID, payload: event.encode()))
+        let datagram = ReceiverWireHeader.control(.input, streamID: controlStreamID, payload: event.encode())
+        send(datagram)
+        switch event {
+        case .mouseButton(_, isDown: false, _, _),
+             .key(_, isDown: false, _),
+             .releaseAll,
+             .cursorVisibility:
+            send(datagram)
+        case .pointerMove, .mouseButton, .scroll, .key, .touch,
+             .text, .keyPress, .pointerDelta, .buttonAtCursor, .clickAtCursor, .sequenced:
+            break
+        }
+    }
+
+    /// While remote control is on, the local macOS pointer sits exactly where the host cursor
+    /// is, so the host leaves its (network-delayed) cursor out of the video. Resent with each
+    /// heartbeat while hidden, since the request is plain UDP and the server forgets it per session.
+    private var remoteCursorHiddenSent: Bool?
+
+    private func syncRemoteCursorVisibility(force: Bool = false) {
+        guard (udpSocket != nil || controlConnection != nil), controlStreamID != 0 else {
+            remoteCursorHiddenSent = nil
+            return
+        }
+        let hidden = remoteControlEnabled
+        guard force || remoteCursorHiddenSent != hidden || hidden else { return }
+        remoteCursorHiddenSent = hidden
+        sendInputEvent(.cursorVisibility(hidden: hidden))
+    }
+
+    /// Asks the remote server to release all currently held mouse buttons and keys.
+    public func releaseAllRemoteInput() {
+        sendInputEvent(.releaseAll)
     }
 
     public func applySettings() {
@@ -743,15 +817,44 @@ public final class ReceiverModel: ObservableObject {
         appendEvent("Configuration sent: \(config.width)x\(config.height) @ \(config.fps) fps, FEC \(config.fec)%")
     }
 
+    /// What goes on the wire for the current resolution mode: `0×0` native, `0×S` short side.
+    private func requestedResolution(fps: Int, quality: Double, manualBitrateMbps: Double) -> (width: Int, height: Int) {
+        switch resolutionMode {
+        case .native:
+            return (0, 0)
+        case .shortSide(let lines):
+            return (0, lines)
+        case .automatic:
+            if !automaticBitrate {
+                // Fixed bitrate: the highest level whose bitrate ceiling fits it.
+                let best = SPPWAutoResolutionController.bestShortSide(
+                    bitrateBps: Int(manualBitrateMbps * 1_000_000),
+                    fps: fps,
+                    quality: quality,
+                    native: nativeSize ?? (width, height)
+                )
+                if best != autoResolution.shortSide {
+                    autoResolution.reset(shortSide: best)
+                }
+            }
+            return autoResolution.shortSide.map { (0, $0) } ?? (0, 0)
+        }
+    }
+
     private func makeConfiguration() -> ReceiverWireSettings {
-        let safeWidth = max(320, min(width, 3840)) & ~1
-        let safeHeight = max(240, min(height, 2160)) & ~1
         let safeFPS = max(1, min(fps, 120))
         let safeQuality = max(0.1, min(1.0, quality))
         let safeBitrate = max(5.0, min(1000.0, bitrateMbps))
         let safeFEC = max(0, min(50, fecPercent))
-        UserDefaults.standard.set(safeWidth, forKey: "receiverWidth")
-        UserDefaults.standard.set(safeHeight, forKey: "receiverHeight")
+        let request = requestedResolution(fps: safeFPS, quality: safeQuality, manualBitrateMbps: safeBitrate)
+        // Expected stream size, for the adaptive bitrate ceiling.
+        let expected = SPPWResolutionLadder.resolve(
+            requestedWidth: request.width,
+            requestedHeight: request.height,
+            native: nativeSize ?? (max(width, 320), max(height, 240))
+        )
+        let safeWidth = expected.width
+        let safeHeight = expected.height
         UserDefaults.standard.set(safeFPS, forKey: "receiverFPS")
         UserDefaults.standard.set(safeQuality, forKey: "receiverQuality")
         UserDefaults.standard.set(safeBitrate, forKey: "receiverBitrate")
@@ -774,8 +877,8 @@ public final class ReceiverModel: ObservableObject {
             effectiveBitrateBps = UInt32(safeBitrate * 1_000_000)
         }
         return ReceiverWireSettings(
-            width: UInt16(safeWidth),
-            height: UInt16(safeHeight),
+            width: UInt16(clamping: request.width),
+            height: UInt16(clamping: request.height),
             fps: UInt16(safeFPS),
             automaticBitrate: automaticBitrate,
             latencyMode: latencyMode.rawValue,
@@ -870,12 +973,16 @@ public final class ReceiverModel: ObservableObject {
         case .pong:
             noteServerActivity(arrivalNanos)
 
+        case .clipboard:
+            // Clipboard sync is offered by the iOS receiver only for now.
+            noteServerActivity(arrivalNanos)
+
         case .audioFrame:
             noteServerActivity(arrivalNanos)
             let payload = data.count > ReceiverWireHeader.byteCount
                 ? data.subdata(in: ReceiverWireHeader.byteCount..<data.count)
                 : Data()
-            audioPlayer.enqueue(audioPayload: payload)
+            audioPlayer.enqueue(audioPayload: payload, senderTimestampNanoseconds: header.timestampNanoseconds)
 
         case .frameFragment, .fecParity:
             assemblyLock.lock()
@@ -1039,24 +1146,24 @@ public final class ReceiverModel: ObservableObject {
             }
             let serverDrivesResolution = (header.flags & 1) != 0
             serverControlledResolution = serverDrivesResolution
-            if serverDrivesResolution && header.width > 0 && header.height > 0 {
+            if header.width > 0 && header.height > 0 {
                 let serverW = Int(header.width)
                 let serverH = Int(header.height)
-                if width != serverW || height != serverH {
-                    width = serverW
-                    height = serverH
-                }
+                noteServerStreamSize(width: serverW, height: serverH)
                 var updated = statistics
                 updated.frameWidth = serverW
                 updated.frameHeight = serverH
                 statistics = updated
-                appendEvent("Risoluzione concordata dal server (cattura schermo): \(serverW)×\(serverH)")
+                appendEvent("Risoluzione concordata: \(serverW)×\(serverH) (\(resolutionMode.title))")
             }
             resetAdaptiveBitrate(nowNanos: nowNanos)
             startHeartbeat()
             startWatchdog()
             startAdaptiveBitrateLoop()
             sendReadinessPing()
+            if remoteControlEnabled {
+                syncRemoteCursorVisibility(force: true)
+            }
             if wasReconnecting {
                 appendEvent("Riconnesso automaticamente · sessione \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             } else {
@@ -1066,13 +1173,12 @@ public final class ReceiverModel: ObservableObject {
         case .streamConfiguration:
             let serverDrivesResolution = (header.flags & 1) != 0
             serverControlledResolution = serverDrivesResolution
-            if serverDrivesResolution && header.width > 0 && header.height > 0 {
+            if header.width > 0 && header.height > 0 {
                 let serverW = Int(header.width)
                 let serverH = Int(header.height)
                 if width != serverW || height != serverH {
-                    width = serverW
-                    height = serverH
-                    appendEvent("Risoluzione mantenuta dal server (cattura schermo): \(serverW)×\(serverH)")
+                    noteServerStreamSize(width: serverW, height: serverH)
+                    appendEvent("Risoluzione stream: \(serverW)×\(serverH) (\(resolutionMode.title))")
                 }
             }
             if isResynchronizing {
@@ -1108,6 +1214,7 @@ public final class ReceiverModel: ObservableObject {
         // Enqueue directly to AVSampleBufferDisplayLayer via pixelBufferSubject
         // without firing ObservableObject.objectWillChange on every frame!
         currentPixelBuffer = decoded.pixelBuffer
+        avSyncClock.noteVideoPresented(senderCaptureNanos: decoded.senderTimestampNanoseconds)
         if state != .streaming {
             state = .streaming
         }
@@ -1165,6 +1272,9 @@ public final class ReceiverModel: ObservableObject {
                     streamID: self.controlStreamID,
                     payload: Data("HB01".utf8)
                 ))
+                if self.remoteControlEnabled {
+                    self.syncRemoteCursorVisibility()
+                }
             }
         }
     }
@@ -1239,6 +1349,44 @@ public final class ReceiverModel: ObservableObject {
         )
     }
 
+    /// Records the size the server streams. While the request is native (`0×0`) that size is
+    /// the server's native size, which bounds the resolution menu and the automatic levels.
+    private func noteServerStreamSize(width serverW: Int, height serverH: Int) {
+        width = serverW
+        height = serverH
+        let requestIsNative: Bool
+        switch resolutionMode {
+        case .native: requestIsNative = true
+        case .automatic: requestIsNative = autoResolution.shortSide == nil
+        case .shortSide: requestIsNative = false
+        }
+        if !serverControlledResolution {
+            // Generated test content has no native size (any level up to 2160p works).
+            nativeSize = nil
+            nativeShortSide = nil
+        } else if requestIsNative {
+            nativeSize = (serverW, serverH)
+            nativeShortSide = min(serverW, serverH)
+        }
+    }
+
+    /// Automatic resolution: one level down when the adaptive bitrate stays far below the
+    /// current level's ceiling, one level up after holding the ceiling (see
+    /// `SPPWAutoResolutionController`). Called every adaptive-bitrate tick.
+    private func evaluateAutomaticResolution(nowNanos: UInt64) {
+        guard resolutionMode == .automatic, automaticBitrate else { return }
+        let change = autoResolution.evaluate(
+            currentBitrateBps: abrController.currentBitrateBps,
+            ceilingBitrateBps: abrController.maxCeilingBitrateBps,
+            nativeShortSide: nativeShortSide ?? SPPWResolutionLadder.maximumHeight,
+            now: nowNanos
+        )
+        guard case .changed(let level) = change else { return }
+        let config = makeConfiguration()
+        send(ReceiverWireHeader.control(.streamConfiguration, streamID: controlStreamID, payload: config.payload))
+        appendEvent("Risoluzione automatica: \(level.map(SPPWResolutionMode.levelTitle) ?? SPPWLocalization.tr("settings.resolution_native"))")
+    }
+
     private func startAdaptiveBitrateLoop() {
         abrTask?.cancel()
         abrTask = Task { [weak self] in
@@ -1274,6 +1422,7 @@ public final class ReceiverModel: ObservableObject {
                 self.abrPrevLateDroppedFrames = curLateDrop
 
                 let decision = self.abrController.evaluate(sample)
+                defer { self.evaluateAutomaticResolution(nowNanos: nowNanos) }
                 switch decision {
                 case .hold:
                     break

@@ -25,6 +25,9 @@ struct MetalVideoSurface: NSViewRepresentable {
     let pixelBuffer: CVPixelBuffer?
     let framePublisher: AnyPublisher<CVPixelBuffer?, Never>?
     let orientation: SPPWVideoOrientation
+    let remoteControlEnabled: Bool
+    let onInputEvent: ((SPPWInputEvent) -> Void)?
+    let onCaptureFocusChanged: ((Bool) -> Void)?
     /// Reports the first occurrence of each display failure so the receiver
     /// event log can show why a surface is blank instead of failing silently.
     let onDiagnostic: ((String) -> Void)?
@@ -33,11 +36,17 @@ struct MetalVideoSurface: NSViewRepresentable {
         pixelBuffer: CVPixelBuffer?,
         framePublisher: AnyPublisher<CVPixelBuffer?, Never>? = nil,
         orientation: SPPWVideoOrientation = SPPWVideoOrientation(),
+        remoteControlEnabled: Bool = false,
+        onInputEvent: ((SPPWInputEvent) -> Void)? = nil,
+        onCaptureFocusChanged: ((Bool) -> Void)? = nil,
         onDiagnostic: ((String) -> Void)? = nil
     ) {
         self.pixelBuffer = pixelBuffer
         self.framePublisher = framePublisher
         self.orientation = orientation
+        self.remoteControlEnabled = remoteControlEnabled
+        self.onInputEvent = onInputEvent
+        self.onCaptureFocusChanged = onCaptureFocusChanged
         self.onDiagnostic = onDiagnostic
     }
 
@@ -45,18 +54,27 @@ struct MetalVideoSurface: NSViewRepresentable {
         framePublisher: P,
         initialPixelBuffer: CVPixelBuffer? = nil,
         orientation: SPPWVideoOrientation = SPPWVideoOrientation(),
+        remoteControlEnabled: Bool = false,
+        onInputEvent: ((SPPWInputEvent) -> Void)? = nil,
+        onCaptureFocusChanged: ((Bool) -> Void)? = nil,
         onDiagnostic: ((String) -> Void)? = nil
     ) where P.Output == CVPixelBuffer?, P.Failure == Never {
         self.pixelBuffer = initialPixelBuffer
         self.framePublisher = framePublisher.eraseToAnyPublisher()
         self.orientation = orientation
+        self.remoteControlEnabled = remoteControlEnabled
+        self.onInputEvent = onInputEvent
+        self.onCaptureFocusChanged = onCaptureFocusChanged
         self.onDiagnostic = onDiagnostic
     }
 
     func makeNSView(context: Context) -> SampleBufferVideoView {
         let view = SampleBufferVideoView()
         view.onDiagnostic = onDiagnostic
+        view.onInputEvent = onInputEvent
+        view.onCaptureFocusChanged = onCaptureFocusChanged
         view.videoOrientation = orientation
+        view.remoteControlEnabled = remoteControlEnabled
         if let framePublisher {
             view.subscribe(to: framePublisher)
         }
@@ -68,8 +86,13 @@ struct MetalVideoSurface: NSViewRepresentable {
 
     func updateNSView(_ nsView: SampleBufferVideoView, context: Context) {
         nsView.onDiagnostic = onDiagnostic
+        nsView.onInputEvent = onInputEvent
+        nsView.onCaptureFocusChanged = onCaptureFocusChanged
         if nsView.videoOrientation != orientation {
             nsView.videoOrientation = orientation
+        }
+        if nsView.remoteControlEnabled != remoteControlEnabled {
+            nsView.remoteControlEnabled = remoteControlEnabled
         }
         if let framePublisher {
             nsView.subscribeIfNeeded(to: framePublisher)
@@ -79,12 +102,24 @@ struct MetalVideoSurface: NSViewRepresentable {
     }
 }
 
-/// NSView hosting an `AVSampleBufferDisplayLayer` as a sublayer (macOS).
+/// NSView hosting an `AVSampleBufferDisplayLayer` as a sublayer (macOS),
+/// with optional mouse/keyboard remote-control event capture.
 final class SampleBufferVideoView: NSView {
     var onDiagnostic: ((String) -> Void)?
+    var onInputEvent: ((SPPWInputEvent) -> Void)?
+    var onCaptureFocusChanged: ((Bool) -> Void)?
     var videoOrientation = SPPWVideoOrientation() {
         didSet {
             syncLayerGeometry()
+        }
+    }
+    var remoteControlEnabled = false {
+        didSet {
+            guard remoteControlEnabled != oldValue else { return }
+            updateTrackingAreas()
+            if !remoteControlEnabled {
+                releaseRemoteInputs(resignFocus: true)
+            }
         }
     }
 
@@ -95,6 +130,20 @@ final class SampleBufferVideoView: NSView {
     private var cachedFormatDescription: CMVideoFormatDescription?
     private var cachedFormatDimensions: (width: Int, height: Int, pixelFormat: OSType)?
     private var lastDisplayedPixelBuffer: CVPixelBuffer?
+    private var lastVideoSize: CGSize = .zero
+
+    // Remote input capture state
+    private var pointerTrackingArea: NSTrackingArea?
+    private var lastPointerMoveNanos: UInt64 = 0
+    private var activeButtons: Set<UInt8> = []
+    private var commandPressedKeys: Set<UInt16> = []
+    private var lastModifierFlags: NSEvent.ModifierFlags = []
+    private var hasKeyboardFocus = false
+    nonisolated(unsafe) private var windowResignObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var appResignObserver: NSObjectProtocol?
+
+    private static let hoverMoveIntervalNanos: UInt64 = 8_000_000 // ~125 Hz
+    private static let dragMoveIntervalNanos: UInt64 = 4_000_000  // ~250 Hz
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -104,11 +153,29 @@ final class SampleBufferVideoView: NSView {
         wantsLayer = true
         if layer == nil { layer = CALayer() }
         setupDisplayLayer()
+        appResignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.releaseRemoteInputs(resignFocus: true)
+            }
+        }
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let observer = windowResignObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = appResignObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     func subscribe(to publisher: AnyPublisher<CVPixelBuffer?, Never>) {
@@ -131,6 +198,7 @@ final class SampleBufferVideoView: NSView {
 
     func clear() {
         lastDisplayedPixelBuffer = nil
+        lastVideoSize = .zero
         displayLayer?.flushAndRemoveImage()
     }
 
@@ -153,9 +221,32 @@ final class SampleBufferVideoView: NSView {
 
     // AppKit does not guarantee layout() runs when SwiftUI sets the frame,
     // so keep the layer geometry in sync from every relevant hook.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if let observer = windowResignObserver {
+            NotificationCenter.default.removeObserver(observer)
+            windowResignObserver = nil
+        }
+        if newWindow == nil {
+            releaseRemoteInputs(resignFocus: true)
+        }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         syncLayerGeometry()
+        updateTrackingAreas()
+        if let window {
+            windowResignObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.releaseRemoteInputs(resignFocus: true)
+                }
+            }
+        }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -166,6 +257,279 @@ final class SampleBufferVideoView: NSView {
     override func layout() {
         super.layout()
         syncLayerGeometry()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = pointerTrackingArea {
+            removeTrackingArea(existing)
+            pointerTrackingArea = nil
+        }
+        guard remoteControlEnabled else { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
+    // MARK: - Remote control responder & event capture
+
+    override var acceptsFirstResponder: Bool {
+        remoteControlEnabled
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        remoteControlEnabled
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard remoteControlEnabled else { return false }
+        lastModifierFlags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        setKeyboardFocus(true)
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releaseRemoteInputs(resignFocus: false)
+        setKeyboardFocus(false)
+        return true
+    }
+
+    private var isKeyboardCaptured: Bool {
+        remoteControlEnabled && window?.firstResponder === self
+    }
+
+    private func setKeyboardFocus(_ focused: Bool) {
+        guard hasKeyboardFocus != focused else { return }
+        hasKeyboardFocus = focused
+        let callback = onCaptureFocusChanged
+        DispatchQueue.main.async {
+            callback?(focused)
+        }
+    }
+
+    private func releaseRemoteInputs(resignFocus: Bool) {
+        let shouldNotifyServer = !activeButtons.isEmpty || !commandPressedKeys.isEmpty || hasKeyboardFocus
+        activeButtons.removeAll()
+        commandPressedKeys.removeAll()
+        lastModifierFlags = []
+        if shouldNotifyServer {
+            onInputEvent?(.releaseAll)
+        }
+        if resignFocus, let window, window.firstResponder === self {
+            window.makeFirstResponder(nil)
+        }
+        setKeyboardFocus(false)
+    }
+
+    private func mappedPoint(for event: NSEvent, clampOutside: Bool) -> SPPWInputCoordinateMapper.Result? {
+        guard lastVideoSize.width > 0, lastVideoSize.height > 0 else { return nil }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        return SPPWInputCoordinateMapper.mapAppKitPoint(
+            viewX: Double(localPoint.x),
+            viewY: Double(localPoint.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height),
+            videoWidth: Double(lastVideoSize.width),
+            videoHeight: Double(lastVideoSize.height),
+            orientation: videoOrientation,
+            clampOutside: clampOutside
+        )
+    }
+
+    private static func sanitizedModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        UInt32(truncatingIfNeeded: flags.intersection(.deviceIndependentFlagsMask).rawValue)
+    }
+
+    private static func isUngrabHotkey(_ event: NSEvent) -> Bool {
+        // Ctrl + Option + Esc releases keyboard/mouse capture locally without forwarding Esc.
+        guard event.keyCode == 53 else { return false }
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return mods.contains(.control) && mods.contains(.option)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard remoteControlEnabled else {
+            super.mouseMoved(with: event)
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now &- lastPointerMoveNanos >= Self.hoverMoveIntervalNanos else { return }
+        guard let mapped = mappedPoint(for: event, clampOutside: false) else { return }
+        lastPointerMoveNanos = now
+        onInputEvent?(.pointerMove(normalizedX: mapped.normalizedX, normalizedY: mapped.normalizedY))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        handleMouseButton(button: 0, isDown: true, event: event) { super.mouseDown(with: event) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        handleMouseButton(button: 0, isDown: false, event: event) { super.mouseUp(with: event) }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        handleMouseButton(button: 1, isDown: true, event: event) { super.rightMouseDown(with: event) }
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        handleMouseButton(button: 1, isDown: false, event: event) { super.rightMouseUp(with: event) }
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        let button = UInt8(clamping: max(2, event.buttonNumber))
+        handleMouseButton(button: button, isDown: true, event: event) { super.otherMouseDown(with: event) }
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        let button = UInt8(clamping: max(2, event.buttonNumber))
+        handleMouseButton(button: button, isDown: false, event: event) { super.otherMouseUp(with: event) }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        handleMouseDrag(event: event) { super.mouseDragged(with: event) }
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        handleMouseDrag(event: event) { super.rightMouseDragged(with: event) }
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        handleMouseDrag(event: event) { super.otherMouseDragged(with: event) }
+    }
+
+    private func handleMouseButton(button: UInt8, isDown: Bool, event: NSEvent, fallback: () -> Void) {
+        guard remoteControlEnabled else {
+            fallback()
+            return
+        }
+        guard let mapped = mappedPoint(for: event, clampOutside: !isDown) else {
+            if !isDown {
+                activeButtons.remove(button)
+            }
+            return
+        }
+        if isDown {
+            if let window, window.firstResponder !== self {
+                window.makeFirstResponder(self)
+            }
+            activeButtons.insert(button)
+        } else {
+            activeButtons.remove(button)
+        }
+        lastPointerMoveNanos = DispatchTime.now().uptimeNanoseconds
+        onInputEvent?(.mouseButton(
+            button: button,
+            isDown: isDown,
+            normalizedX: mapped.normalizedX,
+            normalizedY: mapped.normalizedY
+        ))
+    }
+
+    private func handleMouseDrag(event: NSEvent, fallback: () -> Void) {
+        guard remoteControlEnabled else {
+            fallback()
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now &- lastPointerMoveNanos >= Self.dragMoveIntervalNanos else { return }
+        guard let mapped = mappedPoint(for: event, clampOutside: true) else { return }
+        lastPointerMoveNanos = now
+        onInputEvent?(.pointerMove(normalizedX: mapped.normalizedX, normalizedY: mapped.normalizedY))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard remoteControlEnabled else {
+            super.scrollWheel(with: event)
+            return
+        }
+        guard mappedPoint(for: event, clampOutside: false) != nil else { return }
+        let scale: Double = event.hasPreciseScrollingDeltas ? 1.0 : 10.0
+        let dx = Float(event.scrollingDeltaX * scale)
+        let dy = Float(event.scrollingDeltaY * scale)
+        guard dx != 0 || dy != 0 else { return }
+        onInputEvent?(.scroll(deltaX: dx, deltaY: dy))
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard isKeyboardCaptured else {
+            return super.performKeyEquivalent(with: event)
+        }
+        if Self.isUngrabHotkey(event) {
+            releaseRemoteInputs(resignFocus: true)
+            return true
+        }
+        forwardKeyDown(event)
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isKeyboardCaptured else {
+            super.keyDown(with: event)
+            return
+        }
+        if Self.isUngrabHotkey(event) {
+            releaseRemoteInputs(resignFocus: true)
+            return
+        }
+        forwardKeyDown(event)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard isKeyboardCaptured else {
+            super.keyUp(with: event)
+            return
+        }
+        commandPressedKeys.remove(event.keyCode)
+        onInputEvent?(.key(
+            keyCode: event.keyCode,
+            isDown: false,
+            modifiers: Self.sanitizedModifiers(event.modifierFlags)
+        ))
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        guard isKeyboardCaptured else {
+            super.flagsChanged(with: event)
+            return
+        }
+        let current = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let sanitized = Self.sanitizedModifiers(current)
+
+        // AppKit does not deliver keyUp for non-modifier keys pressed while Command
+        // is held; flush them synthetically when Command is released.
+        if lastModifierFlags.contains(.command) && !current.contains(.command) && !commandPressedKeys.isEmpty {
+            let pending = commandPressedKeys.sorted()
+            commandPressedKeys.removeAll()
+            for keyCode in pending {
+                onInputEvent?(.key(keyCode: keyCode, isDown: false, modifiers: sanitized))
+            }
+        }
+
+        let isDown: Bool
+        if let flag = SPPWMacInputController.modifierFlag(forKeyCode: event.keyCode) {
+            isDown = (UInt64(sanitized) & flag.rawValue) != 0
+        } else {
+            isDown = current.rawValue > lastModifierFlags.rawValue
+        }
+        lastModifierFlags = current
+        onInputEvent?(.key(keyCode: event.keyCode, isDown: isDown, modifiers: sanitized))
+    }
+
+    private func forwardKeyDown(_ event: NSEvent) {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods.contains(.command) {
+            commandPressedKeys.insert(event.keyCode)
+        }
+        onInputEvent?(.key(
+            keyCode: event.keyCode,
+            isDown: true,
+            modifiers: Self.sanitizedModifiers(mods)
+        ))
     }
 
     private func syncLayerGeometry() {
@@ -198,6 +562,12 @@ final class SampleBufferVideoView: NSView {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        if width > 0 && height > 0 {
+            let newSize = CGSize(width: width, height: height)
+            if lastVideoSize != newSize {
+                lastVideoSize = newSize
+            }
+        }
 
         let formatDescription: CMVideoFormatDescription
         if let cached = cachedFormatDescription,

@@ -344,9 +344,36 @@ extension PyrowaveCodec {
     func decodeContiguousFrame(
         _ frame: EncodedFrame,
         to output: PyrowavePixelBufferInput,
-        allowPartialFrame: Bool = false
+        allowPartialFrame: Bool = false,
+        limitedRange: Bool = false
     ) async throws -> PyrowaveContiguousDecodeStageMetrics {
         let cvPixelBuffer = output.pixelBuffer
+        if CVPixelBufferGetPixelFormatType(cvPixelBuffer) == kCVPixelFormatType_32BGRA {
+            // 4:4:4 streams decode to BGRA (see pyrowave_crop_yuv444_to_bgra).
+            let width = CVPixelBufferGetWidth(cvPixelBuffer)
+            let height = CVPixelBufferGetHeight(cvPixelBuffer)
+            let textureStart = PyrowaveClock.now
+            let bgraTexture = try makeMetalTexture(
+                from: cvPixelBuffer,
+                pixelFormat: .bgra8Unorm,
+                width: width,
+                height: height,
+                planeIndex: 0
+            )
+            let textureEnd = PyrowaveClock.now
+            let decodeMetrics = try await decodeToBGRA444Texture(
+                frame,
+                bgraTexture: bgraTexture.texture,
+                limitedRange: limitedRange,
+                allowPartialFrame: allowPartialFrame
+            )
+            _ = bgraTexture.reference
+            return PyrowaveContiguousDecodeStageMetrics(
+                textureCreationMilliseconds: textureStart.milliseconds(to: textureEnd),
+                packetParseMilliseconds: decodeMetrics.packetParseMilliseconds,
+                metalDecodeMilliseconds: decodeMetrics.metalDecodeMilliseconds
+            )
+        }
         let width = CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 0)
         let height = CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 0)
         guard CVPixelBufferGetPlaneCount(cvPixelBuffer) >= 2,

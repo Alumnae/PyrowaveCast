@@ -5,8 +5,7 @@ let package = Package(
     name: "PyrowaveKit",
     platforms: [
         .macOS(.v14),
-        .iOS(.v17),
-        .visionOS("1.1")
+        .iOS(.v17)
     ],
     products: [
         .library(name: "PyrowaveKit", targets: ["PyrowaveKit"]),

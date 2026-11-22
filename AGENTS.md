@@ -4,7 +4,7 @@
 
 PyrowaveKit is an Apple-only Swift and Metal port of PyroWave together with a native macOS and iOS low-latency streaming stack (`SPPW/1`). Treat the project as a native Apple codec and transport suite, not as a compatibility layer for the old Vulkan/C++ implementation.
 
-- Keep the core package Swift Package Manager based (`Package.swift`); the unified iOS app builds via `iOSServer/iPyroServer.xcodeproj`.
+- Keep the core package Swift Package Manager based (`Package.swift`); the unified iOS app builds via `PyrowaveCastiOS/PyrowaveCastiOS.xcodeproj`.
 - Keep codec entry points centered on Metal textures and CoreVideo pixel buffers, and video display on `AVSampleBufferDisplayLayer` (no `CIContext` conversion path).
 - Do not add CPU fallback paths for wavelet encode/decode.
 - Do not change the PyroWave bitstream format (`Vendor/pyrowave-metal`, upstream MIT) or break `SPPW/1` NativeMode.
@@ -18,7 +18,7 @@ PyrowaveKit is an Apple-only Swift and Metal port of PyroWave together with a na
 - `Sources/SPPWCommon`: Shared `SPPW/1` wire/transport helpers — asymmetric LL/HF Cauchy Reed-Solomon GF(2^8) FEC, frame assembler (LL-drop + partial-HF salvage), adaptive bitrate controller (`SPPWAdaptiveBitrateController`), POSIX UDP sockets, pacing, adaptive Wi-Fi buffer, audio & input codecs.
 - `Sources/PyrowaveServerKit`: `SPPW/1` streaming server, macOS `ScreenCaptureKit` capture, test sources.
 - `Sources/PyrowaveGUI`: Shared SwiftUI views/models (`pyrowave-app`, `pyrowave-server-gui`, `pyrowave-receiver-gui`).
-- `iOSServer/iPyroServer.xcodeproj`: Unified iOS server + receiver app (compiles `PyrowaveKit`, `PyrowaveServerKit`, `SPPWCommon`, and vendored Metal sources directly).
+- `PyrowaveCastiOS/PyrowaveCastiOS.xcodeproj`: Unified iOS server + receiver app (compiles `PyrowaveKit`, `PyrowaveServerKit`, `SPPWCommon`, and vendored Metal sources directly).
 - `VERSION` & `scripts/version.sh`: Single source of truth for macOS & iOS app versions (`0.5.x` minor/patch bumps, `0.x.0` major-fix bumps).
 - `PROTOCOL.md`: `SPPW/1` wire specification — keep it in sync whenever changing headers, message kinds, flags, or payloads.
 - `TASK_STATE.md`: Shared multi-agent task list and decisions — always re-read before editing so concurrent agents do not overwrite each other's updates.
@@ -42,8 +42,8 @@ To ensure the repository acts like **macOS Time Machine** and allow instant roll
 
 ## Platform, Concurrency & Licensing Constraints
 
-- **Deployment targets:** macOS 14+, **iOS 17.0 minimum** (`Package.swift` `.iOS(.v17)`, Xcode `IPHONEOS_DEPLOYMENT_TARGET = 17.0`), visionOS 1.1+.
-- **iOS compatibility:** In files compiled for iOS (`PyrowaveKit`, `SPPWCommon`, `PyrowaveServerKit`, `iOSServer`), guard macOS-only VideoToolbox / ScreenCaptureKit APIs and anything newer than iOS 17. Prefer the existing `PyrowaveClock` helper for timing.
+- **Deployment targets:** macOS 14+, **iOS 17.0 minimum** (`Package.swift` `.iOS(.v17)`, Xcode `IPHONEOS_DEPLOYMENT_TARGET = 17.0`). visionOS is not supported.
+- **iOS compatibility:** In files compiled for iOS (`PyrowaveKit`, `SPPWCommon`, `PyrowaveServerKit`, `PyrowaveCastiOS`), guard macOS-only VideoToolbox / ScreenCaptureKit APIs and anything newer than iOS 17. Prefer the existing `PyrowaveClock` helper for timing.
 - **Swift 6 strict concurrency:** Keep UDP receive, FEC reconstruction, and frame assembly off `@MainActor`; only completed frames/UI stats hop to `@MainActor`.
 - **Licensing (MIT):** Never copy GPLv3 code (e.g., Sunshine or `moonlight-common-c`). Never decompile closed-source software (e.g., Punktfunk, Steam Remote Play).
 
@@ -60,16 +60,19 @@ Performance work should focus on real app behavior:
 
 ## Build, Packaging & Benchmarks
 
-- Release app packaging scripts (all embed `PyrowaveKit_PyrowaveKit.bundle`, pass `--disable-sandbox` where needed, and auto-bump `VERSION` + sync `iOSServer/iPyroServer/Info.plist`):
+- Release app packaging scripts (all embed `PyrowaveKit_PyrowaveKit.bundle`, pass `--disable-sandbox` where needed, and auto-bump `VERSION` + sync `PyrowaveCastiOS/PyrowaveCastiOS/Info.plist`):
   - `./scripts/build-app.sh` → `build/PyroWave.app` (unified macOS)
   - `./scripts/build-gui.sh` → `build/PyrowaveServer.app`
   - `./scripts/build-receiver.sh` → `build/PyrowaveReceiver.app`
   - `./scripts/build-ios.sh` → `build/PyroWaveiOS.ipa` (unsigned, iOS 17+)
-- **Automatic versioning (`VERSION` / `scripts/version.sh`):**
-  - Default (`--patch`): increments `0.5.x` → `0.5.(x+1)` for minor fixes/builds.
-  - Major fixes (`--minor` or `--major-fix`): increments `0.x.y` → `0.(x+1).0`.
-  - Reuse current version (`--no-bump` or `PYROWAVE_BUMP=none`): useful when packaging macOS and iOS for the same release.
-  - `CFBundleVersion` is derived monotonically as `MAJOR*10000 + MINOR*100 + PATCH` (e.g. `0.5.1` → `501`).
+- **Code signing:** never sign builds with a personal Apple Development / Developer ID identity — the repositories are public. `build-app.sh` signs ad hoc only, the iOS `.ipa` stays unsigned, and no `DEVELOPMENT_TEAM` is committed to the Xcode projects.
+- **Regola Obbligatoria sul Versionamento di Build (Incremento Z):**
+  - **Ogni volta che si esegue una build, la cifra Z di `X.Y.Z` (patch version) DEVE essere incrementata:**
+    - `X.Y.Z` → `X.Y.(Z+1)` (es. `0.6.4` → `0.6.5`).
+    - Gli script di packaging (`./scripts/build-app.sh`, `./scripts/build-ios.sh`, ecc.) per impostazione predefinita applicano `--patch` ed eseguono automaticamente questo incremento.
+    - **Non** usare `--no-bump` salvo che l'utente non richieda esplicitamente di non incrementare la versione; ogni ciclo/richiesta di build deve avanzare la Z di versione in modo che ogni nuovo artefatto prodotto abbia una versione progressiva e tracciabile.
+  - Incrementi maggiori (`--minor` o `--major-fix`): avanzano `0.x.y` → `0.(x+1).0`.
+  - `CFBundleVersion` è calcolato monotonicamente come `MAJOR*10000 + MINOR*100 + PATCH` (es. `0.6.5` → `605`).
 - Benchmark output belongs under `.pyrowave-results/`, which is git ignored.
 
 Useful commands:

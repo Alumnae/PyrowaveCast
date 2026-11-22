@@ -961,6 +961,47 @@ public final class PyrowaveCodec: @unchecked Sendable {
         )
     }
 
+    /// Decodes a 4:4:4 frame straight into a BGRA texture (BT.709). Used for
+    /// 4:4:4 streams, whose full resolution chroma does not fit an NV12 output.
+    func decodeToBGRA444Texture(
+        _ frame: EncodedFrame,
+        bgraTexture: MTLTexture,
+        limitedRange: Bool,
+        allowPartialFrame: Bool = false
+    ) async throws -> PyrowaveContiguousNV12DecodeMetrics {
+        let packetParseStart = PyrowaveClock.now
+        let decoded = try decodeContiguousGPUPlanes(frame, allowPartialFrame: allowPartialFrame)
+        let packetParseEnd = PyrowaveClock.now
+        guard decoded.sequence.chroma == .yuv444,
+              bgraTexture.width == decoded.sequence.width,
+              bgraTexture.height == decoded.sequence.height else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let metalDecodeStart = PyrowaveClock.now
+        try await metalBackend.decodeSparsePacketsInverseAndCropToBGRATexture(
+            packetData: frame.data,
+            planes: decoded.planes.indices.map { index in
+                (
+                    sampleCount: decoded.planes[index].sampleCount,
+                    paddedWidth: decoded.planes[index].paddedWidth,
+                    paddedHeight: decoded.planes[index].paddedHeight,
+                    levels: decoded.planes[index].levels,
+                    descriptors: decoded.packetDescriptorsByPlane[index]
+                )
+            },
+            width: decoded.sequence.width,
+            height: decoded.sequence.height,
+            bgraTexture: bgraTexture,
+            limitedRange: limitedRange
+        )
+        let metalDecodeEnd = PyrowaveClock.now
+        return PyrowaveContiguousNV12DecodeMetrics(
+            packetParseMilliseconds: packetParseStart.milliseconds(to: packetParseEnd),
+            metalDecodeMilliseconds: metalDecodeStart.milliseconds(to: metalDecodeEnd)
+        )
+    }
+
     private func decodeContiguousGPUPlanes(_ frame: EncodedFrame, allowPartialFrame: Bool = false) throws -> GPUDecodedFramePlanes {
         var headerReader = BinaryReader(frame.data)
         let sequence = try PyrowaveSequenceHeader(reader: &headerReader)
@@ -982,6 +1023,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
         var seenBlocks = [UInt8](repeating: 0, count: layout.descriptors.count)
         var parsedBlockCount = 0
+        var maxParsedBlockIndex = -1
 
         try frame.data.withUnsafeBytes { bytes in
             var offset = headerReader.offset
@@ -1018,6 +1060,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
                     throw PyrowaveError.invalidBitstream("bad sparse block index")
                 }
                 seenBlocks[blockIndex] = 1
+                if blockIndex > maxParsedBlockIndex {
+                    maxParsedBlockIndex = blockIndex
+                }
                 guard let target = blockTargets[blockIndex] else {
                     throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
                 }
@@ -1063,13 +1108,20 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         if allowPartialFrame {
-            guard parsedBlockCount > 0 else {
+            guard parsedBlockCount > 0 || sequence.totalBlocks == 0 else {
                 throw PyrowaveError.invalidBitstream("partial frame has zero decoded blocks")
             }
-            let coarsestLevel = PyrowaveBitstream.decompositionLevels - 1
-            for descriptor in layout.descriptors where descriptor.level == coarsestLevel && descriptor.band == 0 {
-                guard seenBlocks[descriptor.blockIndex] != 0 else {
-                    throw PyrowaveError.invalidBitstream("partial frame missing critical LL subband block \(descriptor.blockIndex)")
+            // The encoder omits all-zero 32x32 blocks (never counting them in
+            // `sequence.totalBlocks`) and emits non-empty blocks in ascending
+            // `blockIndex` order. Therefore an unseen LL block is only missing
+            // if the contiguous prefix truncated before reaching its index while
+            // fewer than `sequence.totalBlocks` were decoded.
+            if parsedBlockCount < sequence.totalBlocks {
+                let coarsestLevel = PyrowaveBitstream.decompositionLevels - 1
+                for descriptor in layout.descriptors where descriptor.level == coarsestLevel && descriptor.band == 0 {
+                    guard seenBlocks[descriptor.blockIndex] != 0 || descriptor.blockIndex <= maxParsedBlockIndex else {
+                        throw PyrowaveError.invalidBitstream("partial frame missing critical LL subband block \(descriptor.blockIndex)")
+                    }
                 }
             }
         } else {
