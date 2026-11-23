@@ -11,6 +11,10 @@ struct IOSDecodedReceiverFrame: @unchecked Sendable {
     let isPartialHF: Bool
     /// Server capture instant (`SPPWCaptureClock`), used for audio/video sync.
     let senderTimestampNanoseconds: UInt64
+    /// A newer frame was already waiting when this decode finished. Only superseded
+    /// frames are dropped for being late: the newest frame is always shown, so a slow
+    /// first decode (session setup at 4K+) or a still screen never leaves the view empty.
+    let isSuperseded: Bool
 }
 
 /// Decodes PyroWave bitstream frames on a background actor using a 1-slot
@@ -102,7 +106,8 @@ actor IOSReceiverDecoder {
                     skippedWhileBusy: skipped,
                     recoveredWithFEC: frame.recoveredWithFEC,
                     isPartialHF: frame.isPartialHF,
-                    senderTimestampNanoseconds: frame.senderTimestampNanoseconds
+                    senderTimestampNanoseconds: frame.senderTimestampNanoseconds,
+                    isSuperseded: pending != nil
                 ))
             } catch {
                 // Reset session on fatal errors so the next frame retries cleanly.

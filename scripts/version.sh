@@ -118,8 +118,10 @@ pyrowave_apply_version() {
 
     printf '%s\n' "$PYROWAVE_VERSION" > "$version_file"
 
-    # Keep the iOS Xcode project's Info.plist synchronized with VERSION and commit.
-    local ios_plist="$root/PyrowaveCastiOS/PyrowaveCastiOS/Info.plist"
+    # Keep the iOS Xcode project's Info.plists (app and broadcast upload extension, which
+    # must carry the same version as its app) synchronized with VERSION and commit.
+    local ios_plist
+    for ios_plist in "$root/PyrowaveCastiOS/PyrowaveCastiOS/Info.plist" "$root/PyrowaveCastiOS/PyrowaveCastBroadcast/Info.plist"; do
     if [[ -f "$ios_plist" && -x /usr/libexec/PlistBuddy ]]; then
         /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PYROWAVE_VERSION" "$ios_plist" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $PYROWAVE_VERSION" "$ios_plist"
@@ -132,6 +134,7 @@ pyrowave_apply_version() {
                 /usr/libexec/PlistBuddy -c "Add :PyrowaveBuildVersion string \"$PYROWAVE_BUILD_VERSION_TEXT\"" "$ios_plist"
         fi
     fi
+    done
 
     # Keep fallback constants in SPPWTransportSupport.swift synchronized if present.
     local transport_file="$root/Sources/SPPWCommon/SPPWTransportSupport.swift"

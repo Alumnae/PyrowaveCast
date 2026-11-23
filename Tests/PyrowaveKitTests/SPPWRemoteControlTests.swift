@@ -331,3 +331,178 @@ private func chordResults(_ steps: [SPPWKeyModifiers?]) -> [Bool] {
     // A click with no modifier held does not spoil the next chord.
     #expect(chordResults([nil, [.option, .control], []]) == [false, false, true])
 }
+
+// MARK: - Rotated controls and zoom
+
+@Test func remoteControlVideoDeltaFollowsRotationAndFlip() {
+    // 0°: unchanged.
+    #expect(SPPWVideoOrientation().videoDelta(screenDX: 3, screenDY: -2) == (3, -2))
+    // 90° CW: the picture's top is on the screen's right, so a swipe right moves up.
+    let quarter = SPPWVideoOrientation(quarterTurnsClockwise: 1)
+    #expect(quarter.videoDelta(screenDX: 1, screenDY: 0) == (0, -1))
+    #expect(quarter.videoDelta(screenDX: 0, screenDY: 1) == (1, 0))
+    #expect(SPPWVideoOrientation(quarterTurnsClockwise: 2).videoDelta(screenDX: 1, screenDY: 2) == (-1, -2))
+    #expect(SPPWVideoOrientation(quarterTurnsClockwise: 3).videoDelta(screenDX: 1, screenDY: 0) == (0, 1))
+    // Mirror only flips the horizontal axis of the picture.
+    #expect(SPPWVideoOrientation(isFlippedHorizontally: true).videoDelta(screenDX: 4, screenDY: 1) == (-4, 1))
+}
+
+@Test func remoteControlVideoDeltaMatchesAbsoluteMapping() {
+    // A small screen motion must move the mapped video point the same way as the delta.
+    for turns in 0..<4 {
+        for flip in [false, true] {
+            let orientation = SPPWVideoOrientation(quarterTurnsClockwise: turns, isFlippedHorizontally: flip)
+            func map(_ x: Double, _ y: Double) -> SPPWInputCoordinateMapper.Result? {
+                SPPWInputCoordinateMapper.mapUIKitPoint(
+                    viewX: x, viewY: y, viewWidth: 800, viewHeight: 800,
+                    videoWidth: 1000, videoHeight: 1000, orientation: orientation
+                )
+            }
+            guard let a = map(400, 400), let b = map(410, 395) else {
+                Issue.record("mapping failed")
+                continue
+            }
+            let delta = orientation.videoDelta(screenDX: 10, screenDY: -5)
+            let mappedDX = Double(b.normalizedX - a.normalizedX)
+            let mappedDY = Double(b.normalizedY - a.normalizedY)
+            #expect((mappedDX > 0) == (delta.dx > 0) || abs(delta.dx) < 0.001)
+            #expect((mappedDY > 0) == (delta.dy > 0) || abs(delta.dy) < 0.001)
+            #expect(abs(mappedDX * 800 - delta.dx) < 0.01 && abs(mappedDY * 800 - delta.dy) < 0.01)
+        }
+    }
+}
+
+@Test func remoteControlRotatedInsetsMoveWithTheVideo() {
+    let screen = (top: 47.0, left: 0.0, bottom: 34.0, right: 10.0)
+    #expect(SPPWVideoOrientation().rotatedInsets(top: screen.top, left: screen.left, bottom: screen.bottom, right: screen.right) == (47, 0, 34, 10))
+    // 90° CW: the container's top edge lies on the screen's right edge.
+    #expect(SPPWVideoOrientation(quarterTurnsClockwise: 1).rotatedInsets(top: screen.top, left: screen.left, bottom: screen.bottom, right: screen.right) == (10, 47, 0, 34))
+    #expect(SPPWVideoOrientation(quarterTurnsClockwise: 2).rotatedInsets(top: screen.top, left: screen.left, bottom: screen.bottom, right: screen.right) == (34, 10, 47, 0))
+    #expect(SPPWVideoOrientation(quarterTurnsClockwise: 3).rotatedInsets(top: screen.top, left: screen.left, bottom: screen.bottom, right: screen.right) == (0, 34, 10, 47))
+}
+
+@Test func remoteControlZoomClampsAndKeepsAnchor() {
+    var zoom = SPPWViewZoom()
+    #expect(!zoom.isZoomed)
+    // Zooming about a point keeps the content under it in place.
+    zoom.zoom(by: 1.5, anchorX: 300, anchorY: 200, viewWidth: 1000, viewHeight: 600)
+    #expect(abs(zoom.scale - 1.5) < 1e-9)
+    let anchored = zoom.contentPoint(viewX: 300, viewY: 200, viewWidth: 1000, viewHeight: 600)
+    #expect(abs(anchored.x - 300) < 1e-9 && abs(anchored.y - 200) < 1e-9)
+    // Never above 2× or below 1×.
+    zoom.zoom(by: 10, anchorX: 500, anchorY: 300, viewWidth: 1000, viewHeight: 600)
+    #expect(zoom.scale == SPPWViewZoom.maximumScale)
+    zoom.zoom(by: 0.01, anchorX: 500, anchorY: 300, viewWidth: 1000, viewHeight: 600)
+    #expect(zoom.scale == 1 && zoom.offsetX == 0 && zoom.offsetY == 0)
+    // Panning stops at the content edge: no black margin.
+    zoom.setScale(2, anchorX: 500, anchorY: 300, viewWidth: 1000, viewHeight: 600)
+    zoom.pan(dx: 10_000, dy: -10_000, viewWidth: 1000, viewHeight: 600)
+    #expect(zoom.offsetX == 500 && zoom.offsetY == -300)
+    let corner = zoom.contentPoint(viewX: 0, viewY: 600, viewWidth: 1000, viewHeight: 600)
+    #expect(abs(corner.x) < 1e-9 && abs(corner.y - 600) < 1e-9)
+    // Smaller view after a rotation: the offset is clamped again.
+    zoom.clampOffset(viewWidth: 600, viewHeight: 1000)
+    #expect(zoom.offsetX == 300 && zoom.offsetY == -300)
+}
+
+@Test func remoteControlZoomFollowKeepsPointerMappingUnzoomed() {
+    var zoom = SPPWViewZoom(scale: 1.8, viewWidth: 1200, viewHeight: 800)
+    for (x, y) in [(0.0, 0.0), (1200.0, 800.0), (300.0, 650.0), (600.0, 400.0)] {
+        zoom.follow(viewX: x, viewY: y, viewWidth: 1200, viewHeight: 800)
+        let content = zoom.contentPoint(viewX: x, viewY: y, viewWidth: 1200, viewHeight: 800)
+        #expect(abs(content.x - x) < 1e-9 && abs(content.y - y) < 1e-9)
+    }
+}
+
+@Test func stillScreenRefreshWaitsForTheInterval() {
+    let second = SPPWStillScreenPolicy.refreshIntervalNanoseconds
+    #expect(!SPPWStillScreenPolicy.shouldRefresh(nowNanoseconds: 5 * second, lastSentNanoseconds: 0))
+    #expect(!SPPWStillScreenPolicy.shouldRefresh(nowNanoseconds: 5 * second, lastSentNanoseconds: 5 * second - second / 2))
+    #expect(SPPWStillScreenPolicy.shouldRefresh(nowNanoseconds: 5 * second, lastSentNanoseconds: 4 * second))
+    #expect(second < 2_000_000_000, "must stay inside the receivers' 2 s fresh-frame watchdog")
+}
+
+@Test func stillScreenResyncRestartsOnlyADeadOrSilentSource() {
+    let silent = SPPWStillScreenPolicy.resyncSilenceNanoseconds
+    #expect(!SPPWStillScreenPolicy.resyncNeedsSourceRestart(geometryOrRateChanged: false, sourceRunning: true, captureSilenceNanoseconds: nil))
+    #expect(!SPPWStillScreenPolicy.resyncNeedsSourceRestart(geometryOrRateChanged: false, sourceRunning: true, captureSilenceNanoseconds: silent - 1))
+    #expect(SPPWStillScreenPolicy.resyncNeedsSourceRestart(geometryOrRateChanged: false, sourceRunning: true, captureSilenceNanoseconds: silent))
+    #expect(SPPWStillScreenPolicy.resyncNeedsSourceRestart(geometryOrRateChanged: false, sourceRunning: false, captureSilenceNanoseconds: nil))
+    #expect(SPPWStillScreenPolicy.resyncNeedsSourceRestart(geometryOrRateChanged: true, sourceRunning: true, captureSilenceNanoseconds: 0))
+}
+
+@Test func stillScreenStallNeedsRecentInteractionAndSpacing() {
+    let stall = SPPWStillScreenPolicy.interactionStallNanoseconds
+    #expect(SPPWStillScreenPolicy.isStalledWhileInteracting(captureSilenceNanoseconds: stall, sinceLastInteractionNanoseconds: 0, sinceLastStallRestartNanoseconds: nil))
+    #expect(!SPPWStillScreenPolicy.isStalledWhileInteracting(captureSilenceNanoseconds: stall - 1, sinceLastInteractionNanoseconds: 0, sinceLastStallRestartNanoseconds: nil))
+    #expect(!SPPWStillScreenPolicy.isStalledWhileInteracting(captureSilenceNanoseconds: stall, sinceLastInteractionNanoseconds: nil, sinceLastStallRestartNanoseconds: nil))
+    #expect(!SPPWStillScreenPolicy.isStalledWhileInteracting(captureSilenceNanoseconds: stall, sinceLastInteractionNanoseconds: 0, sinceLastStallRestartNanoseconds: 1_000_000_000))
+    #expect(SPPWStillScreenPolicy.isStalledWhileInteracting(captureSilenceNanoseconds: stall, sinceLastInteractionNanoseconds: 0, sinceLastStallRestartNanoseconds: SPPWStillScreenPolicy.minimumRestartSpacingNanoseconds))
+}
+
+@Test func inputThatChangesTheScreenExcludesPointerMotion() {
+    #expect(SPPWInputEvent.clickAtCursor(button: 0).normallyChangesScreen)
+    #expect(SPPWInputEvent.key(keyCode: 0, isDown: true, modifiers: 0).normallyChangesScreen)
+    #expect(SPPWInputEvent.scroll(deltaX: 0, deltaY: 1).normallyChangesScreen)
+    #expect(SPPWInputEvent.sequenced(sequence: 3, event: .text("a")).normallyChangesScreen)
+    #expect(!SPPWInputEvent.pointerMove(normalizedX: 0.5, normalizedY: 0.5).normallyChangesScreen)
+    #expect(!SPPWInputEvent.pointerDelta(deltaX: 1, deltaY: 1).normallyChangesScreen)
+    #expect(!SPPWInputEvent.cursorVisibility(hidden: true).normallyChangesScreen)
+}
+
+@Test func localPointerViewPointInvertsTheTouchMapping() {
+    for turns in 0..<4 {
+        for flip in [false, true] {
+            let orientation = SPPWVideoOrientation(quarterTurnsClockwise: turns, isFlippedHorizontally: flip)
+            for (nx, ny) in [(0.1, 0.2), (0.5, 0.5), (0.9, 0.75), (0.0, 1.0)] {
+                guard let view = SPPWInputCoordinateMapper.uiKitViewPoint(
+                    normalizedX: nx, normalizedY: ny,
+                    viewWidth: 390, viewHeight: 844,
+                    videoWidth: 1920, videoHeight: 1080,
+                    orientation: orientation
+                ), let back = SPPWInputCoordinateMapper.mapUIKitPoint(
+                    viewX: view.x, viewY: view.y,
+                    viewWidth: 390, viewHeight: 844,
+                    videoWidth: 1920, videoHeight: 1080,
+                    orientation: orientation,
+                    clampOutside: true
+                ) else {
+                    Issue.record("mapping failed for turns \(turns) flip \(flip)")
+                    continue
+                }
+                #expect(abs(Double(back.normalizedX) - nx) < 1e-4)
+                #expect(abs(Double(back.normalizedY) - ny) < 1e-4)
+            }
+        }
+    }
+}
+
+@Test func localPointerZoomViewPointInvertsContentPoint() {
+    var zoom = SPPWViewZoom()
+    zoom.setScale(1.7, anchorX: 120, anchorY: 300, viewWidth: 390, viewHeight: 844)
+    let view = zoom.viewPoint(contentX: 200, contentY: 500, viewWidth: 390, viewHeight: 844)
+    let back = zoom.contentPoint(viewX: view.x, viewY: view.y, viewWidth: 390, viewHeight: 844)
+    #expect(abs(back.x - 200) < 1e-9)
+    #expect(abs(back.y - 500) < 1e-9)
+}
+
+@Test func localPointerMovesAcrossTheShownPictureAndClamps() {
+    var pointer = SPPWLocalPointer()
+    let size = SPPWLocalPointer.displayedVideoSize(
+        viewWidth: 844, viewHeight: 390, videoWidth: 1920, videoHeight: 1080,
+        orientation: SPPWVideoOrientation()
+    )!
+    #expect(abs(size.height - 390) < 1e-9)
+    pointer.move(videoDX: size.width / 4, videoDY: 0, displayedVideoWidth: size.width, displayedVideoHeight: size.height)
+    #expect(abs(pointer.normalizedX - 0.75) < 1e-9)
+    pointer.move(videoDX: size.width, videoDY: -size.height, displayedVideoWidth: size.width, displayedVideoHeight: size.height)
+    #expect(pointer.normalizedX == 1)
+    #expect(pointer.normalizedY == 0)
+    #expect(pointer.moveEvent == .pointerMove(normalizedX: 1, normalizedY: 0))
+    let rotated = SPPWLocalPointer.displayedVideoSize(
+        viewWidth: 390, viewHeight: 844, videoWidth: 1920, videoHeight: 1080,
+        orientation: SPPWVideoOrientation(quarterTurnsClockwise: 1, isFlippedHorizontally: false)
+    )!
+    #expect(abs(rotated.height - 390) < 1e-9)
+    #expect(abs(rotated.width - 1920.0 * 390 / 1080) < 1e-9)
+}

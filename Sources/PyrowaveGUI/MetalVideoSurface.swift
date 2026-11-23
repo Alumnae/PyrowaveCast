@@ -28,6 +28,9 @@ struct MetalVideoSurface: NSViewRepresentable {
     let remoteControlEnabled: Bool
     let onInputEvent: ((SPPWInputEvent) -> Void)?
     let onCaptureFocusChanged: ((Bool) -> Void)?
+    /// Local magnifier (1×–2×). `onZoomChanged` enables pinch zoom and reports its scale.
+    let zoomScale: Double
+    let onZoomChanged: ((Double) -> Void)?
     /// Reports the first occurrence of each display failure so the receiver
     /// event log can show why a surface is blank instead of failing silently.
     let onDiagnostic: ((String) -> Void)?
@@ -39,8 +42,12 @@ struct MetalVideoSurface: NSViewRepresentable {
         remoteControlEnabled: Bool = false,
         onInputEvent: ((SPPWInputEvent) -> Void)? = nil,
         onCaptureFocusChanged: ((Bool) -> Void)? = nil,
+        zoomScale: Double = 1,
+        onZoomChanged: ((Double) -> Void)? = nil,
         onDiagnostic: ((String) -> Void)? = nil
     ) {
+        self.zoomScale = zoomScale
+        self.onZoomChanged = onZoomChanged
         self.pixelBuffer = pixelBuffer
         self.framePublisher = framePublisher
         self.orientation = orientation
@@ -57,8 +64,12 @@ struct MetalVideoSurface: NSViewRepresentable {
         remoteControlEnabled: Bool = false,
         onInputEvent: ((SPPWInputEvent) -> Void)? = nil,
         onCaptureFocusChanged: ((Bool) -> Void)? = nil,
+        zoomScale: Double = 1,
+        onZoomChanged: ((Double) -> Void)? = nil,
         onDiagnostic: ((String) -> Void)? = nil
     ) where P.Output == CVPixelBuffer?, P.Failure == Never {
+        self.zoomScale = zoomScale
+        self.onZoomChanged = onZoomChanged
         self.pixelBuffer = initialPixelBuffer
         self.framePublisher = framePublisher.eraseToAnyPublisher()
         self.orientation = orientation
@@ -75,6 +86,8 @@ struct MetalVideoSurface: NSViewRepresentable {
         view.onCaptureFocusChanged = onCaptureFocusChanged
         view.videoOrientation = orientation
         view.remoteControlEnabled = remoteControlEnabled
+        view.onZoomChanged = onZoomChanged
+        view.setRequestedZoomScale(zoomScale)
         if let framePublisher {
             view.subscribe(to: framePublisher)
         }
@@ -94,6 +107,8 @@ struct MetalVideoSurface: NSViewRepresentable {
         if nsView.remoteControlEnabled != remoteControlEnabled {
             nsView.remoteControlEnabled = remoteControlEnabled
         }
+        nsView.onZoomChanged = onZoomChanged
+        nsView.setRequestedZoomScale(zoomScale)
         if let framePublisher {
             nsView.subscribeIfNeeded(to: framePublisher)
         } else if let pixelBuffer {
@@ -108,6 +123,10 @@ final class SampleBufferVideoView: NSView {
     var onDiagnostic: ((String) -> Void)?
     var onInputEvent: ((SPPWInputEvent) -> Void)?
     var onCaptureFocusChanged: ((Bool) -> Void)?
+    /// Set when the owner supports zoom (receiver); pinch and scroll-pan are off otherwise.
+    var onZoomChanged: ((Double) -> Void)?
+    private(set) var zoom = SPPWViewZoom()
+    private var lastPointerInView: CGPoint?
     var videoOrientation = SPPWVideoOrientation() {
         didSet {
             syncLayerGeometry()
@@ -152,6 +171,8 @@ final class SampleBufferVideoView: NSView {
         // sublayer instead (the documented macOS pattern).
         wantsLayer = true
         if layer == nil { layer = CALayer() }
+        // The zoomed picture must not spill over the surrounding controls.
+        layer?.masksToBounds = true
         setupDisplayLayer()
         appResignObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
@@ -329,9 +350,17 @@ final class SampleBufferVideoView: NSView {
     private func mappedPoint(for event: NSEvent, clampOutside: Bool) -> SPPWInputCoordinateMapper.Result? {
         guard lastVideoSize.width > 0, lastVideoSize.height > 0 else { return nil }
         let localPoint = convert(event.locationInWindow, from: nil)
-        return SPPWInputCoordinateMapper.mapAppKitPoint(
+        followPointerIfZoomed(localPoint)
+        // Undo the local magnifier: the pointer is over the zoomed picture.
+        let point = zoom.contentPoint(
             viewX: Double(localPoint.x),
             viewY: Double(localPoint.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height)
+        )
+        return SPPWInputCoordinateMapper.mapAppKitPoint(
+            viewX: point.x,
+            viewY: point.y,
             viewWidth: Double(bounds.width),
             viewHeight: Double(bounds.height),
             videoWidth: Double(lastVideoSize.width),
@@ -444,15 +473,88 @@ final class SampleBufferVideoView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard remoteControlEnabled else {
+            // View only: while zoomed, scrolling moves around the magnified picture.
+            if zoom.isZoomed, onZoomChanged != nil {
+                zoom.pan(
+                    dx: Double(event.scrollingDeltaX),
+                    dy: -Double(event.scrollingDeltaY),
+                    viewWidth: Double(bounds.width),
+                    viewHeight: Double(bounds.height)
+                )
+                syncLayerGeometry()
+                return
+            }
             super.scrollWheel(with: event)
             return
         }
         guard mappedPoint(for: event, clampOutside: false) != nil else { return }
         let scale: Double = event.hasPreciseScrollingDeltas ? 1.0 : 10.0
-        let dx = Float(event.scrollingDeltaX * scale)
-        let dy = Float(event.scrollingDeltaY * scale)
+        // Scroll in the picture's own axes when the video is rotated or mirrored.
+        let video = videoOrientation.videoDelta(
+            screenDX: Double(event.scrollingDeltaX) * scale,
+            screenDY: Double(event.scrollingDeltaY) * scale
+        )
+        let dx = Float(video.dx)
+        let dy = Float(video.dy)
         guard dx != 0 || dy != 0 else { return }
         onInputEvent?(.scroll(deltaX: dx, deltaY: dy))
+    }
+
+    // MARK: Zoom
+
+    /// Trackpad pinch zooms the local picture (never sent to the remote Mac).
+    override func magnify(with event: NSEvent) {
+        guard onZoomChanged != nil else {
+            super.magnify(with: event)
+            return
+        }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        zoom.zoom(
+            by: 1 + Double(event.magnification),
+            anchorX: Double(localPoint.x),
+            anchorY: Double(localPoint.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height)
+        )
+        lastPointerInView = localPoint
+        followPointerIfZoomed(localPoint)
+        syncLayerGeometry()
+        reportZoom()
+    }
+
+    /// Scale requested by the owner (zoom buttons, shortcuts); anchored at the pointer.
+    func setRequestedZoomScale(_ scale: Double) {
+        let target = SPPWViewZoom.clampedScale(scale)
+        guard abs(target - zoom.scale) > 0.001 else { return }
+        let anchor = lastPointerInView.flatMap { bounds.contains($0) ? $0 : nil }
+            ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        zoom.setScale(
+            target,
+            anchorX: Double(anchor.x),
+            anchorY: Double(anchor.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height)
+        )
+        if let pointer = lastPointerInView { followPointerIfZoomed(pointer) }
+        syncLayerGeometry()
+    }
+
+    /// With remote control the magnified viewport follows the pointer, so the pointer
+    /// still reaches every edge of the remote screen (classic screen-magnifier panning).
+    private func followPointerIfZoomed(_ point: CGPoint) {
+        lastPointerInView = point
+        guard remoteControlEnabled, zoom.isZoomed else { return }
+        zoom.follow(
+            viewX: Double(point.x),
+            viewY: Double(point.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height)
+        )
+        syncLayerGeometry()
+    }
+
+    private func reportZoom() {
+        onZoomChanged?(zoom.scale)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -548,6 +650,13 @@ final class SampleBufferVideoView: NSView {
             x: CGFloat(videoOrientation.scaleX),
             y: CGFloat(videoOrientation.scaleY)
         )
+        // Local magnifier on top of the orientation (GPU-composited, no extra latency).
+        zoom.clampOffset(viewWidth: Double(b.width), viewHeight: Double(b.height))
+        if zoom.isZoomed {
+            transform = transform
+                .concatenating(CGAffineTransform(scaleX: CGFloat(zoom.scale), y: CGFloat(zoom.scale)))
+                .concatenating(CGAffineTransform(translationX: CGFloat(zoom.offsetX), y: CGFloat(zoom.offsetY)))
+        }
         displayLayer.setAffineTransform(transform)
         displayLayer.contentsScale = effectiveScale
         CATransaction.commit()

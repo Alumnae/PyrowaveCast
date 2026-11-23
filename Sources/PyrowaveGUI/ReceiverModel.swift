@@ -169,6 +169,19 @@ public final class ReceiverModel: ObservableObject {
     }
     /// True while the video surface holds first-responder keyboard focus for remote control.
     @Published public var isCapturingKeyboard: Bool = false
+    /// True while the receiver shows the video fullscreen; the host window hides its sidebar and toolbar.
+    @Published public var isVideoFullscreen: Bool = false
+    /// Local magnifier of the video (1×–2×): pinch on the video, the zoom control or ⌘+ / ⌘− / ⌘0.
+    @Published public var videoZoomScale: Double = 1
+
+    /// Steps the zoom by `delta` (clamped to 1×–2×).
+    public func stepVideoZoom(by delta: Double) {
+        videoZoomScale = SPPWViewZoom.clampedScale(((videoZoomScale + delta) * 4).rounded() / 4)
+    }
+
+    public func resetVideoZoom() {
+        videoZoomScale = 1
+    }
 
     public func rotateVideo() {
         let swapped = videoOrientation.rotate()
@@ -254,6 +267,8 @@ public final class ReceiverModel: ObservableObject {
     private var lastResyncAt: ContinuousClock.Instant?
     private var lastFrameID: UInt32 = 0
     private var hasReceivedFrame = false
+    /// When the receiver started waiting for a first frame (server hello or resync).
+    private var frameWaitStartedAt: ContinuousClock.Instant?
     private var localCompleteFrames = 0
     private var localDecodedFrames = 0
     private var localDroppedFrames = 0
@@ -734,6 +749,7 @@ public final class ReceiverModel: ObservableObject {
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
+        frameWaitStartedAt = nil
         localCompleteFrames = 0
         localDecodedFrames = 0
         localDroppedFrames = 0
@@ -753,7 +769,11 @@ public final class ReceiverModel: ObservableObject {
         byteWindowStartNanos = nowNanos
         lastStatFlushNanos = nowNanos
         assemblyLock.unlock()
-        currentPixelBuffer = nil
+        if clearAutoReconnect {
+            currentPixelBuffer = nil
+        }
+        // During an automatic reconnect the last picture stays (frozen) until the
+        // new session delivers a frame, instead of flashing to black.
         let activeDecoder = decoder
         Task { await activeDecoder?.reset() }
     }
@@ -1114,6 +1134,7 @@ public final class ReceiverModel: ObservableObject {
             state = .waiting
             lastFrameID = 0
             hasReceivedFrame = false
+            frameWaitStartedAt = .now
             var parsedMediaID: UInt32 = 0
             if payload.count >= 4 {
                 parsedMediaID = UInt32(payload[0]) << 24
@@ -1207,7 +1228,7 @@ public final class ReceiverModel: ObservableObject {
         assemblyLock.lock()
         let maxAge = adaptiveBuffer.maxAcceptableAgeMs
         assemblyLock.unlock()
-        guard decoded.ageMilliseconds <= maxAge else {
+        guard decoded.ageMilliseconds <= maxAge || !decoded.isSuperseded else {
             localDroppedFrames += 1
             return
         }
@@ -1301,9 +1322,12 @@ public final class ReceiverModel: ObservableObject {
                 }
 
                 guard self.mediaStreamID > 0, !self.isResynchronizing else { continue }
-                guard let reference = self.lastGoodFrameAt else { continue }
-                if reference.duration(to: .now) > .seconds(2) {
-                    self.requestLiveResync(reason: "No fresh frame for 2 s; requesting live edge")
+                // A stream that never showed its first frame (lost, or a slow start at a
+                // high resolution) also asks for the live edge, after a longer grace period.
+                guard let reference = self.lastGoodFrameAt ?? self.frameWaitStartedAt else { continue }
+                let freshFrameLimit: Duration = self.lastGoodFrameAt != nil ? .seconds(2) : .seconds(4)
+                if reference.duration(to: ContinuousClock.now) > freshFrameLimit {
+                    self.requestLiveResync(reason: "No fresh frame; requesting live edge")
                 }
             }
         }
@@ -1512,7 +1536,9 @@ public final class ReceiverModel: ObservableObject {
         isResynchronizing = true
         resyncStartedAt = now
         lastGoodFrameAt = nil
-        currentPixelBuffer = nil
+        // Keep the last picture on screen (frozen) instead of flashing to black: the
+        // server answers with a fresh frame, usually within a few hundred ms.
+        frameWaitStartedAt = now
         state = .waiting
         assemblyLock.lock()
         assembler.reset()

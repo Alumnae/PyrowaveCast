@@ -1402,6 +1402,18 @@ public enum SPPWInputEvent: Sendable, Equatable {
         return self
     }
 
+    /// Input that normally changes what is on screen (clicks, keys, text, scrolling,
+    /// touches). Plain pointer motion does not count: with the remote cursor hidden it
+    /// changes no pixels. Used to tell a still screen from a stuck capture.
+    public var normallyChangesScreen: Bool {
+        switch unwrapped {
+        case .mouseButton, .scroll, .key, .touch, .text, .keyPress, .buttonAtCursor, .clickAtCursor:
+            return true
+        case .pointerMove, .pointerDelta, .releaseAll, .cursorVisibility, .sequenced:
+            return false
+        }
+    }
+
     /// Truncates `text` to at most `maxBytes` UTF-8 bytes without splitting a character.
     public static func truncatedUTF8(_ text: String, maxBytes: Int = maximumTextBytes) -> String {
         guard text.utf8.count > maxBytes else { return text }
@@ -2121,6 +2133,41 @@ public enum SPPWInputCoordinateMapper {
         return Result(normalizedX: clampedX, normalizedY: clampedY, isInsideVideo: inside)
     }
 
+    /// Inverse of `mapUIKitPoint`: the UIKit view point (top-left origin, `+Y` down) where the
+    /// normalized video point `(normalizedX, normalizedY)` (`0,0` = top-left of the remote
+    /// screen) is displayed, with `.resizeAspect` gravity and the `orientation` transform.
+    public static func uiKitViewPoint(
+        normalizedX: Double,
+        normalizedY: Double,
+        viewWidth: Double,
+        viewHeight: Double,
+        videoWidth: Double,
+        videoHeight: Double,
+        orientation: SPPWVideoOrientation
+    ) -> (x: Double, y: Double)? {
+        guard viewWidth > 0, viewHeight > 0, videoWidth > 0, videoHeight > 0 else { return nil }
+        let layerW = orientation.swapsDimensions ? viewHeight : viewWidth
+        let layerH = orientation.swapsDimensions ? viewWidth : viewHeight
+        let scale = min(layerW / videoWidth, layerH / videoHeight)
+        let fittedW = videoWidth * scale
+        let fittedH = videoHeight * scale
+        guard fittedW > 0, fittedH > 0 else { return nil }
+        // Layer point (AppKit-style, +Y up), centred.
+        let lx = (layerW - fittedW) * 0.5 + normalizedX * fittedW
+        let ly = (layerH - fittedH) * 0.5 + (1.0 - normalizedY) * fittedH
+        let sx = orientation.scaleX == 0 ? 1.0 : orientation.scaleX
+        let sy = orientation.scaleY == 0 ? 1.0 : orientation.scaleY
+        let px = (lx - layerW * 0.5) * sx
+        let py = (ly - layerH * 0.5) * sy
+        // Forward rotation by theta = -rotationAngleRadians.
+        let angle = orientation.rotationAngleRadians
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        let vx = px * cosA + py * sinA
+        let vy = -px * sinA + py * cosA
+        return (vx + viewWidth * 0.5, viewHeight - (vy + viewHeight * 0.5))
+    }
+
     /// Same as `mapAppKitPoint` for UIKit views (top-left origin, `+Y` down).
     public static func mapUIKitPoint(
         viewX: Double,
@@ -2142,6 +2189,196 @@ public enum SPPWInputCoordinateMapper {
             orientation: orientation,
             clampOutside: clampOutside
         )
+    }
+}
+
+// MARK: - Rotated and zoomed video: input mapping
+
+extension SPPWVideoOrientation {
+    /// Converts a motion seen on screen (trackpad swipe, mouse motion, scroll; `+X` right,
+    /// `+Y` down) into the video's own axes, so that with the video turned 90° a swipe
+    /// towards the picture's top still moves the remote pointer up. Undoes the display
+    /// transform (rotation clockwise, then the horizontal mirror applied first in layer space).
+    public func videoDelta(screenDX: Double, screenDY: Double) -> (dx: Double, dy: Double) {
+        var x: Double
+        let y: Double
+        switch quarterTurnsClockwise {
+        case 1:
+            x = screenDY
+            y = -screenDX
+        case 2:
+            x = -screenDX
+            y = -screenDY
+        case 3:
+            x = -screenDY
+            y = screenDX
+        default:
+            x = screenDX
+            y = screenDY
+        }
+        if isFlippedHorizontally { x = -x }
+        return (x, y)
+    }
+
+    /// Insets of a container rotated with the video (`quarterTurnsClockwise`), derived from
+    /// the screen's insets: with a 90° turn the container's top edge lies on the screen's right.
+    public func rotatedInsets(
+        top: Double,
+        left: Double,
+        bottom: Double,
+        right: Double
+    ) -> (top: Double, left: Double, bottom: Double, right: Double) {
+        switch quarterTurnsClockwise {
+        case 1: return (right, top, left, bottom)
+        case 2: return (bottom, right, top, left)
+        case 3: return (left, bottom, right, top)
+        default: return (top, left, bottom, right)
+        }
+    }
+}
+
+/// A pointer the receiver draws itself and sends to the remote Mac as absolute positions
+/// (`.pointerMove`), so what the user sees is exactly where the Mac clicks, without the
+/// delay of the Mac cursor in the video. Relative input (trackpad swipes, an iPad mouse)
+/// moves it across the picture as displayed: a swipe as long as the shown video's width
+/// crosses the whole remote screen at speed 1.
+public struct SPPWLocalPointer: Sendable, Equatable {
+    /// Position on the remote screen, `0...1`, `0,0` = top-left.
+    public var normalizedX: Double
+    public var normalizedY: Double
+
+    public init(normalizedX: Double = 0.5, normalizedY: Double = 0.5) {
+        self.normalizedX = min(max(normalizedX, 0), 1)
+        self.normalizedY = min(max(normalizedY, 0), 1)
+    }
+
+    /// Size of the displayed (aspect-fit, unzoomed) video in its own axes, in view points.
+    public static func displayedVideoSize(
+        viewWidth: Double,
+        viewHeight: Double,
+        videoWidth: Double,
+        videoHeight: Double,
+        orientation: SPPWVideoOrientation
+    ) -> (width: Double, height: Double)? {
+        guard viewWidth > 0, viewHeight > 0, videoWidth > 0, videoHeight > 0 else { return nil }
+        let layerW = orientation.swapsDimensions ? viewHeight : viewWidth
+        let layerH = orientation.swapsDimensions ? viewWidth : viewHeight
+        let scale = min(layerW / videoWidth, layerH / videoHeight)
+        return (videoWidth * scale, videoHeight * scale)
+    }
+
+    /// Moves by a motion already in the video's axes (`SPPWVideoOrientation.videoDelta`),
+    /// in view points of the displayed video, clamped to the remote screen.
+    public mutating func move(
+        videoDX: Double,
+        videoDY: Double,
+        displayedVideoWidth: Double,
+        displayedVideoHeight: Double
+    ) {
+        guard displayedVideoWidth > 0, displayedVideoHeight > 0 else { return }
+        normalizedX = min(max(normalizedX + videoDX / displayedVideoWidth, 0), 1)
+        normalizedY = min(max(normalizedY + videoDY / displayedVideoHeight, 0), 1)
+    }
+
+    public var moveEvent: SPPWInputEvent {
+        .pointerMove(normalizedX: Float(normalizedX), normalizedY: Float(normalizedY))
+    }
+}
+
+/// Receiver-side magnifier (1×–2×) for the video view.
+///
+/// `scale` magnifies the view about its center and `offsetX`/`offsetY` translate the
+/// magnified content, in the caller's view points (UIKit or AppKit axes, used consistently).
+/// The content always covers the view, so no black margin appears while zoomed. Input
+/// mapping undoes the zoom with `contentPoint(...)` before `SPPWInputCoordinateMapper`.
+public struct SPPWViewZoom: Equatable, Sendable {
+    public static let minimumScale = 1.0
+    public static let maximumScale = 2.0
+
+    public private(set) var scale: Double = 1
+    public private(set) var offsetX: Double = 0
+    public private(set) var offsetY: Double = 0
+
+    public init() {}
+
+    public init(scale: Double, offsetX: Double = 0, offsetY: Double = 0, viewWidth: Double, viewHeight: Double) {
+        self.scale = Self.clampedScale(scale)
+        self.offsetX = offsetX
+        self.offsetY = offsetY
+        clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
+    public var isZoomed: Bool { scale > 1.0005 }
+
+    public static func clampedScale(_ value: Double) -> Double {
+        guard value.isFinite else { return minimumScale }
+        return min(max(value, minimumScale), maximumScale)
+    }
+
+    /// Multiplies the scale by `factor`, keeping the content under `(anchorX, anchorY)` in place.
+    public mutating func zoom(by factor: Double, anchorX: Double, anchorY: Double, viewWidth: Double, viewHeight: Double) {
+        guard factor.isFinite, factor > 0 else { return }
+        setScale(scale * factor, anchorX: anchorX, anchorY: anchorY, viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
+    /// Sets an absolute scale, keeping the content under the anchor in place.
+    public mutating func setScale(_ newScale: Double, anchorX: Double, anchorY: Double, viewWidth: Double, viewHeight: Double) {
+        let target = Self.clampedScale(newScale)
+        let content = contentPoint(viewX: anchorX, viewY: anchorY, viewWidth: viewWidth, viewHeight: viewHeight)
+        let cx = viewWidth * 0.5
+        let cy = viewHeight * 0.5
+        scale = target
+        offsetX = anchorX - cx - target * (content.x - cx)
+        offsetY = anchorY - cy - target * (content.y - cy)
+        clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
+    /// Moves the magnified content by a view-space delta (two-finger drag, scroll).
+    public mutating func pan(dx: Double, dy: Double, viewWidth: Double, viewHeight: Double) {
+        offsetX += dx
+        offsetY += dy
+        clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
+    /// Viewport that follows an absolute pointer: the point under the pointer is the same
+    /// content point as without zoom, so the pointer still reaches every edge of the video.
+    public mutating func follow(viewX: Double, viewY: Double, viewWidth: Double, viewHeight: Double) {
+        offsetX = (viewWidth * 0.5 - viewX) * (scale - 1)
+        offsetY = (viewHeight * 0.5 - viewY) * (scale - 1)
+        clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
+    public mutating func reset() {
+        scale = 1
+        offsetX = 0
+        offsetY = 0
+    }
+
+    /// The unzoomed view point shown at `(viewX, viewY)`.
+    public func contentPoint(viewX: Double, viewY: Double, viewWidth: Double, viewHeight: Double) -> (x: Double, y: Double) {
+        let cx = viewWidth * 0.5
+        let cy = viewHeight * 0.5
+        return ((viewX - cx - offsetX) / scale + cx, (viewY - cy - offsetY) / scale + cy)
+    }
+
+    /// Inverse of `contentPoint`: where an unzoomed view point appears in the zoomed view.
+    public func viewPoint(contentX: Double, contentY: Double, viewWidth: Double, viewHeight: Double) -> (x: Double, y: Double) {
+        let cx = viewWidth * 0.5
+        let cy = viewHeight * 0.5
+        return (cx + offsetX + scale * (contentX - cx), cy + offsetY + scale * (contentY - cy))
+    }
+
+    /// Re-clamps after the view size changed (rotation, window resize).
+    public mutating func clampOffset(viewWidth: Double, viewHeight: Double) {
+        let limitX = max(0, (scale - 1) * viewWidth * 0.5)
+        let limitY = max(0, (scale - 1) * viewHeight * 0.5)
+        offsetX = min(max(offsetX, -limitX), limitX)
+        offsetY = min(max(offsetY, -limitY), limitY)
+        if !isZoomed {
+            scale = 1
+            offsetX = 0
+            offsetY = 0
+        }
     }
 }
 

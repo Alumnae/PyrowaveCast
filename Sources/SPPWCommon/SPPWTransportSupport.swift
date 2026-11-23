@@ -2326,6 +2326,62 @@ public enum SPPWSourceRestartPolicy {
     public static let healthyRunNanoseconds: UInt64 = 10_000_000_000
 }
 
+/// Keeps a still screen streaming and tells a still screen apart from a stuck capture.
+///
+/// ScreenCaptureKit drops unchanged frames (`SCFrameStatus.idle`), so a static desktop
+/// sends nothing. Without a refresh, receivers saw no frame for 2 s, asked for a resync,
+/// cleared to black and made the server restart the whole capture, which is slow at
+/// high resolutions. The server now resends the last encoded frame while the screen is
+/// still and restarts the capture only when it really looks dead.
+public enum SPPWStillScreenPolicy {
+    /// Resend the last frame after this long without a new one (well inside the
+    /// receivers' 2 s fresh-frame watchdog).
+    public static let refreshIntervalNanoseconds: UInt64 = 1_000_000_000
+
+    /// Capture silent this long counts as possibly stuck when a receiver asks for a resync.
+    public static let resyncSilenceNanoseconds: UInt64 = 3_000_000_000
+
+    /// Capture silent this long while the user clicks, types or scrolls counts as stuck.
+    public static let interactionStallNanoseconds: UInt64 = 8_000_000_000
+
+    /// Only input within this window counts as "the user is interacting".
+    public static let recentInteractionNanoseconds: UInt64 = 3_000_000_000
+
+    /// Minimum time between two stall-driven capture restarts.
+    public static let minimumRestartSpacingNanoseconds: UInt64 = 15_000_000_000
+
+    public static func shouldRefresh(nowNanoseconds now: UInt64, lastSentNanoseconds last: UInt64) -> Bool {
+        last > 0 && now >= last && now - last >= refreshIntervalNanoseconds
+    }
+
+    /// A resync restarts the source only when the stream geometry or rate changed, the
+    /// source is not running, or the capture has been silent long enough to look stuck.
+    /// Otherwise the server just resends its last frame: PyroWave frames are all intra,
+    /// so any frame is a full picture.
+    public static func resyncNeedsSourceRestart(
+        geometryOrRateChanged: Bool,
+        sourceRunning: Bool,
+        captureSilenceNanoseconds: UInt64?
+    ) -> Bool {
+        if geometryOrRateChanged || !sourceRunning { return true }
+        guard let silence = captureSilenceNanoseconds else { return false }
+        return silence >= resyncSilenceNanoseconds
+    }
+
+    /// True when the capture produced nothing for a long time although the user is
+    /// actively clicking, typing or scrolling, and no stall restart happened recently.
+    public static func isStalledWhileInteracting(
+        captureSilenceNanoseconds silence: UInt64,
+        sinceLastInteractionNanoseconds sinceInteraction: UInt64?,
+        sinceLastStallRestartNanoseconds sinceRestart: UInt64?
+    ) -> Bool {
+        guard silence >= interactionStallNanoseconds,
+              let sinceInteraction, sinceInteraction <= recentInteractionNanoseconds else { return false }
+        if let sinceRestart, sinceRestart < minimumRestartSpacingNanoseconds { return false }
+        return true
+    }
+}
+
 public enum SPPWLocalization {
     public static let languageDefaultsKey = "sppwPreferredAppLanguage"
     public static let didChangeLanguageNotification = Notification.Name("SPPWLocalizationDidChangeLanguageNotification")
@@ -2408,6 +2464,14 @@ public enum SPPWLocalization {
         ],
         "remote.dock.mode": [
             "it": "Modalità tocco", "en": "Touch mode", "zh": "触控模式", "fr": "Mode tactile", "de": "Touch-Modus", "ja": "タッチモード", "es": "Modo táctil"
+        ],
+        "receiver.controls_puck_help": [
+            "it": "Controlli dello stream · clic per aprirli, trascina per spostare", "en": "Stream controls · click to open, drag to move", "zh": "串流控制 · 点击打开，拖动移动",
+            "fr": "Commandes du flux · cliquer pour ouvrir, glisser pour déplacer", "de": "Stream-Steuerung · klicken zum Öffnen, ziehen zum Verschieben", "ja": "ストリームの操作 · クリックで開く、ドラッグで移動", "es": "Controles del stream · haz clic para abrir, arrastra para mover"
+        ],
+        "keyboard.dismiss": [
+            "it": "Chiudi tastiera", "en": "Hide keyboard", "zh": "收起键盘",
+            "fr": "Masquer le clavier", "de": "Tastatur ausblenden", "ja": "キーボードを閉じる", "es": "Ocultar teclado",
         ],
         "remote.dock.keyboard": [
             "it": "Tastiera", "en": "Keyboard", "zh": "键盘", "fr": "Clavier", "de": "Tastatur", "ja": "キーボード", "es": "Teclado"
@@ -2518,6 +2582,18 @@ public enum SPPWLocalization {
         "receiver.fullscreen_exit_hint": [
             "it": "Premi e rilascia ⌃⌥ per uscire dallo schermo intero", "en": "Press and release ⌃⌥ to exit full screen", "zh": "按下并松开 ⌃⌥ 退出全屏",
             "fr": "Appuyez puis relâchez ⌃⌥ pour quitter le plein écran", "de": "⌃⌥ drücken und loslassen, um das Vollbild zu beenden", "ja": "⌃⌥ を押して離すとフルスクリーンを終了します", "es": "Pulsa y suelta ⌃⌥ para salir de pantalla completa"
+        ],
+        "zoom.in_help": [
+            "it": "Ingrandisci (fino a 2×, ⌘+, pizzico sul trackpad)", "en": "Zoom in (up to 2×, ⌘+, trackpad pinch)", "zh": "放大（最高 2×，⌘+，触控板捏合）",
+            "fr": "Agrandir (jusqu'à 2×, ⌘+, pincement trackpad)", "de": "Vergrößern (bis 2×, ⌘+, Trackpad-Zoomgeste)", "ja": "拡大（最大 2×、⌘+、トラックパッドでピンチ）", "es": "Ampliar (hasta 2×, ⌘+, pellizco en el trackpad)"
+        ],
+        "zoom.out_help": [
+            "it": "Riduci (⌘−)", "en": "Zoom out (⌘−)", "zh": "缩小（⌘−）",
+            "fr": "Réduire (⌘−)", "de": "Verkleinern (⌘−)", "ja": "縮小（⌘−）", "es": "Reducir (⌘−)"
+        ],
+        "zoom.reset_help": [
+            "it": "Torna a 1× (⌘0)", "en": "Back to 1× (⌘0)", "zh": "恢复 1×（⌘0）",
+            "fr": "Revenir à 1× (⌘0)", "de": "Zurück auf 1× (⌘0)", "ja": "1× に戻す（⌘0）", "es": "Volver a 1× (⌘0)"
         ],
         "action.fullscreen": [
             "it": "Schermo intero", "en": "Full Screen", "zh": "全屏",
@@ -2915,6 +2991,34 @@ public enum SPPWLocalization {
             "it": "Controllo remoto disabilitato", "en": "Remote control disabled", "zh": "已禁用远程控制",
             "fr": "Contrôle à distance désactivé", "de": "Fernsteuerung deaktiviert", "ja": "リモート操作を無効にしました", "es": "Control remoto desactivado"
         ],
+        "broadcast.share_screen": [
+            "it": "Condividi tutto lo schermo", "en": "Share the whole screen", "zh": "共享整个屏幕",
+            "fr": "Partager tout l’écran", "de": "Ganzen Bildschirm teilen", "ja": "画面全体を共有", "es": "Compartir toda la pantalla"
+        ],
+        "broadcast.stop": [
+            "it": "Trasmissione attiva · tocca per fermarla", "en": "Broadcast running · tap to stop", "zh": "正在广播 · 轻点停止",
+            "fr": "Diffusion en cours · touchez pour arrêter", "de": "Übertragung läuft · tippen zum Beenden", "ja": "ブロードキャスト中 · タップで停止", "es": "Transmisión activa · toca para detenerla"
+        ],
+        "broadcast.help_fmt": [
+            "it": "Trasmette tutto lo schermo e l’audio delle app anche quando PyrowaveCast è in background, sulla schermata Home o con lo schermo bloccato (estensione di trasmissione iOS, porta UDP %d). Si avvia e si ferma anche dal Centro di Controllo (Registrazione schermo → PyrowaveCast).", "en": "Casts the whole screen and app audio even while PyrowaveCast is in the background, on the Home Screen or locked (iOS broadcast extension, UDP port %d). You can also start and stop it from Control Center (Screen Recording → PyrowaveCast).", "zh": "即使 PyrowaveCast 在后台、位于主屏幕或锁屏，也会投射整个屏幕和 App 音频（iOS 广播扩展，UDP 端口 %d）。也可在控制中心启动和停止（屏幕录制 → PyrowaveCast）。",
+            "fr": "Diffuse tout l’écran et le son des apps même lorsque PyrowaveCast est en arrière-plan, sur l’écran d’accueil ou verrouillé (extension de diffusion iOS, port UDP %d). Démarrage et arrêt aussi depuis le Centre de contrôle (Enregistrement de l’écran → PyrowaveCast).", "de": "Überträgt den ganzen Bildschirm und den App-Ton, auch wenn PyrowaveCast im Hintergrund, auf dem Home-Bildschirm oder gesperrt ist (iOS-Übertragungserweiterung, UDP-Port %d). Start und Stopp auch über das Kontrollzentrum (Bildschirmaufnahme → PyrowaveCast).", "ja": "PyrowaveCast がバックグラウンド、ホーム画面、ロック中でも画面全体と App のオーディオをキャストします（iOS ブロードキャスト拡張、UDP ポート %d）。コントロールセンター（画面収録 → PyrowaveCast）からも開始・停止できます。", "es": "Transmite toda la pantalla y el audio de las apps aunque PyrowaveCast esté en segundo plano, en la pantalla de inicio o bloqueado (extensión de transmisión de iOS, puerto UDP %d). También se inicia y detiene desde el Centro de control (Grabación de pantalla → PyrowaveCast)."
+        ],
+        "broadcast.error.start_fmt": [
+            "it": "Server PyrowaveCast non avviato sulla porta UDP %d (%@). Ferma il server nell’app e riprova.", "en": "PyrowaveCast server could not start on UDP port %d (%@). Stop the server in the app and try again.", "zh": "PyrowaveCast 服务器无法在 UDP 端口 %d 上启动（%@）。请停止 App 内的服务器后重试。",
+            "fr": "Le serveur PyrowaveCast n’a pas pu démarrer sur le port UDP %d (%@). Arrêtez le serveur dans l’app et réessayez.", "de": "PyrowaveCast-Server konnte nicht auf UDP-Port %d starten (%@). Server in der App stoppen und erneut versuchen.", "ja": "PyrowaveCast サーバーを UDP ポート %d で開始できませんでした（%@）。App のサーバーを停止してからやり直してください。", "es": "No se pudo iniciar el servidor PyrowaveCast en el puerto UDP %d (%@). Detén el servidor en la app y vuelve a intentarlo."
+        ],
+        "server.background.title": [
+            "it": "Server PyrowaveCast attivo", "en": "PyrowaveCast server running", "zh": "PyrowaveCast 服务器运行中",
+            "fr": "Serveur PyrowaveCast actif", "de": "PyrowaveCast-Server aktiv", "ja": "PyrowaveCast サーバー実行中", "es": "Servidor PyrowaveCast activo"
+        ],
+        "server.background.subtitle_waiting": [
+            "it": "Streaming in corso anche in background", "en": "Keeps streaming in the background", "zh": "在后台继续串流",
+            "fr": "Diffusion maintenue en arrière-plan", "de": "Streamt auch im Hintergrund weiter", "ja": "バックグラウンドでもストリーミングを継続", "es": "Sigue transmitiendo en segundo plano"
+        ],
+        "server.background.subtitle_fmt": [
+            "it": "Client: %d · %@ Mb/s", "en": "Clients: %d · %@ Mb/s", "zh": "客户端：%d · %@ Mb/s",
+            "fr": "Clients : %d · %@ Mb/s", "de": "Clients: %d · %@ Mb/s", "ja": "クライアント: %d · %@ Mb/s", "es": "Clientes: %d · %@ Mb/s"
+        ],
         "server.error.file_import_fmt": [
             "it": "Impossibile importare il file selezionato: %@", "en": "Could not import the selected file: %@", "zh": "无法导入所选文件：%@",
             "fr": "Impossible d’importer le fichier sélectionné : %@", "de": "Ausgewählte Datei konnte nicht importiert werden: %@", "ja": "選択したファイルを読み込めませんでした: %@", "es": "No se pudo importar el archivo seleccionado: %@"
@@ -3246,9 +3350,9 @@ public enum SPPWLocalization {
 // MARK: - App & Build Version Information
 
 public enum SPPWBuildVersion: Sendable {
-    public static let fallbackVersion = "0.6.5"
-    public static let fallbackBuildNumber = "605"
-    public static let fallbackCommit = "6de2f17"
+    public static let fallbackVersion = "0.6.10"
+    public static let fallbackBuildNumber = "610"
+    public static let fallbackCommit = "345f619"
 
     /// Formatted build version string, e.g. "v0.6.4 (build 604, c778763)".
     /// If commit information is not available, falls back to "v0.6.4 (build 604)".

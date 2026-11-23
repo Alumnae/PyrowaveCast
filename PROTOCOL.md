@@ -105,6 +105,11 @@ The client chooses the stream size relative to the server's native size (`SPPWRe
 
 The server answers with the resolved size in the `width`/`height` header fields of `serverHello` / the `streamConfiguration` ack. The macOS server lets ScreenCaptureKit scale the capture; the iOS server scales captured frames on the GPU (`VTPixelTransferSession`). The receiver's *Automatic* mode is client-side: it moves one level down when the adaptive bitrate stays below half the current level's ceiling for 3 s, and one level up after holding the ceiling for 15 s (doubling after a failed step-up, up to 120 s).
 
+### Still screens and resync
+
+- A server resends its last encoded frame (same bitstream, new `frameID` and timestamp) when no frame went out for 1 s (`SPPWStillScreenPolicy`), because screen capture delivers nothing while the screen is unchanged. Receivers therefore treat 2 s without a frame (4 s before the first frame of a session) as a lost stream.
+- A resync is a `streamConfiguration` with flag `0x0001`: the server replaces the control session and answers with a new `serverHello`, then resends the last frame. PyroWave frames are intra-only, so no keyframe exists or is needed. The capture is restarted only when the source is not running, the size or rate changed, or the capture produced nothing (not even idle callbacks) for 3 s.
+
 ### Asymmetric LL/HF FEC Parity (`kind = 8`)
 
 `WireHeader.fragmentIndex` carries the parity index (`0..<blockParityCount`) within the FEC block, and `WireHeader.fragmentCount` carries the total data fragment count of the frame.

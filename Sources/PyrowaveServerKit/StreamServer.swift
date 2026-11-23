@@ -85,6 +85,20 @@ private final class ServerEncodeWorker: @unchecked Sendable {
     private let logHandler: @Sendable (String, Bool) -> Void
     private let previewHandler: (@Sendable (Data, Int, Int) -> Void)?
 
+    /// The last frame sent, resent while the screen is still (`SPPWStillScreenPolicy`).
+    /// Only accessed on `queue`.
+    private struct SentFrame {
+        let bitstream: Data
+        let width: Int
+        let height: Int
+        let generation: UInt64
+    }
+    private var lastSentFrame: SentFrame?
+    /// Under `lock`: when the last frame went out, and whether a resync asked for one now.
+    private var lastSentNanos: UInt64 = 0
+    private var refreshRequested = false
+    private var refreshTimer: DispatchSourceTimer?
+
     init(
         mediaPacer: SPPWMediaPacer,
         stats: StreamStats,
@@ -95,6 +109,52 @@ private final class ServerEncodeWorker: @unchecked Sendable {
         self.stats = stats
         self.logHandler = logHandler
         self.previewHandler = previewHandler
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250), leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            self?.refreshIfStill()
+        }
+        timer.resume()
+        refreshTimer = timer
+    }
+
+    deinit {
+        refreshTimer?.cancel()
+    }
+
+    /// Sends the last frame again as soon as possible (a receiver asked for a resync).
+    func requestRefresh() {
+        lock.lock()
+        refreshRequested = true
+        lock.unlock()
+        queue.async { [weak self] in
+            self?.refreshIfStill()
+        }
+    }
+
+    /// Runs on `queue`. Resends the last frame, with a new frame ID and timestamp, when
+    /// no new frame went out for `SPPWStillScreenPolicy.refreshIntervalNanoseconds`
+    /// (ScreenCaptureKit sends nothing while the screen does not change) or on request.
+    private func refreshIfStill() {
+        let now = SPPWCaptureClock.nowNanoseconds()
+        lock.lock()
+        let currentSnapshot = snapshot
+        let encodeQueued = pendingFrame != nil || isScheduled
+        let forced = refreshRequested
+        let due = SPPWStillScreenPolicy.shouldRefresh(nowNanoseconds: now, lastSentNanoseconds: lastSentNanos)
+        if forced && !encodeQueued { refreshRequested = false }
+        lock.unlock()
+
+        guard !encodeQueued, forced || due,
+              let currentSnapshot, !currentSnapshot.peers.isEmpty,
+              let frame = lastSentFrame, frame.generation == currentSnapshot.generation else { return }
+        _ = sendBitstream(
+            frame.bitstream,
+            width: frame.width,
+            height: frame.height,
+            timestampNanoseconds: now,
+            snapshot: currentSnapshot
+        )
     }
 
     func updateSnapshot(_ newSnapshot: Snapshot?) {
@@ -175,9 +235,7 @@ private final class ServerEncodeWorker: @unchecked Sendable {
 
             let config = snapshot.config
             let maximumBytes = Self.maximumBitstreamBytes(width: width, height: height, config: config)
-            let requestedMTU = config.mtu > 0 ? config.mtu : 1200
-            let datagramLimit = min(requestedMTU, 1200)
-            let payloadLimit = max(256, datagramLimit - WireHeader.byteCount)
+            let payloadLimit = Self.payloadLimit(for: config)
 
             let result = try encoder.encode(
                 pixelBuffer: pixelBuffer,
@@ -185,56 +243,88 @@ private final class ServerEncodeWorker: @unchecked Sendable {
                 packetBoundary: payloadLimit
             )
 
-            // Re-check snapshot after Metal encode so we drop frames from superseded generations.
-            lock.lock()
-            let latestSnapshot = self.snapshot
-            guard let latestSnapshot,
-                  latestSnapshot.generation == snapshot.generation,
-                  !latestSnapshot.peers.isEmpty else {
-                lock.unlock()
-                return
-            }
-            frameCounter &+= 1
-            let frameID = frameCounter
-            lock.unlock()
-
             guard !result.bitstream.isEmpty else { return }
-            let fragmentTotal = (result.bitstream.count + payloadLimit - 1) / payloadLimit
-            guard fragmentTotal <= Int(UInt16.max) else {
-                logHandler("Frame too large to fragment: \(result.bitstream.count) bytes", true)
-                return
-            }
-
             // Capture instant, the clock audio packets are stamped with too (A/V sync).
             let frameTimestamp = captureTimestampNanoseconds != 0
                 ? captureTimestampNanoseconds
                 : SPPWCaptureClock.nowNanoseconds()
-            let datagrams = buildPacedFrameDatagrams(
-                streamID: latestSnapshot.streamID,
-                frameID: frameID,
-                width: UInt16(width),
-                height: UInt16(height),
+            guard sendBitstream(
+                result.bitstream,
+                width: width,
+                height: height,
                 timestampNanoseconds: frameTimestamp,
+                snapshot: snapshot
+            ) else { return }
+            lastSentFrame = SentFrame(
                 bitstream: result.bitstream,
-                payloadLimit: payloadLimit,
-                fecPercent: latestSnapshot.effectiveFECPercent
+                width: width,
+                height: height,
+                generation: snapshot.generation
             )
-
-            let peers = latestSnapshot.peers
-            let socket = latestSnapshot.socket
-            mediaPacer.enqueueFrame(
-                datagrams: datagrams,
-                burstSize: 6,
-                fps: latestSnapshot.config.fps
-            ) { burst in
-                socket.sendBatch(burst, to: peers)
-            }
-
-            stats.record(frameBytes: result.bitstream.count)
             previewHandler?(result.bitstream, width, height)
         } catch {
             logHandler("Encode error: \(error)", true)
         }
+    }
+
+    private static func payloadLimit(for config: ClientConfiguration) -> Int {
+        let requestedMTU = config.mtu > 0 ? config.mtu : 1200
+        let datagramLimit = min(requestedMTU, 1200)
+        return max(256, datagramLimit - WireHeader.byteCount)
+    }
+
+    /// Runs on `queue`. Fragments and paces one encoded frame to every peer of the current
+    /// snapshot; returns false when the snapshot changed (superseded generation, no peers).
+    private func sendBitstream(
+        _ bitstream: Data,
+        width: Int,
+        height: Int,
+        timestampNanoseconds: UInt64,
+        snapshot: Snapshot
+    ) -> Bool {
+        // Re-check the snapshot after the Metal encode so superseded generations are dropped.
+        lock.lock()
+        guard let latestSnapshot = self.snapshot,
+              latestSnapshot.generation == snapshot.generation,
+              !latestSnapshot.peers.isEmpty else {
+            lock.unlock()
+            return false
+        }
+        frameCounter &+= 1
+        let frameID = frameCounter
+        lastSentNanos = SPPWCaptureClock.nowNanoseconds()
+        lock.unlock()
+
+        let payloadLimit = Self.payloadLimit(for: latestSnapshot.config)
+        let fragmentTotal = (bitstream.count + payloadLimit - 1) / payloadLimit
+        guard fragmentTotal <= Int(UInt16.max) else {
+            logHandler("Frame too large to fragment: \(bitstream.count) bytes", true)
+            return false
+        }
+
+        let datagrams = buildPacedFrameDatagrams(
+            streamID: latestSnapshot.streamID,
+            frameID: frameID,
+            width: UInt16(width),
+            height: UInt16(height),
+            timestampNanoseconds: timestampNanoseconds,
+            bitstream: bitstream,
+            payloadLimit: payloadLimit,
+            fecPercent: latestSnapshot.effectiveFECPercent
+        )
+
+        let peers = latestSnapshot.peers
+        let socket = latestSnapshot.socket
+        mediaPacer.enqueueFrame(
+            datagrams: datagrams,
+            burstSize: 6,
+            fps: latestSnapshot.config.fps
+        ) { burst in
+            socket.sendBatch(burst, to: peers)
+        }
+
+        stats.record(frameBytes: bitstream.count)
+        return true
     }
 
     static func maximumBitstreamBytes(
@@ -278,6 +368,7 @@ public actor StreamServer {
     private var sourceRestartTask: Task<Void, Never>?
     private var sourceRestartAttempts = 0
     private var sourceStartedAtNanos: UInt64 = 0
+    private var lastStallRestartNanos: UInt64 = 0
     private var encodeWorker: ServerEncodeWorker?
     private var clients: [UInt32: ClientSession] = [:]
     private var nextStreamID: UInt32 = 1
@@ -822,12 +913,33 @@ public actor StreamServer {
             syncEncodeWorkerSnapshot()
             log("Shared config update: controlID=\(responseStreamID), \(updatedConfig.width)x\(updatedConfig.height) @ \(updatedConfig.fps)fps, quality=\(updatedConfig.quality), fec=\(updatedConfig.fecPercent)%")
 
-            if isResync || geometryOrRateChanged {
+            let sourceRunning = sourceTask != nil || startingGeneration != nil
+            var resendAfterHello = false
+            if geometryOrRateChanged {
                 await restartSharedSource(streamID: responseStreamID)
+            } else if isResync {
+                let silence = captureEngine?.activity.silenceNanoseconds()
+                if SPPWStillScreenPolicy.resyncNeedsSourceRestart(
+                    geometryOrRateChanged: false,
+                    sourceRunning: sourceRunning,
+                    captureSilenceNanoseconds: silence
+                ) {
+                    await restartSharedSource(streamID: responseStreamID)
+                } else {
+                    // The capture is alive (or the screen is just still): restarting it is slow
+                    // at high resolutions and blanks every receiver, so the last frame is
+                    // resent right after the new hello below.
+                    resendAfterHello = true
+                    log("Resync for controlID=\(responseStreamID): capture running, resending the latest frame")
+                }
             }
 
             if isResync {
                 sendServerHello(to: peer, controlStreamID: responseStreamID, config: updatedConfig)
+                if resendAfterHello {
+                    // PyroWave frames are intra-only: the last one is a full picture.
+                    encodeWorker?.requestRefresh()
+                }
             } else {
                 let flags: UInt16 = isScreenCaptureMode ? WireControlFlags.serverControlledResolution : 0
                 let ack = makeWireDatagram(
@@ -907,6 +1019,9 @@ public actor StreamServer {
         if let event = decoded {
             if let accepted = remoteInputState.filter(event, streamID: streamID) {
                 inputController.inject(accepted, displayID: state.displayID)
+                if accepted.normallyChangesScreen {
+                    noteScreenChangingInput()
+                }
             }
             return
         }
@@ -926,6 +1041,28 @@ public actor StreamServer {
             }
         }
         #endif
+    }
+
+    /// Records a click/key/scroll and restarts a capture that has delivered nothing for a
+    /// long time while the user keeps interacting (ScreenCaptureKit can stall silently;
+    /// the still-screen refresh would otherwise keep resending the old picture forever).
+    private func noteScreenChangingInput() {
+        let now = SPPWCaptureClock.nowNanoseconds()
+        guard isScreenCaptureMode, sourceTask != nil, startingGeneration == nil,
+              let engine = captureEngine else { return }
+        let silence = engine.activity.silenceNanoseconds(now: now)
+        guard SPPWStillScreenPolicy.isStalledWhileInteracting(
+            captureSilenceNanoseconds: silence,
+            sinceLastInteractionNanoseconds: 0,
+            sinceLastStallRestartNanoseconds: lastStallRestartNanos > 0 ? now &- lastStallRestartNanos : nil
+        ) else { return }
+        lastStallRestartNanos = now
+        let streamID = sharedStreamID != 0 ? sharedStreamID : (clients.keys.first ?? 0)
+        guard streamID != 0 else { return }
+        log("Cattura schermo ferma da \(silence / 1_000_000_000) s mentre il client interagisce: riavvio della cattura", isError: true)
+        Task { [weak self] in
+            await self?.restartSharedSource(streamID: streamID)
+        }
     }
 
     private func allocateStreamID() -> UInt32 {
@@ -1224,7 +1361,29 @@ struct SendablePixelBuffer: @unchecked Sendable {
     var captureTimestampNanoseconds: UInt64 = 0
 }
 
+/// Time of the last ScreenCaptureKit screen callback of any status (idle included), so
+/// the server can tell a still screen from a capture that stopped delivering anything.
+final class CaptureActivityMonitor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastCallbackNanos = SPPWCaptureClock.nowNanoseconds()
+
+    func noteCallback() {
+        let now = SPPWCaptureClock.nowNanoseconds()
+        lock.lock()
+        lastCallbackNanos = now
+        lock.unlock()
+    }
+
+    func silenceNanoseconds(now: UInt64 = SPPWCaptureClock.nowNanoseconds()) -> UInt64 {
+        lock.lock()
+        let last = lastCallbackNanos
+        lock.unlock()
+        return now > last ? now - last : 0
+    }
+}
+
 actor ScreenCaptureEngine {
+    nonisolated let activity = CaptureActivityMonitor()
     private let width: Int
     private let height: Int
     private let fps: Int
@@ -1360,8 +1519,10 @@ actor ScreenCaptureEngine {
             )
 
             let audioCallback = audioHandler
+            let activityMonitor = activity
             let output = CaptureOutputDelegate(
                 screenHandler: { sampleBuffer in
+                    activityMonitor.noteCallback()
                     if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                        let rawStatus = attachments.first?[.status] as? Int,
                        let status = SCFrameStatus(rawValue: rawStatus),

@@ -367,6 +367,12 @@ final class IOSSpecialKeysPanel: UIView {
     private var groupTitleLabels: [(UILabel, String)] = []
     private var repeatTimer: Timer?
     private var heightToContent: NSLayoutConstraint?
+    private var scrollBottom: NSLayoutConstraint!
+    /// Bottom safe-area inset supplied by the owner: the panel lives in a container that
+    /// rotates with the video, where UIKit's own safe area is not reliable.
+    var bottomSafeInset: CGFloat = 0 {
+        didSet { scrollBottom?.constant = -bottomSafeInset }
+    }
 
     private static let shortcutKeys: [SPPWSpecialKey] = [
         .cut, .copy, .paste, .selectAll,
@@ -414,6 +420,7 @@ final class IOSSpecialKeysPanel: UIView {
         shortcuts.widthAnchor.constraint(equalTo: editing.widthAnchor, multiplier: 1.25).isActive = true
         content.addArrangedSubview(groupsStack)
 
+        scrollBottom = scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -bottomSafeInset)
         let toContent = scrollView.heightAnchor.constraint(equalTo: content.heightAnchor, constant: 20)
         toContent.priority = .defaultHigh
         heightToContent = toContent
@@ -422,7 +429,7 @@ final class IOSSpecialKeysPanel: UIView {
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             // Keys stay above the home indicator; the sheet background extends under it.
-            scrollView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor),
+            scrollBottom,
             toContent,
             content.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 12),
             content.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -8),
@@ -778,6 +785,9 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     /// Returns `true` (and disarms) when the next tap should be a right click.
     var consumeRightClickArm: (() -> Bool)?
     var onToggleControls: (() -> Void)?
+    /// Local magnifier (1×–2×) of the video; touches are mapped through it.
+    var zoom = SPPWViewZoom()
+    var onZoomChanged: ((SPPWViewZoom) -> Void)?
 
     var mode: IOSRemoteInputMode = .trackpad {
         didSet { updateRecognizers() }
@@ -789,6 +799,11 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     private let twoFingerTap = UITapGestureRecognizer()
     private let threeFingerTap = UITapGestureRecognizer()
     private let holdDrag = UILongPressGestureRecognizer()
+    private let pinch = UIPinchGestureRecognizer()
+    /// Cumulative scale of the current pinch and whether it became a zoom (≥ 6 %).
+    private var pinchScaleTotal: CGFloat = 1
+    private var pinchEngaged = false
+    private var lastPinchLocation: CGPoint = .zero
 
     private var lastMoveTranslation: CGPoint = .zero
     private var lastMoveTime: CFTimeInterval = 0
@@ -823,12 +838,13 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
         holdDrag.addTarget(self, action: #selector(handleHoldDrag(_:)))
         holdDrag.minimumPressDuration = 0.45
         holdDrag.allowableMovement = 10
+        pinch.addTarget(self, action: #selector(handlePinch(_:)))
 
         movePan.require(toFail: holdDrag)
         tap.require(toFail: twoFingerTap)
         twoFingerTap.require(toFail: threeFingerTap)
 
-        for recognizer in [movePan, scrollPan, tap, twoFingerTap, threeFingerTap, holdDrag] as [UIGestureRecognizer] {
+        for recognizer in [movePan, scrollPan, tap, twoFingerTap, threeFingerTap, holdDrag, pinch] as [UIGestureRecognizer] {
             recognizer.allowedTouchTypes = directOnly
             recognizer.delegate = self
             addGestureRecognizer(recognizer)
@@ -839,7 +855,9 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        false
+        // Two fingers scroll the Mac until they clearly pinch, then the same gesture zooms.
+        let pair: Set<ObjectIdentifier> = [ObjectIdentifier(gestureRecognizer), ObjectIdentifier(other)]
+        return pair == [ObjectIdentifier(pinch), ObjectIdentifier(scrollPan)]
     }
 
     private func updateRecognizers() {
@@ -848,6 +866,7 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
             recognizer.isEnabled = trackpad
         }
         threeFingerTap.isEnabled = true
+        pinch.isEnabled = true
         stopMomentum()
         if isHoldDragging {
             isHoldDragging = false
@@ -876,13 +895,15 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
 
     private func sendPointerDelta(dx: CGFloat, dy: CGFloat, elapsed: CFTimeInterval) {
         guard dx != 0 || dy != 0, let model else { return }
+        // Swipes follow the picture as shown: rotated/mirrored video, and slower while zoomed.
+        let video = model.videoOrientation.videoDelta(screenDX: Double(dx), screenDY: Double(dy))
         let scaled = SPPWPointerAcceleration.scaled(
-            deltaX: Double(dx),
-            deltaY: Double(dy),
+            deltaX: video.dx / zoom.scale,
+            deltaY: video.dy / zoom.scale,
             elapsedSeconds: max(elapsed, 0.004),
             speed: model.pointerSpeed
         )
-        model.sendInputEvent(.pointerDelta(deltaX: Float(scaled.dx), deltaY: Float(scaled.dy)))
+        model.moveLocalPointer(videoDX: scaled.dx, videoDY: scaled.dy)
     }
 
     @objc private func handleScroll(_ recognizer: UIPanGestureRecognizer) {
@@ -892,10 +913,14 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
             stopMomentum()
             lastScrollTranslation = translation
         case .changed:
-            sendScroll(dx: translation.x - lastScrollTranslation.x, dy: translation.y - lastScrollTranslation.y)
+            if !pinchEngaged {
+                sendScroll(dx: translation.x - lastScrollTranslation.x, dy: translation.y - lastScrollTranslation.y)
+            }
             lastScrollTranslation = translation
         case .ended:
-            startMomentum(velocity: recognizer.velocity(in: self))
+            if !pinchEngaged {
+                startMomentum(velocity: recognizer.velocity(in: self))
+            }
         default:
             break
         }
@@ -905,9 +930,10 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     private func sendScroll(dx: CGFloat, dy: CGFloat) {
         guard let model, dx != 0 || dy != 0 else { return }
         let sign: CGFloat = model.naturalScrolling ? 1 : -1
+        let video = model.videoOrientation.videoDelta(screenDX: Double(dx), screenDY: Double(dy))
         model.sendInputEvent(.scroll(
-            deltaX: Float(dx * Self.scrollScale * sign),
-            deltaY: Float(dy * Self.scrollScale * sign)
+            deltaX: Float(CGFloat(video.dx) * Self.scrollScale * sign),
+            deltaY: Float(CGFloat(video.dy) * Self.scrollScale * sign)
         ))
     }
 
@@ -935,12 +961,66 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
         momentumLink = nil
     }
 
+    // MARK: Zoom
+
+    @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+        let location = recognizer.location(in: self)
+        switch recognizer.state {
+        case .began:
+            pinchScaleTotal = 1
+            pinchEngaged = false
+            lastPinchLocation = location
+            recognizer.scale = 1
+        case .changed:
+            let factor = recognizer.scale
+            recognizer.scale = 1
+            pinchScaleTotal *= factor
+            if !pinchEngaged {
+                guard abs(pinchScaleTotal - 1) >= 0.06 else {
+                    lastPinchLocation = location
+                    return
+                }
+                pinchEngaged = true
+                stopMomentum()
+                // The first finger was pressing on the Mac: lift it before zooming.
+                if mode == .directTouch, let touch = directTouch {
+                    directTouch = nil
+                    sendDirect(touch, phase: .cancelled)
+                    sendDirect(touch, phase: .cancelled)
+                }
+                // Apply the scale accumulated before engaging in one step.
+                applyZoom(by: pinchScaleTotal, at: location, panBy: .zero)
+            } else {
+                applyZoom(
+                    by: factor,
+                    at: location,
+                    panBy: CGPoint(x: location.x - lastPinchLocation.x, y: location.y - lastPinchLocation.y)
+                )
+            }
+            lastPinchLocation = location
+        default:
+            pinchEngaged = false
+            pinchScaleTotal = 1
+        }
+    }
+
+    private func applyZoom(by factor: CGFloat, at anchor: CGPoint, panBy delta: CGPoint) {
+        let width = Double(bounds.width)
+        let height = Double(bounds.height)
+        guard width > 0, height > 0 else { return }
+        zoom.pan(dx: Double(delta.x), dy: Double(delta.y), viewWidth: width, viewHeight: height)
+        zoom.zoom(by: Double(factor), anchorX: Double(anchor.x), anchorY: Double(anchor.y), viewWidth: width, viewHeight: height)
+        onZoomChanged?(zoom)
+    }
+
     @objc private func handleTap() {
         let right = consumeRightClickArm?() ?? false
+        model?.syncLocalPointerToRemote()
         model?.sendInputEvent(.clickAtCursor(button: right ? 1 : 0))
     }
 
     @objc private func handleTwoFingerTap() {
+        model?.syncLocalPointerToRemote()
         model?.sendInputEvent(.clickAtCursor(button: 1))
     }
 
@@ -959,6 +1039,7 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
             lastHoldTime = now
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             let right = consumeRightClickArm?() ?? false
+            model?.syncLocalPointerToRemote()
             model?.sendInputEvent(.buttonAtCursor(button: right ? 1 : 0, isDown: true))
             holdButton = right ? 1 : 0
         case .changed:
@@ -1014,12 +1095,19 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
 
     private func sendDirect(_ touch: UITouch, phase: SPPWTouchPhase) {
         guard let model else { return }
-        let point = touch.location(in: self)
+        let location = touch.location(in: self)
+        // Undo the local magnifier first: the finger points at the zoomed picture.
+        let point = zoom.contentPoint(
+            viewX: Double(location.x),
+            viewY: Double(location.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height)
+        )
         let stats = model.statistics
         guard stats.frameWidth > 0, stats.frameHeight > 0,
               let mapped = SPPWInputCoordinateMapper.mapUIKitPoint(
-                viewX: Double(point.x),
-                viewY: Double(point.y),
+                viewX: point.x,
+                viewY: point.y,
                 viewWidth: Double(bounds.width),
                 viewHeight: Double(bounds.height),
                 videoWidth: Double(stats.frameWidth),
@@ -1028,6 +1116,48 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
                 clampOutside: true
               ) else { return }
         model.sendTouch(phase: phase.rawValue, normalizedX: mapped.normalizedX, normalizedY: mapped.normalizedY)
+        model.placeLocalPointer(normalizedX: Double(mapped.normalizedX), normalizedY: Double(mapped.normalizedY))
+    }
+}
+
+// MARK: - Receiver-drawn pointer
+
+/// Arrow drawn by the receiver at `IOSReceiverModel.localPointer` (tip at the view's origin).
+/// Never takes touches.
+final class IOSLocalPointerView: UIView {
+    static let size = CGSize(width: 18, height: 26)
+
+    override class var layerClass: AnyClass { CAShapeLayer.self }
+
+    override init(frame: CGRect) {
+        super.init(frame: CGRect(origin: frame.origin, size: Self.size))
+        isUserInteractionEnabled = false
+        let shape = layer as! CAShapeLayer
+        let path = UIBezierPath()
+        path.move(to: CGPoint(x: 1, y: 1))
+        path.addLine(to: CGPoint(x: 1, y: 21))
+        path.addLine(to: CGPoint(x: 6, y: 16.5))
+        path.addLine(to: CGPoint(x: 9.5, y: 24.5))
+        path.addLine(to: CGPoint(x: 12.5, y: 23.2))
+        path.addLine(to: CGPoint(x: 9.2, y: 15.4))
+        path.addLine(to: CGPoint(x: 15.5, y: 15.4))
+        path.close()
+        shape.path = path.cgPath
+        shape.fillColor = UIColor.white.cgColor
+        shape.strokeColor = UIColor.black.cgColor
+        shape.lineWidth = 1.2
+        shape.lineJoin = .round
+        shape.shadowColor = UIColor.black.cgColor
+        shape.shadowOpacity = 0.35
+        shape.shadowRadius = 1.5
+        shape.shadowOffset = CGSize(width: 0, height: 1)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Places the tip at `point` (in the superview's coordinates).
+    func place(tipAt point: CGPoint) {
+        frame = CGRect(origin: CGPoint(x: point.x - 1, y: point.y - 1), size: Self.size)
     }
 }
 
@@ -1099,23 +1229,27 @@ final class IOSHardwareMouseInput {
         let now = CACurrentMediaTime()
         let elapsed = lastMoveTime > 0 ? min(now - lastMoveTime, 0.05) : 0.008
         lastMoveTime = now
-        // GCMouse reports +Y up; the Mac's display space grows downwards.
+        // GCMouse reports +Y up; the Mac's display space grows downwards. Motion follows
+        // the picture as shown when the video is rotated or mirrored.
+        let video = model.videoOrientation.videoDelta(screenDX: Double(dx) * 0.6, screenDY: Double(-dy) * 0.6)
         let scaled = SPPWPointerAcceleration.scaled(
-            deltaX: Double(dx) * 0.6,
-            deltaY: Double(-dy) * 0.6,
+            deltaX: video.dx,
+            deltaY: video.dy,
             elapsedSeconds: max(elapsed, 0.004),
             speed: model.pointerSpeed
         )
-        model.sendInputEvent(.pointerDelta(deltaX: Float(scaled.dx), deltaY: Float(scaled.dy)))
+        model.moveLocalPointer(videoDX: scaled.dx, videoDY: scaled.dy)
     }
 
     private func button(_ index: UInt8, _ pressed: Bool) {
+        if pressed { model?.syncLocalPointerToRemote() }
         model?.sendInputEvent(.buttonAtCursor(button: index, isDown: pressed))
     }
 
     private func scrolled(x: Float, y: Float) {
-        guard x != 0 || y != 0 else { return }
-        model?.sendInputEvent(.scroll(deltaX: x * 10, deltaY: y * 10))
+        guard x != 0 || y != 0, let model else { return }
+        let video = model.videoOrientation.videoDelta(screenDX: Double(x * 10), screenDY: Double(y * 10))
+        model.sendInputEvent(.scroll(deltaX: Float(video.dx), deltaY: Float(video.dy)))
     }
 }
 

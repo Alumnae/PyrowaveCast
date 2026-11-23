@@ -37,14 +37,33 @@ struct PyrowaveApp: App {
     }
 
     @State private var selectedPanel: Panel = .server
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    /// Sidebar layout to restore when the receiver leaves video fullscreen.
+    @State private var columnVisibilityBeforeFullscreen: NavigationSplitViewVisibility = .all
+
+    /// Receiver video fullscreen: no sidebar and no window toolbar, so the title bar
+    /// ("PyrowaveCast") hides with the macOS fullscreen chrome and only comes back
+    /// when the pointer reaches the top edge.
+    private var isReceiverVideoFullscreen: Bool {
+        selectedPanel == .receiver && receiverModel.isVideoFullscreen
+    }
 
     var body: some Scene {
         WindowGroup("PyrowaveCast") {
             let _ = selectedLanguageRaw
-            NavigationSplitView {
+            NavigationSplitView(columnVisibility: $columnVisibility) {
                 sidebar
             } detail: {
                 detailPanel
+            }
+            .toolbar(isReceiverVideoFullscreen ? .hidden : .automatic, for: .windowToolbar)
+            .onChange(of: isReceiverVideoFullscreen) { _, fullscreen in
+                if fullscreen {
+                    columnVisibilityBeforeFullscreen = columnVisibility
+                    columnVisibility = .detailOnly
+                } else {
+                    columnVisibility = columnVisibilityBeforeFullscreen
+                }
             }
             .frame(minWidth: 1100, minHeight: 700)
             .preferredColorScheme(.dark)

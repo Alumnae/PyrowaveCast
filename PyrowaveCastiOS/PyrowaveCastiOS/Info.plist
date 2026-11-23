@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.pyrowavecast.ios.streaming.*</string>
+	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDisplayName</key>
@@ -15,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.6.5</string>
+	<string>0.6.10</string>
 	<key>CFBundleVersion</key>
-	<string>605</string>
+	<string>610</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSBonjourServices</key>
@@ -30,9 +34,9 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>PyrowaveCast streams the selected audio input (microphone) as the stream audio when you choose it as audio source.</string>
 	<key>PyrowaveBuildVersion</key>
-	<string>v0.6.5 (build 605, 6de2f17)</string>
+	<string>v0.6.10 (build 610, 345f619)</string>
 	<key>PyrowaveGitCommit</key>
-	<string>6de2f17</string>
+	<string>345f619</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -68,8 +68,12 @@ final class IOSServerModel: ObservableObject {
         }
     }
     private var microphone: SPPWMicrophoneCapture?
-    /// Extra background time + diagnostics while the server runs.
+    /// Background streaming (continued-processing GPU task) + diagnostics while the server runs.
     private var backgroundGuard: IOSBackgroundStreamingGuard?
+    private var isAppInForeground = true
+    /// The system screen capture stopped while serving; restarted when the app is on screen.
+    private var screenCaptureNeedsRestart = false
+    private var screenCaptureResolution = (width: 0, height: 0)
 
     func refreshAudioSources() {
         audioSources = SPPWAudioSourceCatalog.availableSources()
@@ -162,9 +166,26 @@ final class IOSServerModel: ObservableObject {
                 self.isRunning = true
                 // No auto-lock while serving; a locked device suspends the app and the stream.
                 IOSKeepAwake.shared.acquire(.server)
-                self.backgroundGuard = IOSBackgroundStreamingGuard { [weak self] message, isError in
-                    self?.append(ServerLogEntry(id: 0, timestamp: Date(), text: message, isError: isError))
-                }
+                self.isAppInForeground = UIApplication.shared.applicationState != .background
+                self.backgroundGuard = IOSBackgroundStreamingGuard(
+                    onEvent: { [weak self] message, isError in
+                        self?.append(ServerLogEntry(id: 0, timestamp: Date(), text: message, isError: isError))
+                    },
+                    onVideoAllowedChanged: { allowed in
+                        Task { await instance.setVideoSuspended(!allowed) }
+                    },
+                    onForegroundChanged: { [weak self] foreground in
+                        self?.appForegroundChanged(foreground, instance: instance)
+                    },
+                    snapshot: { [weak self] in
+                        let status = self?.status ?? StreamStatus()
+                        return IOSBackgroundStreamingGuard.Snapshot(
+                            framesSent: status.framesSent,
+                            connectedClients: status.connectedClients,
+                            megabitsPerSecond: status.megabitsPerSecond
+                        )
+                    }
+                )
                 self.startStatusPolling(for: instance)
                 self.append(ServerLogEntry(
                     id: 0,
@@ -175,20 +196,15 @@ final class IOSServerModel: ObservableObject {
 
                 if self.mode == .screen {
                     self.isStartingScreenCapture = true
-                    let capture = IOSScreenCaptureCoordinator()
+                    let capture = self.makeScreenCapture(for: instance)
                     self.screenCapture = capture
+                    self.screenCaptureResolution = serverScreenResolution
                     do {
                         let audioKind = SPPWAudioSourceCatalog.source(withID: self.audioSourceID, in: self.audioSources).kind
-                        let systemAudioHandler: (@Sendable (CMSampleBuffer) -> Void)?
-                        if audioKind == .system {
-                            systemAudioHandler = { sampleBuffer in instance.ingestAudio(sampleBuffer) }
-                        } else {
-                            systemAudioHandler = nil
-                        }
                         let frames = try await capture.start(
                             width: serverScreenResolution.width,
                             height: serverScreenResolution.height,
-                            audioHandler: systemAudioHandler
+                            audioHandler: self.systemAudioHandler(for: instance)
                         )
                         if case .input(let portUID) = audioKind {
                             let microphone = SPPWMicrophoneCapture()
@@ -247,6 +263,7 @@ final class IOSServerModel: ObservableObject {
         }
         microphone?.stop()
         microphone = nil
+        screenCaptureNeedsRestart = false
         backgroundGuard?.invalidate()
         backgroundGuard = nil
         IOSKeepAwake.shared.release(.server)
@@ -339,6 +356,86 @@ final class IOSServerModel: ObservableObject {
             return String(format: "%d:%02d:%02d", hours, minutes, secs)
         }
         return String(format: "%02d:%02d", minutes, secs)
+    }
+
+    // MARK: Background and capture recovery
+
+    private func systemAudioHandler(for instance: IOSStreamServer) -> (@Sendable (CMSampleBuffer) -> Void)? {
+        let audioKind = SPPWAudioSourceCatalog.source(withID: audioSourceID, in: audioSources).kind
+        guard audioKind == .system else { return nil }
+        return { sampleBuffer in instance.ingestAudio(sampleBuffer) }
+    }
+
+    private func makeScreenCapture(for instance: IOSStreamServer) -> IOSScreenCaptureCoordinator {
+        let capture = IOSScreenCaptureCoordinator()
+        capture.onCaptureStopped = { [weak self, weak capture] reason in
+            guard let self, let capture, self.screenCapture === capture else { return }
+            self.screenCaptureStopped(reason, instance: instance)
+        }
+        return capture
+    }
+
+    private func appForegroundChanged(_ foreground: Bool, instance: IOSStreamServer) {
+        isAppInForeground = foreground
+        // The preview is invisible in the background; skip its GPU decode there.
+        let enabled = previewEnabled && foreground
+        Task { await instance.setPreviewEnabled(enabled) }
+        if foreground {
+            restartScreenCaptureIfNeeded(instance: instance)
+        }
+    }
+
+    private func screenCaptureStopped(_ reason: String, instance: IOSStreamServer) {
+        guard isRunning, server === instance, mode == .screen else { return }
+        screenCaptureNeedsRestart = true
+        append(ServerLogEntry(
+            id: 0,
+            timestamp: Date(),
+            text: "Screen capture stopped by iOS (\(reason)); "
+                + (isAppInForeground ? "restarting it" : "it restarts when PyrowaveCast returns to the foreground"),
+            isError: true
+        ))
+        if isAppInForeground {
+            restartScreenCaptureIfNeeded(instance: instance)
+        }
+    }
+
+    /// Starts a new system capture after iOS stopped the previous one, so the stream comes
+    /// back by itself instead of staying frozen until the server is restarted.
+    private func restartScreenCaptureIfNeeded(instance: IOSStreamServer) {
+        guard screenCaptureNeedsRestart, isRunning, server === instance,
+              mode == .screen, !isStartingScreenCapture else { return }
+        screenCaptureNeedsRestart = false
+        isStartingScreenCapture = true
+        let previous = screenCapture
+        let capture = makeScreenCapture(for: instance)
+        screenCapture = capture
+        let resolution = screenCaptureResolution
+        Task { [weak self] in
+            await previous?.stop()
+            guard let self else { return }
+            do {
+                let frames = try await capture.start(
+                    width: resolution.width,
+                    height: resolution.height,
+                    audioHandler: self.systemAudioHandler(for: instance)
+                )
+                guard self.server === instance, self.screenCapture === capture else {
+                    await capture.stop()
+                    return
+                }
+                await instance.setScreenFrameStream(frames)
+                self.append(ServerLogEntry(id: 0, timestamp: Date(), text: "Screen capture restarted", isError: false))
+            } catch {
+                self.append(ServerLogEntry(
+                    id: 0,
+                    timestamp: Date(),
+                    text: "Screen capture could not restart (\(error.localizedDescription)); stop and start the server to share the screen again",
+                    isError: true
+                ))
+            }
+            self.isStartingScreenCapture = false
+        }
     }
 
     private func startStatusPolling(for instance: IOSStreamServer) {

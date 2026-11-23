@@ -30,6 +30,8 @@ pyrowave_apply_version "$ROOT" "$PYROWAVE_BUMP_MODE"
 OUT="${PYROWAVE_OUT_ARG:-$ROOT/build/PyrowaveCastiOS-${PYROWAVE_VERSION_TAG}.ipa}"
 PROJECT="$ROOT/PyrowaveCastiOS/PyrowaveCastiOS.xcodeproj"
 SCHEME="PyrowaveCastiOS"
+# Product name and bundle identifiers come from the project (per target): passing them
+# here would also rename the broadcast upload extension and clash with the app.
 PRODUCT_NAME="Pyrowavecast"
 ARCHIVE_PATH="$ROOT/build/PyrowaveCastiOS.xcarchive"
 
@@ -40,8 +42,6 @@ xcodebuild \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
     -destination "generic/platform=iOS" \
-    PRODUCT_NAME="$PRODUCT_NAME" \
-    PRODUCT_BUNDLE_IDENTIFIER="com.pyrowavecast.ios" \
     MARKETING_VERSION="$PYROWAVE_VERSION" \
     CURRENT_PROJECT_VERSION="$PYROWAVE_BUILD_NUMBER" \
     CODE_SIGNING_ALLOWED=NO \

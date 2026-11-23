@@ -1,6 +1,7 @@
 import Combine
 import CoreVideo
 import PhotosUI
+import ReplayKit
 import UIKit
 import UniformTypeIdentifiers
 #if canImport(SPPWCommon)
@@ -26,6 +27,10 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
     private let chooseAssetButton = UIButton(type: .system)
     private let startButton = UIButton(type: .system)
     private let helpLabel = UILabel()
+    /// System-wide casting through the Broadcast Upload Extension (keeps streaming in the
+    /// background). In screen mode the Start button triggers the system picker's own button.
+    private let broadcastHelpLabel = UILabel()
+    private let broadcastPicker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
     private let previewTitleLabel = UILabel()
     private let previewSwitch = UISwitch()
     private let previewContainer = UIView()
@@ -288,6 +293,7 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         portLabel.font = .preferredFont(forTextStyle: .subheadline)
         portField.borderStyle = .roundedRect
         portField.keyboardType = .numberPad
+        portField.addKeyboardDismissBar()
         portField.textAlignment = .right
         portField.font = .monospacedSystemFont(ofSize: 16, weight: .regular)
         portField.placeholder = "9888"
@@ -302,6 +308,19 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         startButton.configuration = .filled()
         startButton.addTarget(self, action: #selector(startStopPressed), for: .touchUpInside)
         stack.addArrangedSubview(startButton)
+
+        broadcastPicker.preferredExtension = IOSBroadcastSettings.extensionBundleIdentifier
+        broadcastPicker.showsMicrophoneButton = false
+        broadcastPicker.isHidden = true
+        view.addSubview(broadcastPicker)
+        broadcastHelpLabel.font = .preferredFont(forTextStyle: .caption1)
+        broadcastHelpLabel.textColor = .secondaryLabel
+        broadcastHelpLabel.numberOfLines = 0
+        stack.addArrangedSubview(broadcastHelpLabel)
+        NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshUI() }
+            .store(in: &cancellables)
 
         helpLabel.font = .preferredFont(forTextStyle: .caption1)
         helpLabel.textColor = .secondaryLabel
@@ -425,8 +444,17 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         portField.isEnabled = !model.isRunning
         updateAudioControls()
 
+        let isScreen = model.mode == .screen
+        // `isCaptured` is true while the screen is broadcast (or recorded/mirrored).
+        let broadcasting = view.window?.windowScene?.screen.isCaptured ?? false
         let buttonTitle: String
-        if model.isRunning {
+        if isScreen && !model.isRunning {
+            // Screen mode always casts through the system broadcast (extension): the in-app
+            // capture cannot encode once PyrowaveCast leaves the screen (no background GPU),
+            // which left receivers black on the Home Screen or in other apps.
+            buttonTitle = broadcasting ? SPPWLocalization.tr("broadcast.stop") : SPPWLocalization.tr("broadcast.share_screen")
+            startButton.tintColor = broadcasting ? .systemRed : .systemBlue
+        } else if model.isRunning {
             buttonTitle = SPPWLocalization.tr("action.stop_server")
             startButton.tintColor = .systemRed
         } else if model.isStartingScreenCapture {
@@ -437,9 +465,12 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
             startButton.tintColor = .systemBlue
         }
         startButton.setTitle(buttonTitle, for: .normal)
-        startButton.isEnabled = model.isRunning || model.canStart
+        startButton.isEnabled = model.isRunning || model.canStart || (isScreen && !model.isStartingScreenCapture)
 
         helpLabel.text = helpText(for: model.mode)
+        helpLabel.isHidden = isScreen
+        broadcastHelpLabel.isHidden = !isScreen
+        broadcastHelpLabel.text = SPPWLocalization.tr("broadcast.help_fmt", Int(IOSBroadcastSettings.port))
         previewSwitch.isOn = model.previewEnabled
         let hasPreview = model.previewEnabled && model.previewPixelBuffer != nil
         previewSurfaceView.isHidden = !hasPreview
@@ -588,7 +619,28 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
         }
     }
 
+    /// Opens the system broadcast sheet preselected on the PyrowaveCast extension. The
+    /// extension runs its own server on the same port, so the in-app server stops first.
+    @objc private func broadcastPressed() {
+        portField.resignFirstResponder()
+        if model.isRunning { model.stop() }
+        IOSBroadcastSettings.port = UInt16(clamping: model.port)
+        func findButton(in view: UIView) -> UIButton? {
+            if let button = view as? UIButton { return button }
+            for subview in view.subviews {
+                if let button = findButton(in: subview) { return button }
+            }
+            return nil
+        }
+        findButton(in: broadcastPicker)?.sendActions(for: .allTouchEvents)
+    }
+
     @objc private func startStopPressed() {
+        if model.mode == .screen && !model.isRunning {
+            // Opens the system sheet: Start Broadcast, or Stop while one is running.
+            broadcastPressed()
+            return
+        }
         if model.isRunning { model.stop() } else { model.start() }
         portField.resignFirstResponder()
     }

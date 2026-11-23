@@ -62,10 +62,18 @@ actor IOSStreamServer {
     private var activeVideoSource: TestVideoSource?
     private var pendingVideoSeekSeconds: Double?
     private var screenFrameStream: AsyncStream<IOSSendablePixelBuffer>?
+    /// True while the app is in the background without GPU access: iOS rejects Metal work,
+    /// so frames are dropped instead of failing in the encoder. Audio and heartbeats go on.
+    private var videoSuspended = false
     private var sharedConfig: ClientConfiguration?
     private var sharedStreamID: UInt32 = 0
     private var frameID: UInt32 = 0
     private var generation: UInt64 = 0
+    /// The last frame sent, resent while the screen is still (`SPPWStillScreenPolicy`):
+    /// ReplayKit / ScreenCaptureKit deliver nothing while nothing changes on screen.
+    private var lastSentFrame: (bitstream: Data, width: Int, height: Int, generation: UInt64)?
+    private var lastFrameSentNanos: UInt64 = 0
+    private var stillRefreshTask: Task<Void, Never>?
     private var geometry: (width: Int, height: Int)?
     private var fps = 0
     private var frameCount = 0
@@ -138,6 +146,13 @@ actor IOSStreamServer {
     }
 
     func setScreenFrameStream(_ stream: AsyncStream<IOSSendablePixelBuffer>) async {
+        if captureTask != nil {
+            // Replacing a capture that stopped (or is being restarted): the old stream is
+            // single-consumer and finished, so drop its pump and start one on the new stream.
+            generation &+= 1
+            captureTask?.cancel()
+            captureTask = nil
+        }
         screenFrameStream = stream
         // In screen capture mode, start the capture consumer loop immediately so:
         // 1) local server preview renders captured frames right away, and
@@ -237,6 +252,9 @@ actor IOSStreamServer {
         audioSendQueue.finish()
         sessionReaperTask?.cancel()
         sessionReaperTask = nil
+        stillRefreshTask?.cancel()
+        stillRefreshTask = nil
+        lastSentFrame = nil
         mediaPacer.cancelPending()
         generation &+= 1
         captureTask?.cancel()
@@ -386,6 +404,8 @@ actor IOSStreamServer {
             }
             if isResync {
                 sendServerHello(to: peer, controlID: responseID)
+                // Frames are intra-only: the last one is a full picture for the new session.
+                resendLastFrameIfStill(force: true)
             } else {
                 let ackFlags: UInt16 = isScreenCaptureMode ? WireControlFlags.serverControlledResolution : 0
                 udpSocket?.send(
@@ -530,6 +550,54 @@ actor IOSStreamServer {
             await self.sourceEnded(generation: currentGeneration)
         }
         log("Streaming \(source.title): \(width)x\(height) @ \(requestedFPS) fps")
+        startStillRefreshIfNeeded()
+    }
+
+    private func startStillRefreshIfNeeded() {
+        guard stillRefreshTask == nil else { return }
+        stillRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+                await self?.resendLastFrameIfStill(force: false)
+            }
+        }
+    }
+
+    /// Resends the last encoded frame (new frame ID and timestamp) when no frame went out
+    /// for `SPPWStillScreenPolicy.refreshIntervalNanoseconds`, or right away on a resync.
+    /// Keeps receivers' fresh-frame watchdogs quiet on a still screen and repairs a last
+    /// frame lost on the network, without any GPU work.
+    private func resendLastFrameIfStill(force: Bool) {
+        let now = SPPWCaptureClock.nowNanoseconds()
+        guard force || SPPWStillScreenPolicy.shouldRefresh(nowNanoseconds: now, lastSentNanoseconds: lastFrameSentNanos),
+              !videoSuspended,
+              captureTask != nil,
+              let frame = lastSentFrame, frame.generation == generation,
+              let config = sharedConfig,
+              let socket = udpSocket else { return }
+        let peers = clients.values.map(\.peer)
+        guard !peers.isEmpty else { return }
+        let totalDatagramLimit = min(max(config.mtu, 512), 1200)
+        let payloadLimit = max(256, totalDatagramLimit - WireHeader.byteCount)
+        let effectiveFECPercent = clients.values.map(\.config.fecPercent).max() ?? config.fecPercent
+        frameID &+= 1
+        let datagrams = buildPacedFrameDatagrams(
+            streamID: sharedStreamID,
+            frameID: frameID,
+            width: UInt16(frame.width),
+            height: UInt16(frame.height),
+            timestampNanoseconds: now,
+            bitstream: frame.bitstream,
+            payloadLimit: payloadLimit,
+            fecPercent: effectiveFECPercent
+        )
+        mediaPacer.enqueueFrame(datagrams: datagrams, burstSize: 6, fps: config.fps) { burst in
+            socket.sendBatch(burst, to: peers)
+        }
+        lastFrameSentNanos = now
+        frameCount += 1
+        byteCount += frame.bitstream.count
+        stats.record(frameBytes: frame.bitstream.count)
     }
 
     private func makeTestFrameStream(width: Int, height: Int, fps: Int) -> AsyncStream<IOSSendablePixelBuffer> {
@@ -687,12 +755,21 @@ actor IOSStreamServer {
         socket.sendBatch(datagrams, to: peers)
     }
 
+    /// Pauses or resumes video encoding (background without GPU access). PyroWave frames
+    /// are intra-only, so the first frame after resuming decodes on its own.
+    func setVideoSuspended(_ suspended: Bool) {
+        guard suspended != videoSuspended else { return }
+        videoSuspended = suspended
+        log(suspended ? "Video paused (app in background without GPU access)" : "Video resumed")
+    }
+
     private func encodeAndSend(
         _ pixelBuffer: CVPixelBuffer,
         captureTimestampNanoseconds: UInt64 = 0,
         generation frameGeneration: UInt64
     ) async {
-        guard frameGeneration == generation,
+        guard !videoSuspended,
+              frameGeneration == generation,
               let config = sharedConfig,
               let socket = udpSocket else { return }
         let sourceWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
@@ -785,6 +862,8 @@ actor IOSStreamServer {
             frameCount += 1
             byteCount += output.bitstream.count
             stats.record(frameBytes: output.bitstream.count)
+            lastSentFrame = (output.bitstream, width, height, frameGeneration)
+            lastFrameSentNanos = SPPWCaptureClock.nowNanoseconds()
         } catch {
             log("Encode error: \(error)", isError: true)
         }

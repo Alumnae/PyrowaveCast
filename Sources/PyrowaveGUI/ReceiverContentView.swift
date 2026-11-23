@@ -6,10 +6,15 @@ public struct ReceiverContentView: View {
     @EnvironmentObject private var model: ReceiverModel
     @State private var isVideoFullscreen = false
     @State private var enteredNativeFullscreen = false
-    /// Fullscreen top-right bar: shown on entry and on mouse movement, hidden after a pause.
-    @State private var fullscreenBarVisible = true
-    @State private var fullscreenBarHovered = false
-    @State private var fullscreenBarHideTask: Task<Void, Never>?
+    /// Floating control button over the video (app logo, 50 % opacity until hovered): drag it
+    /// anywhere, click it for the controls. Its centre is stored as a fraction of the free
+    /// travel, so it keeps its place when the window or fullscreen changes size.
+    @AppStorage("receiverControlPuckX") private var puckX: Double = 0.5
+    @AppStorage("receiverControlPuckY") private var puckY: Double = 0
+    @State private var puckDragOffset: CGSize = .zero
+    @State private var puckDragging = false
+    @State private var puckHovered = false
+    @State private var puckMenuShown = false
     @State private var showFullscreenExitHint = false
     @StateObject private var exitChordMonitor = FullscreenExitChordMonitor()
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
@@ -49,44 +54,28 @@ public struct ReceiverContentView: View {
         }
         .onDisappear {
             model.stopDiscovery()
+            model.isVideoFullscreen = false
         }
         .onExitCommand {
             if isVideoFullscreen && (!model.remoteControlEnabled || !model.isCapturingKeyboard) {
                 exitVideoFullscreen()
             }
         }
+        .onChange(of: isVideoFullscreen) { _, fullscreen in
+            model.isVideoFullscreen = fullscreen
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
             if isVideoFullscreen {
                 isVideoFullscreen = false
                 enteredNativeFullscreen = false
                 exitChordMonitor.stop()
-                fullscreenBarHideTask?.cancel()
-                fullscreenBarHideTask = nil
             }
-        }
-    }
-
-    /// Height of the top strip that brings the fullscreen bar back on hover.
-    static let fullscreenRevealBandHeight: CGFloat = 48
-
-    /// Shows the fullscreen bar and schedules it to slide up after 3 s away from it.
-    private func revealFullscreenBar() {
-        guard isVideoFullscreen else { return }
-        if !fullscreenBarVisible {
-            withAnimation(.easeOut(duration: 0.2)) { fullscreenBarVisible = true }
-        }
-        fullscreenBarHideTask?.cancel()
-        fullscreenBarHideTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled, isVideoFullscreen, !fullscreenBarHovered else { return }
-            withAnimation(.easeInOut(duration: 0.35)) { fullscreenBarVisible = false }
         }
     }
 
     private func enterVideoFullscreen() {
         isVideoFullscreen = true
-        exitChordMonitor.start { exitVideoFullscreen() } onPointerNearTop: { revealFullscreenBar() }
-        revealFullscreenBar()
+        exitChordMonitor.start { exitVideoFullscreen() }
         showFullscreenExitHint = true
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
@@ -103,8 +92,6 @@ public struct ReceiverContentView: View {
     private func exitVideoFullscreen() {
         isVideoFullscreen = false
         exitChordMonitor.stop()
-        fullscreenBarHideTask?.cancel()
-        fullscreenBarHideTask = nil
         showFullscreenExitHint = false
         if enteredNativeFullscreen {
             enteredNativeFullscreen = false
@@ -590,6 +577,12 @@ public struct ReceiverContentView: View {
                     },
                     onCaptureFocusChanged: { focused in
                         model.isCapturingKeyboard = focused
+                    },
+                    zoomScale: model.videoZoomScale,
+                    onZoomChanged: { scale in
+                        if abs(model.videoZoomScale - scale) > 0.001 {
+                            model.videoZoomScale = scale
+                        }
                     }
                 ) { message in
                     DispatchQueue.main.async { model.noteDisplayError(message) }
@@ -617,13 +610,8 @@ public struct ReceiverContentView: View {
             }
         }
         .contentShape(Rectangle())
-        .onContinuousHover { phase in
-            // Mouse-moved events only reach the monitor while remote control tracks the
-            // pointer; hover covers the view-only case. Only the top edge brings the bar back.
-            if case let .active(location) = phase, isVideoFullscreen,
-               location.y <= Self.fullscreenRevealBandHeight {
-                revealFullscreenBar()
-            }
+        .background {
+            if hasVideo { zoomShortcuts }
         }
         .onTapGesture(count: 2) {
             if !model.remoteControlEnabled {
@@ -643,81 +631,11 @@ public struct ReceiverContentView: View {
                     .transition(.opacity)
             }
         }
-        .overlay(alignment: .topTrailing) {
-            if !isVideoFullscreen || fullscreenBarVisible {
-                HStack(spacing: 8) {
-                    if hasVideo {
-                        Button {
-                            model.remoteControlEnabled.toggle()
-                        } label: {
-                            Label(
-                                SPPWLocalization.tr("receiver.remote_control_short"),
-                                systemImage: model.remoteControlEnabled ? "cursorarrow.click.2" : "cursorarrow"
-                            )
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(model.remoteControlEnabled ? .green : .white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(.black.opacity(0.65), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .help(SPPWLocalization.tr("receiver.remote_control_help"))
-
-                        HStack(spacing: 8) {
-                            Button { model.rotateVideo() } label: {
-                                Label(SPPWLocalization.tr("orientation.rotate"), systemImage: "rotate.right")
-                            }
-                            .buttonStyle(.plain)
-                            .help(SPPWLocalization.tr("orientation.rotate_help"))
-
-                            Button { model.toggleFlip() } label: {
-                                Label(
-                                    SPPWLocalization.tr("orientation.flip"),
-                                    systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right"
-                                )
-                                .foregroundStyle(model.videoOrientation.isFlippedHorizontally ? .cyan : .white)
-                            }
-                            .buttonStyle(.plain)
-                            .help(SPPWLocalization.tr("orientation.flip_help"))
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.black.opacity(0.65), in: Capsule())
-                    }
-
-                    Button {
-                        toggleVideoFullscreen()
-                    } label: {
-                        Label(
-                            isVideoFullscreen
-                                ? SPPWLocalization.tr("action.exit_fullscreen")
-                                : SPPWLocalization.tr("action.fullscreen"),
-                            systemImage: isVideoFullscreen
-                                ? "arrow.down.right.and.arrow.up.left"
-                                : "arrow.up.left.and.arrow.down.right"
-                        )
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.black.opacity(0.65), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white)
-                    .help(isVideoFullscreen
-                        ? SPPWLocalization.tr("receiver.fullscreen_exit_help")
-                        : SPPWLocalization.tr("action.fullscreen_help"))
-                }
-                .padding(14)
-                .onHover { hovering in
-                    fullscreenBarHovered = hovering
-                    if !hovering { revealFullscreenBar() }
-                }
-                // Slides up out of the screen when it hides, and back down when the pointer
-                // reaches the top edge.
-                .transition(.move(edge: .top).combined(with: .opacity))
+        .overlay {
+            GeometryReader { geometry in
+                controlPuck(in: geometry.size, hasVideo: hasVideo)
             }
+            .padding(isVideoFullscreen ? 0 : 12)
         }
         .overlay(alignment: .bottomLeading) {
             if hasVideo && !isVideoFullscreen {
@@ -745,6 +663,203 @@ public struct ReceiverContentView: View {
                 .padding(14)
             }
         }
+    }
+
+    static let puckSize: CGFloat = 40
+    static let puckMargin: CGFloat = 10
+
+    /// Centre of the control button for the stored fractions plus the drag in progress,
+    /// kept inside the video area.
+    private func puckCenter(in size: CGSize) -> CGPoint {
+        let half = Self.puckSize / 2 + Self.puckMargin
+        let travelX = max(0, size.width - 2 * half)
+        let travelY = max(0, size.height - 2 * half)
+        let x = half + travelX * puckX + puckDragOffset.width
+        let y = half + travelY * puckY + puckDragOffset.height
+        return CGPoint(
+            x: min(max(x, half), max(half, size.width - half)),
+            y: min(max(y, half), max(half, size.height - half))
+        )
+    }
+
+    /// The app logo as a small floating button: 50 % opacity until hovered, so the remote
+    /// screen underneath stays visible; drag it out of the way, click it for the controls.
+    private func controlPuck(in size: CGSize, hasVideo: Bool) -> some View {
+        let active = puckHovered || puckMenuShown || puckDragging
+        return ZStack(alignment: .topTrailing) {
+            Circle()
+                .fill(.black.opacity(0.72))
+                .overlay(Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1))
+                .overlay(
+                    Image(systemName: "wave.3.right")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                )
+            if model.remoteControlEnabled && hasVideo {
+                Circle()
+                    .fill(model.isCapturingKeyboard ? Color.green : Color.white)
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().strokeBorder(.black.opacity(0.6), lineWidth: 1))
+                    .offset(x: -1, y: 1)
+            }
+        }
+        .frame(width: Self.puckSize, height: Self.puckSize)
+        .contentShape(Circle())
+        .opacity(active ? 1 : 0.5)
+        .scaleEffect(puckDragging ? 1.08 : 1)
+        .animation(.easeOut(duration: 0.15), value: active)
+        .onHover { puckHovered = $0 }
+        .help(SPPWLocalization.tr("receiver.controls_puck_help"))
+        .accessibilityLabel(SPPWLocalization.tr("receiver.controls_puck_help"))
+        .accessibilityAddTraits(.isButton)
+        .gesture(
+            DragGesture(minimumDistance: 4)
+                .onChanged { value in
+                    puckDragging = true
+                    puckDragOffset = value.translation
+                }
+                .onEnded { _ in
+                    let center = puckCenter(in: size)
+                    let half = Self.puckSize / 2 + Self.puckMargin
+                    let travelX = max(1, size.width - 2 * half)
+                    let travelY = max(1, size.height - 2 * half)
+                    puckX = min(max((center.x - half) / travelX, 0), 1)
+                    puckY = min(max((center.y - half) / travelY, 0), 1)
+                    puckDragOffset = .zero
+                    puckDragging = false
+                }
+        )
+        .onTapGesture { puckMenuShown.toggle() }
+        .popover(isPresented: $puckMenuShown, arrowEdge: .bottom) {
+            controlMenu(hasVideo: hasVideo)
+        }
+        .position(puckCenter(in: size))
+    }
+
+    /// The video controls, grouped in the control button's popover.
+    private func controlMenu(hasVideo: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if hasVideo {
+                Button {
+                    model.remoteControlEnabled.toggle()
+                } label: {
+                    Label(
+                        SPPWLocalization.tr("receiver.remote_control_short"),
+                        systemImage: model.remoteControlEnabled ? "cursorarrow.click.2" : "cursorarrow"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(model.remoteControlEnabled ? .green : .white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.65), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(SPPWLocalization.tr("receiver.remote_control_help"))
+
+                HStack(spacing: 8) {
+                    Button { model.rotateVideo() } label: {
+                        Label(SPPWLocalization.tr("orientation.rotate"), systemImage: "rotate.right")
+                    }
+                    .buttonStyle(.plain)
+                    .help(SPPWLocalization.tr("orientation.rotate_help"))
+
+                    Button { model.toggleFlip() } label: {
+                        Label(
+                            SPPWLocalization.tr("orientation.flip"),
+                            systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right"
+                        )
+                        .foregroundStyle(model.videoOrientation.isFlippedHorizontally ? .cyan : .white)
+                    }
+                    .buttonStyle(.plain)
+                    .help(SPPWLocalization.tr("orientation.flip_help"))
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.black.opacity(0.65), in: Capsule())
+
+                zoomControl
+            }
+
+            Button {
+                puckMenuShown = false
+                toggleVideoFullscreen()
+            } label: {
+                Label(
+                    isVideoFullscreen
+                        ? SPPWLocalization.tr("action.exit_fullscreen")
+                        : SPPWLocalization.tr("action.fullscreen"),
+                    systemImage: isVideoFullscreen
+                        ? "arrow.down.right.and.arrow.up.left"
+                        : "arrow.up.left.and.arrow.down.right"
+                )
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.black.opacity(0.65), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .help(isVideoFullscreen
+                ? SPPWLocalization.tr("receiver.fullscreen_exit_help")
+                : SPPWLocalization.tr("action.fullscreen_help"))
+        }
+        .padding(12)
+    }
+
+    /// ⌘+ / ⌘− / ⌘0 on invisible buttons, so they keep working while the controls popover is
+    /// closed. Bound only while the keyboard is not captured: during remote control the same
+    /// keys reach the remote Mac.
+    private var zoomShortcuts: some View {
+        let captured = model.remoteControlEnabled && model.isCapturingKeyboard
+        return ZStack {
+            Button("") { model.stepVideoZoom(by: 0.25) }
+                .keyboardShortcut(captured ? nil : KeyboardShortcut("=", modifiers: .command))
+            Button("") { model.stepVideoZoom(by: 0.25) }
+                .keyboardShortcut(captured ? nil : KeyboardShortcut("+", modifiers: .command))
+            Button("") { model.stepVideoZoom(by: -0.25) }
+                .keyboardShortcut(captured ? nil : KeyboardShortcut("-", modifiers: .command))
+            Button("") { model.resetVideoZoom() }
+                .keyboardShortcut(captured ? nil : KeyboardShortcut("0", modifiers: .command))
+        }
+        .buttonStyle(.plain)
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    /// "− 1.0× +": local magnifier up to 2× (the number resets to 1×).
+    private var zoomControl: some View {
+        let scale = model.videoZoomScale
+        return HStack(spacing: 6) {
+            Button { model.stepVideoZoom(by: -0.25) } label: {
+                Image(systemName: "minus.magnifyingglass")
+            }
+            .buttonStyle(.plain)
+            .disabled(scale <= SPPWViewZoom.minimumScale + 0.001)
+            .help(SPPWLocalization.tr("zoom.out_help"))
+
+            Button { model.resetVideoZoom() } label: {
+                Text(String(format: "%.1f×", scale))
+                    .monospacedDigit()
+                    .frame(minWidth: 30)
+            }
+            .buttonStyle(.plain)
+            .help(SPPWLocalization.tr("zoom.reset_help"))
+
+            Button { model.stepVideoZoom(by: 0.25) } label: {
+                Image(systemName: "plus.magnifyingglass")
+            }
+            .buttonStyle(.plain)
+            .disabled(scale >= SPPWViewZoom.maximumScale - 0.001)
+            .help(SPPWLocalization.tr("zoom.in_help"))
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(scale > 1.001 ? .cyan : .white)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.65), in: Capsule())
     }
 
     private var eventLog: some View {
@@ -797,13 +912,12 @@ final class FullscreenExitChordMonitor: ObservableObject {
     private var monitor: Any?
     private var detector = SPPWModifierChordDetector(required: [.control, .option])
 
-    func start(onExit: @escaping @MainActor () -> Void, onPointerNearTop: @escaping @MainActor () -> Void) {
+    func start(onExit: @escaping @MainActor () -> Void) {
         stop()
         detector.reset()
         let mask: NSEvent.EventTypeMask = [
             .flagsChanged, .keyDown,
             .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
-            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
         ]
         monitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
             guard let self else { return event }
@@ -815,19 +929,11 @@ final class FullscreenExitChordMonitor: ObservableObject {
                     // Let Control/Option reach the remote first, then leave fullscreen.
                     DispatchQueue.main.async { onExit() }
                 }
-            case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-                if Self.isNearTopEdge(event) { onPointerNearTop() }
             default:
                 self.detector.otherInput()
             }
             return event
         }
-    }
-
-    /// True when the pointer is in the top strip of the event's window.
-    private static func isNearTopEdge(_ event: NSEvent) -> Bool {
-        guard let height = event.window?.contentView?.bounds.height else { return false }
-        return height - event.locationInWindow.y <= ReceiverContentView.fullscreenRevealBandHeight
     }
 
     func stop() {

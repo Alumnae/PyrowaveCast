@@ -250,6 +250,8 @@ final class IOSReceiverModel: ObservableObject {
     private var lastResyncAt: PyrowaveClock.Instant?
     private var lastFrameID: UInt32 = 0
     private var hasReceivedFrame = false
+    /// When the receiver started waiting for a first frame (server hello or resync).
+    private var frameWaitStartedAt: PyrowaveClock.Instant?
     private var lastDecodeErrorLogged = ""
     private var localCompleteFrames = 0
     private var localDecodedFrames = 0
@@ -726,6 +728,7 @@ final class IOSReceiverModel: ObservableObject {
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
+        frameWaitStartedAt = nil
         lastDecodeErrorLogged = ""
         localCompleteFrames = 0
         localDecodedFrames = 0
@@ -746,7 +749,11 @@ final class IOSReceiverModel: ObservableObject {
         byteWindowStartNanos = nowNanos
         lastStatFlushNanos = nowNanos
         assemblyLock.unlock()
-        currentPixelBuffer = nil
+        if clearAutoReconnect {
+            currentPixelBuffer = nil
+        }
+        // During an automatic reconnect the last picture stays (frozen) until the
+        // new session delivers a frame, instead of flashing to black.
         let activeDecoder = decoder
         Task { await activeDecoder?.reset() }
     }
@@ -785,6 +792,53 @@ final class IOSReceiverModel: ObservableObject {
         guard hidden != remoteCursorHidden else { return }
         remoteCursorHidden = hidden
         sendInputEvent(.cursorVisibility(hidden: hidden))
+    }
+
+    // MARK: Receiver-drawn pointer
+
+    /// Pointer drawn by the fullscreen view and sent to the Mac as absolute positions, so it
+    /// shows exactly where the Mac clicks with no video delay (the Mac cursor stays out of
+    /// the video). Starts in the middle of the remote screen.
+    private(set) var localPointer = SPPWLocalPointer()
+    /// Fires on every pointer change; not `@Published`, so SwiftUI does not re-render at 120 Hz.
+    let localPointerSubject = PassthroughSubject<SPPWLocalPointer, Never>()
+    /// Size of the displayed (unzoomed) video in its own axes, set by the fullscreen view on
+    /// layout. Relative motion is measured against it.
+    var pointerViewport: (width: Double, height: Double)?
+
+    /// Default trackpad gain (`SPPWPointerAcceleration` at speed 5, slow moves): divided out so
+    /// a slow swipe across the shown picture crosses the remote screen once at the default speed.
+    private static let pointerGainReference = 1.85
+
+    /// Relative motion (trackpad swipe, iPad mouse), already rotated into the video's axes
+    /// and accelerated: moves the local pointer and the Mac's.
+    func moveLocalPointer(videoDX: Double, videoDY: Double) {
+        guard let viewport = pointerViewport else { return }
+        var pointer = localPointer
+        pointer.move(
+            videoDX: videoDX / Self.pointerGainReference,
+            videoDY: videoDY / Self.pointerGainReference,
+            displayedVideoWidth: viewport.width,
+            displayedVideoHeight: viewport.height
+        )
+        guard pointer != localPointer else { return }
+        localPointer = pointer
+        sendInputEvent(pointer.moveEvent)
+        localPointerSubject.send(pointer)
+    }
+
+    /// Direct touch: the finger is the pointer (the touch event itself moves the Mac's).
+    func placeLocalPointer(normalizedX: Double, normalizedY: Double) {
+        let pointer = SPPWLocalPointer(normalizedX: normalizedX, normalizedY: normalizedY)
+        guard pointer != localPointer else { return }
+        localPointer = pointer
+        localPointerSubject.send(pointer)
+    }
+
+    /// Sends the local pointer's position before a click at the cursor, so a lost motion
+    /// datagram can never make the click land somewhere else than where the pointer is drawn.
+    func syncLocalPointerToRemote() {
+        sendInputEvent(localPointer.moveEvent)
     }
 
     /// Committed keyboard text (after IME composition) with the sticky modifiers applied once.
@@ -1057,6 +1111,7 @@ final class IOSReceiverModel: ObservableObject {
             state = .waiting
             lastFrameID = 0
             hasReceivedFrame = false
+            frameWaitStartedAt = PyrowaveClock.now
             lastDecodeErrorLogged = ""
             var parsedMediaID: UInt32 = 0
             if payload.count >= 4 {
@@ -1228,7 +1283,7 @@ final class IOSReceiverModel: ObservableObject {
         assemblyLock.lock()
         let maxAge = adaptiveBuffer.maxAcceptableAgeMs
         assemblyLock.unlock()
-        guard decoded.ageMilliseconds <= maxAge else {
+        guard decoded.ageMilliseconds <= maxAge || !decoded.isSuperseded else {
             localDroppedFrames += 1
             return
         }
@@ -1329,9 +1384,12 @@ final class IOSReceiverModel: ObservableObject {
                 }
 
                 guard self.mediaStreamID > 0, !self.isResynchronizing else { continue }
-                guard let reference = self.lastGoodFrameAt else { continue }
-                if reference.duration(to: PyrowaveClock.now) > .seconds(2) {
-                    self.requestLiveResync(reason: "No fresh frame for 2 s")
+                // A stream that never showed its first frame (lost, or a slow start at a
+                // high resolution) also asks for the live edge, after a longer grace period.
+                guard let reference = self.lastGoodFrameAt ?? self.frameWaitStartedAt else { continue }
+                let freshFrameLimit: PyrowaveDuration = self.lastGoodFrameAt != nil ? .seconds(2) : .seconds(4)
+                if reference.duration(to: PyrowaveClock.now) > freshFrameLimit {
+                    self.requestLiveResync(reason: "No fresh frame; requesting live edge")
                 }
             }
         }
@@ -1537,7 +1595,9 @@ final class IOSReceiverModel: ObservableObject {
         isResynchronizing = true
         resyncStartedAt = now
         lastGoodFrameAt = nil
-        currentPixelBuffer = nil
+        // Keep the last picture on screen (frozen) instead of flashing to black: the
+        // server answers with a fresh frame, usually within a few hundred ms.
+        frameWaitStartedAt = now
         state = .waiting
         assemblyLock.lock()
         assembler.reset()
