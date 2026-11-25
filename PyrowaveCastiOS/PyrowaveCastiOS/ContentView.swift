@@ -67,6 +67,16 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        model.setSecurityPolling(true)
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        model.setSecurityPolling(false)
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = SPPWLocalization.tr("server.title")
@@ -157,6 +167,7 @@ final class IOSServerViewController: UIViewController, UIDocumentPickerDelegate,
 
         contentStack.addArrangedSubview(makeStatusSection())
         contentStack.addArrangedSubview(makeSourceSection())
+        contentStack.addArrangedSubview(card(makeIOSHostedView(IOSServerSecurityPanel(model: model), parent: self)))
         contentStack.addArrangedSubview(makePreviewSection())
         contentStack.addArrangedSubview(makeLogSection())
     }

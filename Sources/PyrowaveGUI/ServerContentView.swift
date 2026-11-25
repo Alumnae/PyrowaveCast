@@ -7,13 +7,22 @@ public struct ServerContentView: View {
     @State private var showAccessibilityPermissionGuide = true
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
 
-    public init() {}
+    /// The unified app has one language picker in its sidebar, so it hides this one.
+    private let showsLanguagePicker: Bool
+
+    public init(showsLanguagePicker: Bool = true) {
+        self.showsLanguagePicker = showsLanguagePicker
+    }
 
     public var body: some View {
         let _ = selectedLanguageRaw
         VStack(spacing: 0) {
             statusBar
             Divider()
+            if let prompt = model.pairingPIN {
+                pairingPINBanner(prompt)
+                Divider()
+            }
 
             HSplitView {
                 settings
@@ -28,6 +37,40 @@ public struct ServerContentView: View {
                 .frame(height: 190)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: - Pairing PIN
+
+    private func pairingPINBanner(_ prompt: SPPWPairingPINPrompt) -> some View {
+        HStack(spacing: 18) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 30))
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(SPPWLocalization.tr("security.pin.title"))
+                    .font(.headline)
+                Text(SPPWLocalization.tr("security.pin.subtitle_fmt", prompt.clientName, prompt.clientFingerprint.short))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let left = max(0, Int(prompt.expiresAt.timeIntervalSince(context.date).rounded(.up)))
+                    Text(SPPWLocalization.tr("security.pin.expires_fmt", left))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Text(prompt.pin)
+                .font(.system(size: 44, weight: .bold, design: .monospaced))
+                .kerning(8)
+                .textSelection(.enabled)
+            Button(SPPWLocalization.tr("security.pin.dismiss")) {
+                model.dismissPairingPIN()
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(Color.accentColor.opacity(0.12))
     }
 
     // MARK: - Status bar
@@ -107,6 +150,7 @@ public struct ServerContentView: View {
                 Text(SPPWLocalization.tr("tab.settings"))
                     .font(.title3.weight(.semibold))
 
+                if showsLanguagePicker {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(SPPWLocalization.tr("settings.language"))
                         .font(.caption)
@@ -124,6 +168,7 @@ public struct ServerContentView: View {
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
+                }
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -233,9 +278,20 @@ public struct ServerContentView: View {
                         .help(SPPWLocalization.tr("server.chroma444.help"))
                         .disabled(model.isRunning)
 
-                    Toggle(SPPWLocalization.tr("server.remote_control"), isOn: $model.remoteControlEnabled)
-                        .font(.subheadline)
-                        .help(SPPWLocalization.tr("server.remote_control.help"))
+                    if SPPWDistribution.allowsRemoteInputInjection {
+                        Toggle(SPPWLocalization.tr("server.remote_control"), isOn: $model.remoteControlEnabled)
+                            .font(.subheadline)
+                            .help(SPPWLocalization.tr("server.remote_control.help"))
+                    } else {
+                        // Mac App Store build: only clipboard sync is available.
+                        Toggle(SPPWLocalization.tr("server.clipboard_sync_store"), isOn: $model.remoteControlEnabled)
+                            .font(.subheadline)
+                            .help(SPPWLocalization.tr("server.remote_control_store_unavailable"))
+                        Text(SPPWLocalization.tr("server.remote_control_store_unavailable"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 if model.mode == .screen {
@@ -274,6 +330,10 @@ public struct ServerContentView: View {
                 Toggle(SPPWLocalization.tr("server.client_preview"), isOn: $model.previewEnabled)
                     .font(.subheadline)
 
+                ServerSecuritySection(model: model)
+
+                FileTransfersView()
+
                 HStack(spacing: 10) {
                     if model.isRunning {
                         Button(role: .destructive) {
@@ -297,7 +357,7 @@ public struct ServerContentView: View {
 
                 if model.mode == .screen {
                     screenCaptureGuidanceCard
-                    if model.remoteControlEnabled {
+                    if model.remoteControlEnabled && SPPWDistribution.allowsRemoteInputInjection {
                         accessibilityGuidanceCard
                     }
                 } else {
@@ -318,16 +378,16 @@ public struct ServerContentView: View {
             model.refreshScreenRecordingPermission()
             model.refreshAccessibilityPermission()
             showScreenPermissionGuide = !model.hasScreenRecordingPermission
-            showAccessibilityPermissionGuide = !model.hasAccessibilityPermission
+            showAccessibilityPermissionGuide = SPPWDistribution.allowsRemoteInputInjection && !model.hasAccessibilityPermission
         }
         .onChange(of: model.hasScreenRecordingPermission) { _, granted in
             if !granted { showScreenPermissionGuide = true }
         }
         .onChange(of: model.hasAccessibilityPermission) { _, granted in
-            showAccessibilityPermissionGuide = !granted
+            showAccessibilityPermissionGuide = SPPWDistribution.allowsRemoteInputInjection && !granted
         }
         .onChange(of: model.remoteControlEnabled) { _, enabled in
-            if enabled {
+            if enabled && SPPWDistribution.allowsRemoteInputInjection {
                 model.refreshAccessibilityPermission()
                 if !model.hasAccessibilityPermission {
                     showAccessibilityPermissionGuide = true
@@ -665,5 +725,93 @@ public struct ServerContentView: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+}
+
+
+// MARK: - Security settings
+
+/// Encryption toggle, pairing mode, headless password, fingerprint and paired receivers.
+struct ServerSecuritySection: View {
+    @ObservedObject var model: ServerModel
+    @State private var newPassword = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(SPPWLocalization.tr("security.section"))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Toggle(SPPWLocalization.tr("security.encryption"), isOn: $model.encryptionEnabled)
+                .font(.subheadline)
+                .help(SPPWLocalization.tr("security.encryption.help"))
+            if model.encryptionEnabled {
+                Picker(SPPWLocalization.tr("security.pairing_mode"), selection: $model.pairingMode) {
+                    Text(SPPWLocalization.tr("security.mode.pin")).tag(SPPWPairingMode.pin)
+                    Text(SPPWLocalization.tr("security.mode.password")).tag(SPPWPairingMode.password)
+                    Text(SPPWLocalization.tr("security.mode.open")).tag(SPPWPairingMode.open)
+                }
+                .pickerStyle(.segmented)
+                .font(.subheadline)
+                Text(modeHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if model.pairingMode == .password {
+                    HStack {
+                        SecureField(SPPWLocalization.tr("security.password.placeholder"), text: $newPassword)
+                            .textFieldStyle(.roundedBorder)
+                        Button(SPPWLocalization.tr("security.password.save")) {
+                            model.setPairingPassword(newPassword)
+                            newPassword = ""
+                        }
+                        .disabled(newPassword.isEmpty)
+                    }
+                    Label(
+                        SPPWLocalization.tr(model.hasPairingPassword ? "security.password.set" : "security.password.missing"),
+                        systemImage: model.hasPairingPassword ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(model.hasPairingPassword ? Color.green : Color.orange)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(SPPWLocalization.tr("security.fingerprint_this"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(model.serverFingerprint)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+                DisclosureGroup(SPPWLocalization.tr("security.paired_clients_fmt", model.pairedClients.count)) {
+                    if model.pairedClients.isEmpty {
+                        Text(SPPWLocalization.tr("security.none_paired"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.pairedClients) { peer in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(peer.name).font(.caption)
+                                Text(peer.fingerprint.short).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(SPPWLocalization.tr("security.forget"), role: .destructive) {
+                                model.forgetPairedClient(peer)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                        }
+                    }
+                }
+                .font(.subheadline)
+            }
+        }
+    }
+
+    private var modeHelp: String {
+        switch model.pairingMode {
+        case .pin: SPPWLocalization.tr("security.mode.pin.help")
+        case .password: SPPWLocalization.tr("security.mode.password.help")
+        case .open: SPPWLocalization.tr("security.mode.open.help")
+        }
     }
 }

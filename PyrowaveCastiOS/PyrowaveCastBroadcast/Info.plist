@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.6.10</string>
+	<string>0.6.19</string>
 	<key>CFBundleVersion</key>
-	<string>610</string>
+	<string>619</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_pyrowavecast._udp</string>
@@ -37,8 +37,8 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>PyrowaveCast uses the local network to stream the screen to receivers over UDP.</string>
 	<key>PyrowaveBuildVersion</key>
-	<string>v0.6.10 (build 610, 345f619)</string>
+	<string>v0.6.19 (build 619, 1f7c373)</string>
 	<key>PyrowaveGitCommit</key>
-	<string>345f619</string>
+	<string>1f7c373</string>
 </dict>
 </plist>

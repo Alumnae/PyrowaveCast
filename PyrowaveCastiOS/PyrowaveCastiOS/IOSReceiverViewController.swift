@@ -95,8 +95,28 @@ final class IOSReceiverViewController: UIViewController {
                 self.refreshUI()
             }
             .store(in: &cancellables)
+        model.$pairingRequest
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] request in self?.showPairingPrompt(request) }
+            .store(in: &cancellables)
         refreshUI()
         renderInlineVideo(model.currentPixelBuffer)
+    }
+
+    private weak var pairingAlert: UIAlertController?
+
+    /// Asks for the server's PIN or password over whatever is on screen (also the fullscreen video).
+    private func showPairingPrompt(_ request: SPPWPairingRequest?) {
+        if let pairingAlert {
+            pairingAlert.dismiss(animated: false)
+            self.pairingAlert = nil
+        }
+        guard let request else { return }
+        var presenter: UIViewController = view.window?.rootViewController ?? self
+        while let next = presenter.presentedViewController { presenter = next }
+        let alert = model.makePairingAlert(request)
+        pairingAlert = alert
+        presenter.present(alert, animated: true)
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -778,25 +798,33 @@ final class IOSFullscreenVideoViewController: UIViewController {
     private let closeButton = UIButton(type: .system)
     private let orientationToolbar = UIStackView()
     private let statsBadge = UILabel()
-    private var hudVisible = true
+    /// Whether the controls menu (opened from the floating button) is shown.
+    private var hudVisible = false
     private var hudHideTask: Task<Void, Never>?
+    /// Floating logo button (as on macOS): drag to move, tap for the controls menu.
+    private let controlPuck = IOSControlPuckView()
+    /// The controls menu next to the button: orientation and zoom, the remote-control dock
+    /// and exit fullscreen.
+    private let menuCard = UIView()
+    private let menuStack = UIStackView()
+    private var puckCenterX: NSLayoutConstraint?
+    private var puckCenterY: NSLayoutConstraint?
+    private var menuBelowPuck: NSLayoutConstraint?
+    private var menuAbovePuck: NSLayoutConstraint?
+    private var puckDragOrigin: CGPoint?
+    /// Button position as fractions (0…1) of the free area inside the safe area.
+    private var puckFractionX: CGFloat = {
+        CGFloat(UserDefaults.standard.object(forKey: "iosReceiverControlPuckX") as? Double ?? 0.5)
+    }()
+    private var puckFractionY: CGFloat = {
+        CGFloat(UserDefaults.standard.object(forKey: "iosReceiverControlPuckY") as? Double ?? 0)
+    }()
 
     // Remote control (keyboard, mouse, clipboard → Mac)
     private let touchInputView = IOSTouchInputView()
     /// Receiver-drawn pointer at the Mac's click position (the Mac cursor is left out of the video).
     private let pointerView = IOSLocalPointerView()
-    private lazy var pasteControl: UIPasteControl = {
-        var config = UIPasteControl.Configuration()
-        config.displayMode = .iconOnly
-        config.cornerStyle = .capsule
-        config.baseBackgroundColor = IOSRemoteStyle.buttonBackground
-        config.baseForegroundColor = .white
-        let control = UIPasteControl(configuration: config)
-        control.target = self
-        return control
-    }()
-    private lazy var dock = IOSRemoteInputDock(pasteControl: pasteControl)
-    private let showControlsButton = UIButton(type: .system)
+    private let dock = IOSRemoteInputDock()
     private let specialKeysPanel = IOSSpecialKeysPanel()
     private let keyboardField = IOSRemoteKeyboardField()
     private let compositionLabel = IOSPaddedLabel()
@@ -808,6 +836,9 @@ final class IOSFullscreenVideoViewController: UIViewController {
     private var dockBottomToKeyboard: NSLayoutConstraint?
     private var dockBottomToPanel: NSLayoutConstraint?
     private var hintHideTask: Task<Void, Never>?
+    /// Bottom edges of the video and touch surface: raised above the keyboard in landscape.
+    private var videoBottomConstraint: NSLayoutConstraint?
+    private var touchBottomConstraint: NSLayoutConstraint?
 
     init(model: IOSReceiverModel, onDismiss: @escaping () -> Void) {
         self.model = model
@@ -940,7 +971,6 @@ final class IOSFullscreenVideoViewController: UIViewController {
             videoSurfaceView.topAnchor.constraint(equalTo: view.topAnchor),
             videoSurfaceView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             videoSurfaceView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            videoSurfaceView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             placeholderLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             placeholderLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
@@ -955,12 +985,6 @@ final class IOSFullscreenVideoViewController: UIViewController {
             hudContainer.trailingAnchor.constraint(equalTo: controlsOverlay.trailingAnchor),
             hudContainer.bottomAnchor.constraint(equalTo: controlsOverlay.bottomAnchor),
 
-            orientationToolbar.topAnchor.constraint(equalTo: overlaySafe.topAnchor, constant: 12),
-            orientationToolbar.leadingAnchor.constraint(equalTo: overlaySafe.leadingAnchor, constant: 16),
-
-            closeButton.topAnchor.constraint(equalTo: overlaySafe.topAnchor, constant: 12),
-            closeButton.trailingAnchor.constraint(equalTo: overlaySafe.trailingAnchor, constant: -16),
-
             statsBadge.leadingAnchor.constraint(equalTo: overlaySafe.leadingAnchor, constant: 16),
             statsBadge.bottomAnchor.constraint(equalTo: overlaySafe.bottomAnchor, constant: -16),
             statsBadge.heightAnchor.constraint(equalToConstant: 28)
@@ -969,13 +993,14 @@ final class IOSFullscreenVideoViewController: UIViewController {
         NSLayoutConstraint.activate([
             touchInputView.topAnchor.constraint(equalTo: view.topAnchor),
             touchInputView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            touchInputView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            touchInputView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            touchInputView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
+        let videoBottom = videoSurfaceView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        let touchBottom = touchInputView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        NSLayoutConstraint.activate([videoBottom, touchBottom])
+        videoBottomConstraint = videoBottom
+        touchBottomConstraint = touchBottom
         // The HUD container covers the screen; touches outside its controls reach the touch surface.
-        pasteConfiguration = UIPasteConfiguration(acceptableTypeIdentifiers: [
-            UTType.plainText.identifier, UTType.text.identifier, UTType.image.identifier
-        ])
         buildRemoteControls()
 
         model.pixelBufferSubject
@@ -996,6 +1021,7 @@ final class IOSFullscreenVideoViewController: UIViewController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.refreshStatsBadge()
+                self?.syncZoomContentSize()
                 self?.updateLocalPointer()
             }
             .store(in: &cancellables)
@@ -1003,6 +1029,11 @@ final class IOSFullscreenVideoViewController: UIViewController {
         model.localPointerSubject
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateLocalPointer() }
+            .store(in: &cancellables)
+
+        model.relativePointerMoveSubject
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.followPointerIfZoomed() }
             .store(in: &cancellables)
 
         model.$stickyModifiers
@@ -1083,6 +1114,37 @@ final class IOSFullscreenVideoViewController: UIViewController {
         pointerView.isHidden = false
     }
 
+
+    /// Content (unzoomed) position of the pointer after the last follow: the direction of the
+    /// next relative move is measured from it, unaffected by zoom changes in between.
+    private var lastFollowContent: (x: Double, y: Double)?
+
+    /// Zoomed above 1.1× (portrait and landscape): once a trackpad swipe or mouse brings the pointer to the
+    /// middle of the view, the pointer stays there and the picture pans under it (Remotix-style).
+    /// At the picture's edges the pan stops and the pointer moves on to the remote screen's edge.
+    private func followPointerIfZoomed() {
+        var zoom = touchInputView.zoom
+        let bounds = touchInputView.bounds
+        let width = Double(bounds.width)
+        let height = Double(bounds.height)
+        guard !pointerView.isHidden, width > 0, height > 0 else { return }
+        let tip = pointerView.tipPosition
+        let content = zoom.contentPoint(viewX: Double(tip.x), viewY: Double(tip.y), viewWidth: width, viewHeight: height)
+        let previous = lastFollowContent
+        lastFollowContent = content
+        guard zoom.scale > SPPWViewZoom.pointerFollowMinimumScale, let previous else { return }
+        guard zoom.followCentered(
+            viewX: Double(tip.x),
+            viewY: Double(tip.y),
+            motionX: content.x - previous.x,
+            motionY: content.y - previous.y,
+            viewWidth: width,
+            viewHeight: height
+        ) else { return }
+        touchInputView.zoom = zoom
+        applyZoom(zoom)
+    }
+
     // MARK: Remote control
 
     private func buildRemoteControls() {
@@ -1101,20 +1163,33 @@ final class IOSFullscreenVideoViewController: UIViewController {
 
         dock.translatesAutoresizingMaskIntoConstraints = false
         dock.onAction = { [weak self] action in self?.handleDockAction(action) }
-        hudContainer.addSubview(dock)
 
-        var showConfig = UIButton.Configuration.filled()
-        showConfig.image = UIImage(systemName: "chevron.up")
-        showConfig.cornerStyle = .capsule
-        showConfig.baseBackgroundColor = IOSRemoteStyle.dockBackground
-        showConfig.baseForegroundColor = .white
-        showControlsButton.configuration = showConfig
-        showControlsButton.accessibilityLabel = SPPWLocalization.tr("remote.dock.show")
-        showControlsButton.translatesAutoresizingMaskIntoConstraints = false
-        showControlsButton.alpha = 0
-        showControlsButton.isHidden = true
-        showControlsButton.addAction(UIAction { [weak self] _ in self?.setControlsVisible(true) }, for: .touchUpInside)
-        controlsOverlay.addSubview(showControlsButton)
+        // Controls menu: orientation/zoom, the dock, exit fullscreen, next to the floating button.
+        menuCard.translatesAutoresizingMaskIntoConstraints = false
+        menuCard.backgroundColor = IOSRemoteStyle.sheetBackground
+        menuCard.layer.cornerRadius = 20
+        menuCard.layer.cornerCurve = .continuous
+        menuCard.layer.borderWidth = 1
+        menuCard.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+        menuStack.translatesAutoresizingMaskIntoConstraints = false
+        menuStack.axis = .vertical
+        menuStack.alignment = .center
+        menuStack.spacing = 10
+        orientationToolbar.removeFromSuperview()
+        closeButton.removeFromSuperview()
+        menuStack.addArrangedSubview(orientationToolbar)
+        menuStack.addArrangedSubview(dock)
+        menuStack.addArrangedSubview(closeButton)
+        menuCard.addSubview(menuStack)
+        hudContainer.addSubview(menuCard)
+
+        controlPuck.translatesAutoresizingMaskIntoConstraints = false
+        controlPuck.onTap = { [weak self] in
+            guard let self else { return }
+            self.setControlsVisible(!self.hudVisible)
+        }
+        controlPuck.onDrag = { [weak self] translation in self?.dragPuck(translation) }
+        controlsOverlay.addSubview(controlPuck)
 
         for label in [compositionLabel, hintLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -1147,10 +1222,24 @@ final class IOSFullscreenVideoViewController: UIViewController {
         // The overlay already ends at the keyboard, so its safe bottom is the keyboard's top.
         let keyboardTop = overlaySafe.bottomAnchor
         let safe = overlaySafe
-        let toKeyboard = dock.bottomAnchor.constraint(equalTo: keyboardTop, constant: -12)
-        let toPanel = dock.bottomAnchor.constraint(equalTo: specialKeysPanel.topAnchor, constant: -8)
+        // The menu stays above the keyboard, and above the special keys while they are shown.
+        let toKeyboard = menuCard.bottomAnchor.constraint(lessThanOrEqualTo: keyboardTop, constant: -8)
+        let toPanel = menuCard.bottomAnchor.constraint(lessThanOrEqualTo: specialKeysPanel.topAnchor, constant: -8)
         dockBottomToKeyboard = toKeyboard
         dockBottomToPanel = toPanel
+        let puckX = controlPuck.centerXAnchor.constraint(equalTo: safe.leadingAnchor, constant: 40)
+        let puckY = controlPuck.centerYAnchor.constraint(equalTo: safe.topAnchor, constant: 40)
+        puckCenterX = puckX
+        puckCenterY = puckY
+        let below = menuCard.topAnchor.constraint(equalTo: controlPuck.bottomAnchor, constant: 8)
+        let above = menuCard.bottomAnchor.constraint(equalTo: controlPuck.topAnchor, constant: -8)
+        below.priority = .defaultHigh
+        above.priority = .defaultHigh
+        menuBelowPuck = below
+        menuAbovePuck = above
+        let menuCenter = menuCard.centerXAnchor.constraint(equalTo: controlPuck.centerXAnchor)
+        menuCenter.priority = .defaultHigh
+        let dockFit = dock.widthAnchor.constraint(lessThanOrEqualTo: menuStack.widthAnchor)
         NSLayoutConstraint.activate([
             keyboardField.widthAnchor.constraint(equalToConstant: 1),
             keyboardField.heightAnchor.constraint(equalToConstant: 1),
@@ -1163,23 +1252,33 @@ final class IOSFullscreenVideoViewController: UIViewController {
             specialKeysPanel.heightAnchor.constraint(lessThanOrEqualTo: controlsOverlay.heightAnchor, multiplier: 0.6),
 
             toKeyboard,
-            dock.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
-            dock.leadingAnchor.constraint(greaterThanOrEqualTo: safe.leadingAnchor, constant: 12),
-            dock.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -12),
-
-            showControlsButton.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
-            showControlsButton.bottomAnchor.constraint(equalTo: keyboardTop, constant: -12),
-            showControlsButton.widthAnchor.constraint(equalToConstant: 44),
-            showControlsButton.heightAnchor.constraint(equalToConstant: 30),
+            puckX,
+            puckY,
+            below,
+            menuCenter,
+            dockFit,
+            menuCard.leadingAnchor.constraint(greaterThanOrEqualTo: safe.leadingAnchor, constant: 8),
+            menuCard.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -8),
+            menuCard.topAnchor.constraint(greaterThanOrEqualTo: safe.topAnchor, constant: 4),
+            menuStack.topAnchor.constraint(equalTo: menuCard.topAnchor, constant: 10),
+            menuStack.bottomAnchor.constraint(equalTo: menuCard.bottomAnchor, constant: -10),
+            menuStack.leadingAnchor.constraint(equalTo: menuCard.leadingAnchor, constant: 10),
+            menuStack.trailingAnchor.constraint(equalTo: menuCard.trailingAnchor, constant: -10),
 
             compositionLabel.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
-            compositionLabel.bottomAnchor.constraint(equalTo: dock.topAnchor, constant: -8),
+            compositionLabel.bottomAnchor.constraint(lessThanOrEqualTo: keyboardTop, constant: -16),
             compositionLabel.widthAnchor.constraint(lessThanOrEqualTo: safe.widthAnchor, constant: -32),
 
             hintLabel.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
-            hintLabel.bottomAnchor.constraint(equalTo: dock.topAnchor, constant: -10),
+            hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: keyboardTop, constant: -16),
             hintLabel.widthAnchor.constraint(lessThanOrEqualTo: safe.widthAnchor, constant: -32)
         ])
+        for label in [compositionLabel, hintLabel] {
+            let rest = label.bottomAnchor.constraint(equalTo: keyboardTop, constant: -16)
+            rest.priority = .defaultLow
+            rest.isActive = true
+        }
+        hudContainer.alpha = 0
     }
 
     private func handleDockAction(_ action: IOSRemoteInputDock.Action) {
@@ -1245,24 +1344,79 @@ final class IOSFullscreenVideoViewController: UIViewController {
         refreshDock()
     }
 
-    /// Dock, top buttons and stats come and go together (dock chevron, handle, three-finger tap).
+    /// Opens or closes the controls menu and the stats (floating button, dock close button,
+    /// three-finger tap). The system keyboard is left as it is.
     private func setControlsVisible(_ visible: Bool) {
         hudVisible = visible
         if !visible {
+            // The system keyboard stays up: only its dock icon (or its own hide key) closes it.
             setSpecialKeysVisible(false)
-            if keyboardField.isFirstResponder {
-                keyboardField.resignFirstResponder()
-                becomeFirstResponder()
-            }
         }
-        showControlsButton.isHidden = false
+        controlPuck.isActive = visible
+        if visible { placeMenuNextToPuck() }
         UIView.animate(withDuration: 0.2) {
             self.hudContainer.alpha = visible ? 1 : 0
-            self.showControlsButton.alpha = visible ? 0 : 1
-        } completion: { _ in
-            self.showControlsButton.isHidden = self.hudVisible
         }
         refreshDock()
+    }
+
+    // MARK: Floating control button
+
+    /// Free area for the button's center inside the overlay's safe area.
+    private func puckTravel() -> (origin: CGPoint, size: CGSize) {
+        let safe = overlaySafe.layoutFrame
+        let half = IOSControlPuckView.size / 2 + 10
+        return (
+            CGPoint(x: half, y: half),
+            CGSize(width: max(0, safe.width - 2 * half), height: max(0, safe.height - 2 * half))
+        )
+    }
+
+    /// Places the button from its stored fractions (plus a drag in progress).
+    private func positionPuck(dragTranslation: CGPoint = .zero) {
+        let travel = puckTravel()
+        let x = travel.origin.x + travel.size.width * puckFractionX + dragTranslation.x
+        let y = travel.origin.y + travel.size.height * puckFractionY + dragTranslation.y
+        if let puckCenterX { Self.setConstant(puckCenterX, min(max(x, travel.origin.x), travel.origin.x + travel.size.width)) }
+        if let puckCenterY { Self.setConstant(puckCenterY, min(max(y, travel.origin.y), travel.origin.y + travel.size.height)) }
+        placeMenuNextToPuck()
+    }
+
+    /// Writes a constant only when it changes, so layout passes do not schedule new ones.
+    private static func setConstant(_ constraint: NSLayoutConstraint, _ value: CGFloat) {
+        if abs(constraint.constant - value) > 0.25 { constraint.constant = value }
+    }
+
+    private static func sameTransform(_ a: CGAffineTransform, _ b: CGAffineTransform) -> Bool {
+        abs(a.a - b.a) < 1e-6 && abs(a.b - b.b) < 1e-6 && abs(a.c - b.c) < 1e-6
+            && abs(a.d - b.d) < 1e-6 && abs(a.tx - b.tx) < 1e-3 && abs(a.ty - b.ty) < 1e-3
+    }
+
+    /// The menu opens below the button in the upper half of the screen, above it in the lower half.
+    private func placeMenuNextToPuck() {
+        let travel = puckTravel()
+        let lowerHalf = (puckCenterY?.constant ?? 0) > travel.origin.y + travel.size.height * 0.5
+        if menuBelowPuck?.isActive == lowerHalf { menuBelowPuck?.isActive = !lowerHalf }
+        if menuAbovePuck?.isActive != lowerHalf { menuAbovePuck?.isActive = lowerHalf }
+    }
+
+    private func dragPuck(_ translation: CGPoint?) {
+        guard let translation else {
+            // Drag ended: keep the new place as fractions, so it survives rotation.
+            let travel = puckTravel()
+            if travel.size.width > 0 {
+                puckFractionX = min(max(((puckCenterX?.constant ?? 0) - travel.origin.x) / travel.size.width, 0), 1)
+            }
+            if travel.size.height > 0 {
+                puckFractionY = min(max(((puckCenterY?.constant ?? 0) - travel.origin.y) / travel.size.height, 0), 1)
+            }
+            UserDefaults.standard.set(Double(puckFractionX), forKey: "iosReceiverControlPuckX")
+            UserDefaults.standard.set(Double(puckFractionY), forKey: "iosReceiverControlPuckY")
+            positionPuck()
+            return
+        }
+        positionPuck(dragTranslation: translation)
+        controlsOverlay.layoutIfNeeded()
     }
 
     private func showComposition(_ marked: String?) {
@@ -1331,16 +1485,6 @@ final class IOSFullscreenVideoViewController: UIViewController {
         pressesEnded(presses, with: event)
     }
 
-    // MARK: Clipboard (iPhone → Mac on an explicit paste)
-
-    override func paste(itemProviders: [NSItemProvider]) {
-        Task { @MainActor [weak self] in
-            guard let content = await IOSClipboardBridge.content(from: itemProviders) else { return }
-            self?.model.sendClipboardToHost(content)
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-        }
-    }
-
     func syncVideoOrientation(_ orientation: SPPWVideoOrientation) {
         if videoSurfaceView.videoOrientation != orientation {
             videoSurfaceView.videoOrientation = orientation
@@ -1348,6 +1492,7 @@ final class IOSFullscreenVideoViewController: UIViewController {
         guard isViewLoaded, controlsOverlay.bounds.width > 0 else { return }
         UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState]) {
             self.layoutControlsOverlay()
+            self.syncZoomContentSize(orientation: orientation)
             self.updateLocalPointer()
         }
     }
@@ -1356,13 +1501,35 @@ final class IOSFullscreenVideoViewController: UIViewController {
         super.viewDidLayoutSubviews()
         layoutControlsOverlay()
         updateLocalPointer()
-        // Size changed (device rotation): keep the zoomed picture covering the screen.
-        var zoom = touchInputView.zoom
-        zoom.clampOffset(viewWidth: Double(view.bounds.width), viewHeight: Double(view.bounds.height))
-        if zoom != touchInputView.zoom {
-            touchInputView.zoom = zoom
-            applyZoom(zoom)
+        // Size changed (device rotation, keyboard): keep the zoomed picture covering the surface.
+        syncZoomContentSize()
+    }
+
+    /// Tells the zoom where the aspect-fit picture is (portrait shows a landscape Mac as a band),
+    /// so panning, pinching and the centered pointer stop at the picture's own edges.
+    private func syncZoomContentSize(orientation: SPPWVideoOrientation? = nil) {
+        let bounds = touchInputView.bounds
+        let stats = model.statistics
+        let orientation = orientation ?? model.videoOrientation
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        var width = 0.0
+        var height = 0.0
+        if stats.frameWidth > 0, stats.frameHeight > 0,
+           let size = SPPWLocalPointer.displayedVideoSize(
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height),
+            videoWidth: Double(stats.frameWidth),
+            videoHeight: Double(stats.frameHeight),
+            orientation: orientation
+           ) {
+            width = orientation.swapsDimensions ? size.height : size.width
+            height = orientation.swapsDimensions ? size.width : size.height
         }
+        var zoom = touchInputView.zoom
+        zoom.setContentSize(width: width, height: height, viewWidth: Double(bounds.width), viewHeight: Double(bounds.height))
+        guard zoom != touchInputView.zoom else { return }
+        touchInputView.zoom = zoom
+        applyZoom(zoom)
     }
 
     /// Places the controls over the area above the keyboard, turned like the video.
@@ -1379,6 +1546,14 @@ final class IOSFullscreenVideoViewController: UIViewController {
             area.size.height = keyboardTop
             screenInsets.bottom = 0
         }
+        // The keyboard's space does not count as viewport: the video (and its touch surface)
+        // fits in the area above it, so the pointer's lowest point stays visible, in portrait
+        // and landscape alike.
+        let raise = keyboardVisible ? -(bounds.maxY - keyboardTop) : 0
+        if videoBottomConstraint?.constant != raise {
+            videoBottomConstraint?.constant = raise
+            touchBottomConstraint?.constant = raise
+        }
         let orientation = model.videoOrientation
         let insets = orientation.rotatedInsets(
             top: Double(screenInsets.top),
@@ -1386,20 +1561,30 @@ final class IOSFullscreenVideoViewController: UIViewController {
             bottom: Double(screenInsets.bottom),
             right: Double(screenInsets.right)
         )
-        controlsOverlay.transform = .identity
-        controlsOverlay.bounds = CGRect(
-            origin: .zero,
-            size: orientation.swapsDimensions
-                ? CGSize(width: area.height, height: area.width)
-                : area.size
-        )
-        controlsOverlay.center = CGPoint(x: area.midX, y: area.midY)
-        controlsOverlay.transform = CGAffineTransform(rotationAngle: CGFloat(orientation.rotationAngleRadians))
-        overlaySafeConstraints[0].constant = CGFloat(insets.top)
-        overlaySafeConstraints[1].constant = CGFloat(insets.left)
-        overlaySafeConstraints[2].constant = CGFloat(insets.bottom)
-        overlaySafeConstraints[3].constant = CGFloat(insets.right)
+        // Bounds and center do not depend on the transform, so the rotation is only written when
+        // it changes. Resetting it to identity on every pass made UIKit animate 0° ↔ 180° again
+        // and again (additive transform animations) while a layout ran inside an animation,
+        // and each pass triggered the next one: the controls spun without end at 180°.
+        let overlaySize = orientation.swapsDimensions
+            ? CGSize(width: area.height, height: area.width)
+            : area.size
+        if controlsOverlay.bounds.size != overlaySize || controlsOverlay.bounds.origin != .zero {
+            controlsOverlay.bounds = CGRect(origin: .zero, size: overlaySize)
+        }
+        let overlayCenter = CGPoint(x: area.midX, y: area.midY)
+        if controlsOverlay.center != overlayCenter {
+            controlsOverlay.center = overlayCenter
+        }
+        let overlayTransform = CGAffineTransform(rotationAngle: CGFloat(orientation.rotationAngleRadians))
+        if !Self.sameTransform(controlsOverlay.transform, overlayTransform) {
+            controlsOverlay.transform = overlayTransform
+        }
+        for (constraint, value) in zip(overlaySafeConstraints, [insets.top, insets.left, insets.bottom, insets.right]) {
+            Self.setConstant(constraint, CGFloat(value))
+        }
         specialKeysPanel.bottomSafeInset = CGFloat(insets.bottom)
+        controlsOverlay.layoutIfNeeded()
+        positionPuck()
         controlsOverlay.layoutIfNeeded()
     }
 
@@ -1512,6 +1697,7 @@ final class IOSSettingsViewController: UIViewController {
     private let qualityValueLabel = UILabel()
     private let autoBitrateTitleLabel = UILabel()
     private let autoBitrateSwitch = UISwitch()
+    private let highQualitySwitch = UISwitch()
     private let bitrateRow = UIStackView()
     private let bitrateTitleLabel = UILabel()
     private let bitrateField = UITextField()
@@ -1589,6 +1775,7 @@ final class IOSSettingsViewController: UIViewController {
         contentStack.addArrangedSubview(makeGeneralLanguageSection())
         contentStack.addArrangedSubview(makeStreamParametersSection())
         contentStack.addArrangedSubview(makeNetworkAndFECSection())
+        contentStack.addArrangedSubview(card(makeIOSHostedView(IOSReceiverSecurityPanel(model: receiverModel), parent: self)))
         contentStack.addArrangedSubview(remoteControlCard)
         contentStack.addArrangedSubview(makeDiagnosticsSection())
         contentStack.addArrangedSubview(makeVersionFooter())
@@ -1713,6 +1900,33 @@ final class IOSSettingsViewController: UIViewController {
         autoBitrateRow.addArrangedSubview(UIView())
         autoBitrateRow.addArrangedSubview(autoBitrateSwitch)
         stack.addArrangedSubview(autoBitrateRow)
+
+        let highQualityRow = UIStackView()
+        highQualityRow.axis = .horizontal
+        highQualityRow.alignment = .center
+        highQualityRow.spacing = 8
+        let highQualityLabels = UIStackView()
+        highQualityLabels.axis = .vertical
+        highQualityLabels.spacing = 2
+        let highQualityTitle = UILabel()
+        highQualityTitle.text = SPPWLocalization.tr("settings.prefer_high_quality")
+        highQualityTitle.font = .preferredFont(forTextStyle: .subheadline)
+        let highQualityFooter = UILabel()
+        highQualityFooter.text = SPPWLocalization.tr("settings.prefer_high_quality_help")
+        highQualityFooter.font = .preferredFont(forTextStyle: .caption2)
+        highQualityFooter.textColor = .secondaryLabel
+        highQualityFooter.numberOfLines = 0
+        highQualityLabels.addArrangedSubview(highQualityTitle)
+        highQualityLabels.addArrangedSubview(highQualityFooter)
+        highQualitySwitch.isOn = receiverModel.preferHighQuality
+        highQualitySwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.receiverModel.preferHighQuality = self.highQualitySwitch.isOn
+        }, for: .valueChanged)
+        highQualitySwitch.setContentCompressionResistancePriority(.required, for: .horizontal)
+        highQualityRow.addArrangedSubview(highQualityLabels)
+        highQualityRow.addArrangedSubview(highQualitySwitch)
+        stack.addArrangedSubview(highQualityRow)
 
         bitrateRow.axis = .horizontal
         bitrateRow.alignment = .center
@@ -1909,6 +2123,7 @@ final class IOSSettingsViewController: UIViewController {
         }
         qualityValueLabel.text = String(format: "%.2f", receiverModel.quality)
         autoBitrateSwitch.isOn = receiverModel.automaticBitrate
+        highQualitySwitch.isOn = receiverModel.preferHighQuality
         bitrateRow.isHidden = receiverModel.automaticBitrate
         if !bitrateField.isFirstResponder {
             bitrateField.text = String(format: "%.0f", receiverModel.bitrateMbps)

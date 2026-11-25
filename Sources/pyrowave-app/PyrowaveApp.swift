@@ -11,8 +11,29 @@ import SPPWCommon
 /// server on localhost).
 @main
 struct PyrowaveApp: App {
-    @StateObject private var serverModel = ServerModel()
-    @StateObject private var receiverModel = ReceiverModel()
+    /// Held with `@State`, not `@StateObject`: the scene must not observe the models. With
+    /// `@StateObject` every published change (server status every 0.5 s, receiver
+    /// statistics at 2 Hz while streaming) re-evaluated the scene and its `.commands`, so
+    /// SwiftUI rebuilt the menu bar continuously: blank rows under Quit, a choppy View
+    /// menu, and open menus closing on mouse movement. Only the views observe them.
+    @State private var serverModel = ServerModel()
+    @State private var receiverModel = ReceiverModel()
+
+    var body: some Scene {
+        WindowGroup("PyrowaveCast") {
+            PyrowaveRootView(serverModel: serverModel, receiverModel: receiverModel)
+        }
+        .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .newItem) { }
+        }
+    }
+}
+
+/// The unified window: sidebar (server / receiver) and the selected panel.
+struct PyrowaveRootView: View {
+    @ObservedObject var serverModel: ServerModel
+    @ObservedObject var receiverModel: ReceiverModel
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
 
     enum Panel: String, CaseIterable, Identifiable {
@@ -48,30 +69,24 @@ struct PyrowaveApp: App {
         selectedPanel == .receiver && receiverModel.isVideoFullscreen
     }
 
-    var body: some Scene {
-        WindowGroup("PyrowaveCast") {
-            let _ = selectedLanguageRaw
-            NavigationSplitView(columnVisibility: $columnVisibility) {
-                sidebar
-            } detail: {
-                detailPanel
-            }
-            .toolbar(isReceiverVideoFullscreen ? .hidden : .automatic, for: .windowToolbar)
-            .onChange(of: isReceiverVideoFullscreen) { _, fullscreen in
-                if fullscreen {
-                    columnVisibilityBeforeFullscreen = columnVisibility
-                    columnVisibility = .detailOnly
-                } else {
-                    columnVisibility = columnVisibilityBeforeFullscreen
-                }
-            }
-            .frame(minWidth: 1100, minHeight: 700)
-            .preferredColorScheme(.dark)
+    var body: some View {
+        let _ = selectedLanguageRaw
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            sidebar
+        } detail: {
+            detailPanel
         }
-        .windowResizability(.contentMinSize)
-        .commands {
-            CommandGroup(replacing: .newItem) { }
+        .toolbar(isReceiverVideoFullscreen ? .hidden : .automatic, for: .windowToolbar)
+        .onChange(of: isReceiverVideoFullscreen) { _, fullscreen in
+            if fullscreen {
+                columnVisibilityBeforeFullscreen = columnVisibility
+                columnVisibility = .detailOnly
+            } else {
+                columnVisibility = columnVisibilityBeforeFullscreen
+            }
         }
+        .frame(minWidth: 1100, minHeight: 700)
+        .preferredColorScheme(.dark)
     }
 
     private var sidebar: some View {
@@ -168,10 +183,10 @@ struct PyrowaveApp: App {
     private var detailPanel: some View {
         switch selectedPanel {
         case .server:
-            ServerContentView()
+            ServerContentView(showsLanguagePicker: false)
                 .environmentObject(serverModel)
         case .receiver:
-            ReceiverContentView()
+            ReceiverContentView(showsLanguagePicker: false)
                 .environmentObject(receiverModel)
         }
     }

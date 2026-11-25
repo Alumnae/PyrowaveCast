@@ -19,7 +19,12 @@ public struct ReceiverContentView: View {
     @StateObject private var exitChordMonitor = FullscreenExitChordMonitor()
     @AppStorage(SPPWLocalization.languageDefaultsKey) private var selectedLanguageRaw: String = SPPWAppLanguage.system.rawValue
 
-    public init() {}
+    /// The unified app has one language picker in its sidebar, so it hides this one.
+    private let showsLanguagePicker: Bool
+
+    public init(showsLanguagePicker: Bool = true) {
+        self.showsLanguagePicker = showsLanguagePicker
+    }
 
     public var body: some View {
         let _ = selectedLanguageRaw
@@ -63,6 +68,16 @@ public struct ReceiverContentView: View {
         }
         .onChange(of: isVideoFullscreen) { _, fullscreen in
             model.isVideoFullscreen = fullscreen
+        }
+        .sheet(item: Binding(
+            get: { model.pairingRequest.map(PairingSheetItem.init) },
+            set: { if $0 == nil && model.pairingRequest != nil { model.cancelPairing() } }
+        )) { item in
+            PairingSecretSheet(request: item.request) { secret in
+                model.providePairingSecret(secret)
+            } onCancel: {
+                model.cancelPairing()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
             if isVideoFullscreen {
@@ -119,6 +134,12 @@ public struct ReceiverContentView: View {
                     .font(.headline)
                     .lineLimit(1)
             }
+            if let info = model.securityInfo {
+                Label(ReceiverModel.securityStatusText(info), systemImage: info.trust == .plaintext ? "lock.open" : (info.trust == .paired ? "lock.fill" : "lock"))
+                    .font(.caption)
+                    .foregroundStyle(info.trust == .paired ? Color.green : (info.trust == .plaintext ? Color.orange : Color.secondary))
+                    .help(info.fingerprint?.display ?? "")
+            }
             Divider().frame(height: 20)
             metric(SPPWLocalization.tr("metric.client"), SPPWLocalization.tr("metric.frames_fmt", model.statistics.decodedFrames))
             metric(SPPWLocalization.tr("metric.video"), model.statistics.frameWidth > 0
@@ -150,6 +171,7 @@ public struct ReceiverContentView: View {
                 Text(SPPWLocalization.tr("receiver.connect_to_server"))
                     .font(.title3.weight(.semibold))
 
+                if showsLanguagePicker {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(SPPWLocalization.tr("settings.language")).font(.caption).foregroundStyle(.secondary)
                     Picker(SPPWLocalization.tr("settings.language"), selection: Binding(
@@ -165,6 +187,7 @@ public struct ReceiverContentView: View {
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
+                }
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -415,6 +438,8 @@ public struct ReceiverContentView: View {
                             .frame(width: 38, alignment: .trailing)
                     }
                     Toggle(SPPWLocalization.tr("settings.automatic_bitrate"), isOn: $model.automaticBitrate)
+                    Toggle(SPPWLocalization.tr("settings.prefer_high_quality"), isOn: $model.preferHighQuality)
+                        .help(SPPWLocalization.tr("settings.prefer_high_quality_help"))
                     if model.automaticBitrate && model.isConnected && model.activeAutoBitrateMbps > 0 {
                         HStack {
                             Text(SPPWLocalization.tr("settings.auto_target"))
@@ -468,6 +493,9 @@ public struct ReceiverContentView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .disabled(!model.isConnected)
+
+                Divider()
+                ReceiverSecuritySection(model: model)
 
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
@@ -613,6 +641,11 @@ public struct ReceiverContentView: View {
         .background {
             if hasVideo { zoomShortcuts }
         }
+        .overlay(alignment: .bottomLeading) {
+            // Large clipboard files on their way (background transfer), with cancel.
+            FileTransfersView(compact: true)
+                .padding(18)
+        }
         .onTapGesture(count: 2) {
             if !model.remoteControlEnabled {
                 toggleVideoFullscreen()
@@ -755,6 +788,41 @@ public struct ReceiverContentView: View {
                 }
                 .buttonStyle(.plain)
                 .help(SPPWLocalization.tr("receiver.remote_control_help"))
+
+                if model.remoteControlEnabled {
+                    Button {
+                        model.clipboardSyncEnabled.toggle()
+                    } label: {
+                        Label(
+                            SPPWLocalization.tr("remote.clipboard_sync"),
+                            systemImage: model.clipboardSyncEnabled ? "doc.on.clipboard.fill" : "doc.on.clipboard"
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(model.clipboardSyncEnabled ? .green : .white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.65), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help(SPPWLocalization.tr("receiver.clipboard_sync_help"))
+                } else {
+                    // With remote control on the remote cursor is always hidden.
+                    Button {
+                        model.hideRemoteCursor.toggle()
+                    } label: {
+                        Label(
+                            SPPWLocalization.tr("receiver.hide_remote_cursor"),
+                            systemImage: model.hideRemoteCursor ? "cursorarrow.slash" : "cursorarrow.rays"
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(model.hideRemoteCursor ? .green : .white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.65), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help(SPPWLocalization.tr("receiver.hide_remote_cursor_help"))
+                }
 
                 HStack(spacing: 8) {
                     Button { model.rotateVideo() } label: {
@@ -911,10 +979,18 @@ public struct ReceiverContentView: View {
 final class FullscreenExitChordMonitor: ObservableObject {
     private var monitor: Any?
     private var detector = SPPWModifierChordDetector(required: [.control, .option])
+    /// The running monitor; the video view reports keys it consumes before this monitor sees them.
+    private static weak var active: FullscreenExitChordMonitor?
+
+    /// A key went to the remote Mac (⌃⌥ + key is a shortcut, not the exit chord).
+    static func noteOtherInput() {
+        active?.detector.otherInput()
+    }
 
     func start(onExit: @escaping @MainActor () -> Void) {
         stop()
         detector.reset()
+        Self.active = self
         let mask: NSEvent.EventTypeMask = [
             .flagsChanged, .keyDown,
             .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
@@ -942,5 +1018,122 @@ final class FullscreenExitChordMonitor: ObservableObject {
         }
         monitor = nil
         detector.reset()
+        if Self.active === self { Self.active = nil }
+    }
+}
+
+
+// MARK: - Security (receiver)
+
+private struct PairingSheetItem: Identifiable {
+    let request: SPPWPairingRequest
+    var id: String { "\(request.serverFingerprint.hex)-\(request.attemptsLeft)-\(request.previousAttemptFailed)" }
+}
+
+/// Asks for the PIN shown on the server (or the headless server's password).
+struct PairingSecretSheet: View {
+    let request: SPPWPairingRequest
+    let onSubmit: (String) -> Void
+    let onCancel: () -> Void
+    @State private var secret = ""
+    @FocusState private var focused: Bool
+
+    private var isPIN: Bool { request.method == .pin }
+    private var isValid: Bool { isPIN ? secret.count == 5 && secret.allSatisfy(\.isNumber) : !secret.isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(
+                SPPWLocalization.tr(isPIN ? "security.prompt.pin.title" : "security.prompt.password.title"),
+                systemImage: "lock.shield"
+            )
+            .font(.title3.weight(.semibold))
+            Text(SPPWLocalization.tr(
+                isPIN ? "security.prompt.pin.message_fmt" : "security.prompt.password.message_fmt",
+                request.serverName,
+                request.serverFingerprint.display
+            ))
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            if request.previousAttemptFailed {
+                Text(isPIN && request.attemptsLeft >= SPPWServerSecurity.pinAttempts
+                     ? SPPWLocalization.tr("security.prompt.renewed")
+                     : SPPWLocalization.tr("security.prompt.wrong_fmt", request.attemptsLeft))
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+            Group {
+                if isPIN {
+                    TextField("00000", text: $secret)
+                        .font(.system(size: 28, weight: .semibold, design: .monospaced))
+                        .multilineTextAlignment(.center)
+                        .onChange(of: secret) { _, value in
+                            let digits = String(value.filter(\.isNumber).prefix(5))
+                            if digits != value { secret = digits }
+                        }
+                } else {
+                    SecureField(SPPWLocalization.tr("security.prompt.password.title"), text: $secret)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .focused($focused)
+            .onSubmit { if isValid { onSubmit(secret) } }
+            HStack {
+                Spacer()
+                Button(SPPWLocalization.tr("security.prompt.cancel"), role: .cancel) { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button(SPPWLocalization.tr("security.prompt.pair")) { onSubmit(secret) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!isValid)
+            }
+        }
+        .padding(22)
+        .frame(width: 380)
+        .onAppear { focused = true }
+    }
+}
+
+/// Encryption toggle, this device's fingerprint and the paired servers.
+struct ReceiverSecuritySection: View {
+    @ObservedObject var model: ReceiverModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(SPPWLocalization.tr("security.encryption"), isOn: $model.encryptionEnabled)
+                .font(.subheadline)
+                .help(SPPWLocalization.tr("security.receiver.encryption.help"))
+                .disabled(model.isConnected)
+            if model.encryptionEnabled {
+                Text(SPPWLocalization.tr("security.fingerprint_this"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(model.deviceFingerprint)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+                DisclosureGroup(SPPWLocalization.tr("security.paired_servers_fmt", model.pairedServers.count)) {
+                    if model.pairedServers.isEmpty {
+                        Text(SPPWLocalization.tr("security.none_paired"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.pairedServers) { peer in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(peer.name).font(.caption)
+                                Text(peer.fingerprint.short).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(SPPWLocalization.tr("security.forget"), role: .destructive) {
+                                model.forgetPairedServer(peer)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                        }
+                    }
+                }
+                .font(.subheadline)
+            }
+        }
     }
 }

@@ -55,19 +55,19 @@ import Testing
     }
     let low = abr.currentBitrateBps
     #expect(low < 50_000_000)
-    for _ in 0..<9 {
+    for _ in 0..<4 {
         t += sec
         #expect(abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 60)) == .hold)
     }
     t += sec
     guard case let .probeUp(next) = abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 60)) else {
-        Issue.record("expected a probe after 10 clean seconds")
+        Issue.record("expected a probe after 5 clean seconds")
         return
     }
     #expect(next >= Int(Double(low) * 1.25))
 }
 
-@Test func adaptiveBitrateReleasesALockedCeilingAfterTwoCleanMinutes() {
+@Test func adaptiveBitrateReleasesALockedCeilingAfterThirtyCleanSeconds() {
     let sec: UInt64 = 1_000_000_000
     var t: UInt64 = 10 * sec
     var abr = SPPWAdaptiveBitrateController(ceilingBitrateBps: 120_000_000, nowNanoseconds: t)
@@ -80,14 +80,16 @@ import Testing
         return abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 54, llDroppedFramesDelta: 3))
     }
     _ = heavy()
-    for _ in 0..<10 { _ = clean() }
+    for _ in 0..<5 { _ = clean() }
     _ = heavy()                                  // 1st failed probe
     for _ in 0..<20 { _ = clean() }
     _ = heavy()                                  // 2nd failed probe -> locked
     #expect(abr.isCeilingLocked)
     let locked = abr.currentBitrateBps
     var probed = false
-    for _ in 0..<150 {
+    for _ in 0..<29 { _ = clean() }
+    #expect(abr.isCeilingLocked)                 // still locked before 30 s
+    for _ in 0..<30 {
         if case .probeUp = clean() { probed = true; break }
     }
     #expect(!abr.isCeilingLocked)

@@ -3,7 +3,9 @@ import PyrowaveGUI
 
 @main
 struct PyrowaveReceiverApp: App {
-    @StateObject private var model = ReceiverModel()
+    /// `@State`, not `@StateObject`: the scene must not observe the model, or every statistics
+    /// update rebuilds the menu bar (blank rows, menus closing). The content view observes it.
+    @State private var model = ReceiverModel()
 
     var body: some Scene {
         WindowGroup("PyrowaveCast Receiver") {

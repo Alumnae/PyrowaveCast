@@ -158,6 +158,8 @@ final class SampleBufferVideoView: NSView {
     private var commandPressedKeys: Set<UInt16> = []
     private var lastModifierFlags: NSEvent.ModifierFlags = []
     private var hasKeyboardFocus = false
+    /// Local key monitor installed while the keyboard is captured (see `installKeyMonitor`).
+    private var keyMonitor: Any?
     nonisolated(unsafe) private var windowResignObserver: NSObjectProtocol?
     nonisolated(unsafe) private var appResignObserver: NSObjectProtocol?
 
@@ -311,7 +313,37 @@ final class SampleBufferVideoView: NSView {
         guard remoteControlEnabled else { return false }
         lastModifierFlags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         setKeyboardFocus(true)
+        installKeyMonitor()
         return true
+    }
+
+    /// While the keyboard is captured, every key down/up for this window goes to the remote Mac
+    /// before AppKit dispatches it. Otherwise the app's own menus and SwiftUI key equivalents
+    /// would take shortcuts such as ⌘⌫, ⌘C or ⌘W, and AppKit drops key ups while ⌘ is held.
+    /// System shortcuts handled by WindowServer (⌘Tab, ⌘Space) never reach the app.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self, event.window === self.window, self.isKeyboardCaptured else { return event }
+            FullscreenExitChordMonitor.noteOtherInput()
+            if event.type == .keyDown {
+                if Self.isUngrabHotkey(event) {
+                    self.releaseRemoteInputs(resignFocus: true)
+                } else {
+                    self.forwardKeyDown(event)
+                }
+            } else {
+                self.forwardKeyUp(event)
+            }
+            return nil
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+        }
+        keyMonitor = nil
     }
 
     override func resignFirstResponder() -> Bool {
@@ -344,6 +376,7 @@ final class SampleBufferVideoView: NSView {
         if resignFocus, let window, window.firstResponder === self {
             window.makeFirstResponder(nil)
         }
+        removeKeyMonitor()
         setKeyboardFocus(false)
     }
 
@@ -586,6 +619,10 @@ final class SampleBufferVideoView: NSView {
             super.keyUp(with: event)
             return
         }
+        forwardKeyUp(event)
+    }
+
+    private func forwardKeyUp(_ event: NSEvent) {
         commandPressedKeys.remove(event.keyCode)
         onInputEvent?(.key(
             keyCode: event.keyCode,

@@ -346,8 +346,8 @@ import Testing
     }
     #expect(bps2 < bps1)
 
-    // Clean seconds 1..9 MUST NOT ramp up (< 10 s cooldown).
-    for _ in 1...9 {
+    // Clean seconds 1..4 MUST NOT ramp up (< 5 s cooldown).
+    for _ in 1...4 {
         t += sec
         let decision = abr.evaluate(SPPWAdaptiveBitrateSample(
             timestampNanoseconds: t,
@@ -359,7 +359,7 @@ import Testing
     #expect(abr.currentBitrateBps == bps2)
     #expect(abr.lastStableBitrateBps == bps2)
 
-    // At 10 clean seconds, ABR cautiously probes upward.
+    // At 5 clean seconds, ABR cautiously probes upward.
     t += sec
     let probe = abr.evaluate(SPPWAdaptiveBitrateSample(
         timestampNanoseconds: t,
@@ -367,7 +367,7 @@ import Testing
         jitterMs: 3.0
     ))
     guard case let .probeUp(probedBps) = probe else {
-        Issue.record("Expected probeUp at 10 s clean, got \(probe)")
+        Issue.record("Expected probeUp at 5 s clean, got \(probe)")
         return
     }
     #expect(probedBps > bps2)
@@ -393,14 +393,14 @@ import Testing
         return
     }
 
-    // 10 clean seconds -> 1st probe upward.
-    for _ in 1...9 {
+    // 5 clean seconds -> 1st probe upward.
+    for _ in 1...4 {
         t += sec
         #expect(abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 60)) == .hold)
     }
     t += sec
     guard case .probeUp = abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 60)) else {
-        Issue.record("Expected 1st probeUp after 10 s clean")
+        Issue.record("Expected 1st probeUp after 5 s clean")
         return
     }
 
@@ -448,8 +448,9 @@ import Testing
     #expect(abr.isCeilingLocked)
     #expect(abr.learnedSafeCeilingBps == stableBps)
 
-    // Even after 60 more clean seconds, stays pinned at the problem-free bitrate.
-    for _ in 1...60 {
+    // For the next 29 clean seconds it stays pinned at the problem-free bitrate
+    // (the lock is released after 30 s clean).
+    for _ in 1...29 {
         t += sec
         #expect(abr.evaluate(SPPWAdaptiveBitrateSample(timestampNanoseconds: t, completeFramesDelta: 60)) == .hold)
     }
@@ -1252,3 +1253,51 @@ private func makePCMSampleBuffer(
     #expect(current.contains("build"))
 }
 
+
+@Test func preferHighQualityHoldsBitrateThroughASingleModerateWindow() {
+    let sec: UInt64 = 1_000_000_000
+    var plain = SPPWAdaptiveBitrateController(ceilingBitrateBps: 100_000_000, nowNanoseconds: 0)
+    var quality = SPPWAdaptiveBitrateController(ceilingBitrateBps: 100_000_000, nowNanoseconds: 0)
+    quality.prefersHighQuality = true
+    // One window with heavy partial-HF salvage but no lost frames.
+    let moderate = SPPWAdaptiveBitrateSample(timestampNanoseconds: 2 * sec, completeFramesDelta: 60, partialHFFramesDelta: 8)
+    let plainDecision = plain.evaluate(moderate)
+    let qualityDecision = quality.evaluate(moderate)
+    guard case .stepDown = plainDecision else {
+        Issue.record("Expected the default policy to step down, got \(plainDecision)")
+        return
+    }
+    #expect(qualityDecision == .hold)
+    #expect(quality.currentBitrateBps == 100_000_000)
+    // Real loss still cuts, but by 15 % instead of 20 %.
+    let lossy = SPPWAdaptiveBitrateSample(timestampNanoseconds: 3 * sec, completeFramesDelta: 55, llDroppedFramesDelta: 5)
+    let cut = quality.evaluate(lossy)
+    #expect(cut == .stepDown(newBitrateBps: 85_000_000, reason: "LL drop: 5"))
+    // Survives reset.
+    quality.reset(ceilingBitrateBps: 80_000_000, nowNanoseconds: 10 * sec)
+    #expect(quality.prefersHighQuality)
+}
+
+@Test func preferHighQualityKeepsTheResolutionLongerAndProbesSooner() {
+    var controller = SPPWAutoResolutionController()
+    controller.prefersHighQuality = true
+    var now: UInt64 = 0
+    func tick(_ current: Int, _ ceiling: Int, seconds: Int) -> [SPPWAutoResolutionController.Change] {
+        var changes: [SPPWAutoResolutionController.Change] = []
+        for _ in 0..<seconds {
+            now += 1_000_000_000
+            let change = controller.evaluate(currentBitrateBps: current, ceilingBitrateBps: ceiling, nativeShortSide: 1440, now: now)
+            if change != .none { changes.append(change) }
+        }
+        return changes
+    }
+    // 40 % of the ceiling is no longer low enough to drop a level.
+    #expect(tick(40, 100, seconds: 10) == [])
+    // Below 35 % it takes 6 s, not 3.
+    #expect(tick(30, 100, seconds: 5) == [])
+    #expect(tick(30, 100, seconds: 2) == [.changed(1080)])
+    // Back at the ceiling: the probe up comes after 8 s instead of 15.
+    #expect(tick(100, 100, seconds: 9) == [.changed(nil)])
+    controller.reset()
+    #expect(controller.prefersHighQuality)
+}

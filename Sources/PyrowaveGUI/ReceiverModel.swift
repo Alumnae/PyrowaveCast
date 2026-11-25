@@ -76,6 +76,11 @@ public final class ReceiverModel: ObservableObject {
             UserDefaults.standard.set(clamped, forKey: "receiverFECPercent")
         }
     }
+    /// "Prefer high quality": the adaptive bitrate and automatic resolution hold the higher
+    /// setting through short Wi-Fi trouble, and the request carries 5 % more FEC.
+    @Published public var preferHighQuality: Bool = UserDefaults.standard.bool(forKey: "receiverPreferHighQuality") {
+        didSet { UserDefaults.standard.set(preferHighQuality, forKey: "receiverPreferHighQuality") }
+    }
     @Published public var latencyMode: SPPWLatencyMode = {
         let raw = UserDefaults.standard.object(forKey: "receiverLatencyMode") as? Int ?? 1
         return SPPWLatencyMode(rawValue: UInt8(clamping: raw)) ?? .balancedWiFi
@@ -121,7 +126,7 @@ public final class ReceiverModel: ObservableObject {
             guard resolutionMode != oldValue else { return }
             UserDefaults.standard.set(resolutionMode.id, forKey: "receiverResolutionMode")
             autoResolution.reset()
-            appendEvent("Risoluzione richiesta: \(resolutionMode.title)")
+            appendEvent("Requested resolution: \(resolutionMode.englishTitle)")
             if isConnected {
                 applySettings()
             }
@@ -160,13 +165,56 @@ public final class ReceiverModel: ObservableObject {
                 releaseAllRemoteInput()
             }
             syncRemoteCursorVisibility(force: true)
+            clipboardSession.setEnabled(isClipboardSyncActive)
             appendEvent(
                 remoteControlEnabled
-                    ? SPPWLocalization.tr("receiver.log.remote_control_enabled")
-                    : SPPWLocalization.tr("receiver.log.remote_control_disabled")
+                    ? SPPWLocalization.english("receiver.log.remote_control_enabled")
+                    : SPPWLocalization.english("receiver.log.remote_control_disabled")
             )
         }
     }
+    /// Keeps this Mac's clipboard and the remote Mac's in step (text, images, files) while
+    /// remote control is on.
+    @Published public var clipboardSyncEnabled: Bool = UserDefaults.standard.object(forKey: "receiverClipboardSync") as? Bool ?? true {
+        didSet {
+            guard clipboardSyncEnabled != oldValue else { return }
+            UserDefaults.standard.set(clipboardSyncEnabled, forKey: "receiverClipboardSync")
+            clipboardSession.setEnabled(isClipboardSyncActive)
+        }
+    }
+    nonisolated let clipboardSession = ReceiverClipboardSession()
+
+    /// Keeps the remote Mac's cursor out of the video even while remote control is off (with it
+    /// on, the cursor is always hidden because this Mac's pointer stands in for it).
+    @Published public var hideRemoteCursor: Bool = UserDefaults.standard.bool(forKey: "receiverHideRemoteCursor") {
+        didSet {
+            guard hideRemoteCursor != oldValue else { return }
+            UserDefaults.standard.set(hideRemoteCursor, forKey: "receiverHideRemoteCursor")
+            syncRemoteCursorVisibility(force: true)
+        }
+    }
+
+    private var wantsRemoteCursorHidden: Bool { remoteControlEnabled || hideRemoteCursor }
+
+    // MARK: Security (encryption and pairing, PROTOCOL.md §7)
+
+    /// Use the secure handshake and encrypt the stream; must match the server's setting.
+    @Published public var encryptionEnabled: Bool = UserDefaults.standard.object(forKey: "receiverEncryptionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(encryptionEnabled, forKey: "receiverEncryptionEnabled")
+        }
+    }
+    /// Set while the server asks for its PIN or password.
+    @Published public private(set) var pairingRequest: SPPWPairingRequest?
+    /// How the current session is protected (nil before the handshake).
+    @Published public private(set) var securityInfo: SPPWServerSecurityInfo?
+    @Published public private(set) var pairedServers: [SPPWTrustedPeer] = SPPWSecurityStore.shared.trustedPeers(.servers)
+    public var deviceFingerprint: String { SPPWSecurityStore.shared.identity.fingerprint.display }
+    private var activeSecurity: SPPWClientSecurity?
+    private var activeSecurityID = UUID()
+    /// The security layer of the `NWConnection` fallback (the UDP socket carries its own).
+    private nonisolated let connectionSecurity = SPPWClientSecurityBox()
+    private var isClipboardSyncActive: Bool { remoteControlEnabled && clipboardSyncEnabled }
     /// True while the video surface holds first-responder keyboard focus for remote control.
     @Published public var isCapturingKeyboard: Bool = false
     /// True while the receiver shows the video fullscreen; the host window hides its sidebar and toolbar.
@@ -672,6 +720,7 @@ public final class ReceiverModel: ObservableObject {
                 }
             }
         )
+        clientSocket.attachSecurity(makeClientSecurity())
         if reconnectTask == nil {
             state = .waiting
         }
@@ -746,6 +795,13 @@ public final class ReceiverModel: ObservableObject {
         connection?.cancel()
         audioPlayer.stop()
         avSyncClock.reset()
+        clipboardSession.stop()
+        activeSecurity?.stop()
+        activeSecurity = nil
+        activeSecurityID = UUID()
+        connectionSecurity.current?.stop()
+        connectionSecurity.current = nil
+        pairingRequest = nil
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
@@ -807,7 +863,8 @@ public final class ReceiverModel: ObservableObject {
     }
 
     /// While remote control is on, the local macOS pointer sits exactly where the host cursor
-    /// is, so the host leaves its (network-delayed) cursor out of the video. Resent with each
+    /// is, so the host leaves its (network-delayed) cursor out of the video; `hideRemoteCursor`
+    /// asks for the same without remote control. Resent with each
     /// heartbeat while hidden, since the request is plain UDP and the server forgets it per session.
     private var remoteCursorHiddenSent: Bool?
 
@@ -816,7 +873,7 @@ public final class ReceiverModel: ObservableObject {
             remoteCursorHiddenSent = nil
             return
         }
-        let hidden = remoteControlEnabled
+        let hidden = wantsRemoteCursorHidden
         guard force || remoteCursorHiddenSent != hidden || hidden else { return }
         remoteCursorHiddenSent = hidden
         sendInputEvent(.cursorVisibility(hidden: hidden))
@@ -865,7 +922,7 @@ public final class ReceiverModel: ObservableObject {
         let safeFPS = max(1, min(fps, 120))
         let safeQuality = max(0.1, min(1.0, quality))
         let safeBitrate = max(5.0, min(1000.0, bitrateMbps))
-        let safeFEC = max(0, min(50, fecPercent))
+        let safeFEC = max(0, min(50, fecPercent + (preferHighQuality ? 5 : 0)))
         let request = requestedResolution(fps: safeFPS, quality: safeQuality, manualBitrateMbps: safeBitrate)
         // Expected stream size, for the adaptive bitrate ceiling.
         let expected = SPPWResolutionLadder.resolve(
@@ -917,6 +974,13 @@ public final class ReceiverModel: ObservableObject {
             if reconnectTask == nil {
                 state = .waiting
             }
+            if connectionSecurity.current == nil, let connection = controlConnection {
+                let security = makeClientSecurity()
+                connectionSecurity.current = security
+                security.start { [weak connection] datagram in
+                    connection?.send(content: datagram, completion: .idempotent)
+                }
+            }
             let hello = ReceiverWireHeader.control(.clientHello, payload: makeConfiguration().payload)
             send(hello)
             startHelloRetryLoop()
@@ -947,8 +1011,8 @@ public final class ReceiverModel: ObservableObject {
     private nonisolated func receiveNext(on connection: NWConnection) {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
             guard let self, let connection else { return }
-            if let data {
-                self.handleDatagramBackground(data)
+            if let data, let plain = self.connectionSecurity.open(data) {
+                self.handleDatagramBackground(plain)
             }
             if let error {
                 Task { @MainActor [weak self, weak connection] in
@@ -994,8 +1058,22 @@ public final class ReceiverModel: ObservableObject {
             noteServerActivity(arrivalNanos)
 
         case .clipboard:
-            // Clipboard sync is offered by the iOS receiver only for now.
             noteServerActivity(arrivalNanos)
+            let payload = data.count > ReceiverWireHeader.byteCount
+                ? data.subdata(in: ReceiverWireHeader.byteCount..<data.count)
+                : Data()
+            if let content = clipboardSession.receive(payload) {
+                let kind: String
+                switch content.format {
+                case .utf8Text: kind = "text"
+                case .png: kind = "image"
+                case .files: kind = "files"
+                case .fileOffer: kind = "files, background transfer"
+                }
+                Task { @MainActor [weak self] in
+                    self?.appendEvent(SPPWLocalization.english("receiver.log.clipboard_received", kind, content.data.count))
+                }
+            }
 
         case .audioFrame:
             noteServerActivity(arrivalNanos)
@@ -1131,7 +1209,9 @@ public final class ReceiverModel: ObservableObject {
             controlStreamID = header.streamID
             isResynchronizing = false
             resyncStartedAt = nil
-            state = .waiting
+            // A reconnect or resync over the same picture stays "streaming" (no orange
+            // blink); only a session without a picture waits for its first frame.
+            state = currentPixelBuffer != nil ? .streaming : .waiting
             lastFrameID = 0
             hasReceivedFrame = false
             frameWaitStartedAt = .now
@@ -1175,18 +1255,19 @@ public final class ReceiverModel: ObservableObject {
                 updated.frameWidth = serverW
                 updated.frameHeight = serverH
                 statistics = updated
-                appendEvent("Risoluzione concordata: \(serverW)×\(serverH) (\(resolutionMode.title))")
+                appendEvent("Agreed resolution: \(serverW)×\(serverH) (\(resolutionMode.englishTitle))")
             }
             resetAdaptiveBitrate(nowNanos: nowNanos)
             startHeartbeat()
             startWatchdog()
             startAdaptiveBitrateLoop()
             sendReadinessPing()
-            if remoteControlEnabled {
+            if wantsRemoteCursorHidden {
                 syncRemoteCursorVisibility(force: true)
             }
+            startClipboardSession()
             if wasReconnecting {
-                appendEvent("Riconnesso automaticamente · sessione \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
+                appendEvent("Reconnected automatically · session \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             } else {
                 appendEvent("Server hello · control session \(controlStreamID), media stream \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             }
@@ -1199,7 +1280,7 @@ public final class ReceiverModel: ObservableObject {
                 let serverH = Int(header.height)
                 if width != serverW || height != serverH {
                     noteServerStreamSize(width: serverW, height: serverH)
-                    appendEvent("Risoluzione stream: \(serverW)×\(serverH) (\(resolutionMode.title))")
+                    appendEvent("Stream resolution: \(serverW)×\(serverH) (\(resolutionMode.englishTitle))")
                 }
             }
             if isResynchronizing {
@@ -1266,12 +1347,17 @@ public final class ReceiverModel: ObservableObject {
                 do { try await Task.sleep(for: .seconds(1)) }
                 catch { return }
                 guard let self, (self.udpSocket != nil || self.controlConnection != nil), self.controlStreamID == 0 else { return }
+                if self.pairingRequest != nil {
+                    // The user is typing the PIN/password: no timeout, and the hello waits anyway.
+                    self.connectStartedNanos = DispatchTime.now().uptimeNanoseconds
+                    continue
+                }
                 if self.reconnectTask == nil {
                     let elapsedSec = Double(DispatchTime.now().uptimeNanoseconds &- self.connectStartedNanos) / 1_000_000_000.0
                     if elapsedSec >= Double(self.agreedTimeoutSeconds) {
                         self.teardownActiveConnection(clearAutoReconnect: true)
                         self.state = .failed(SPPWLocalization.tr("receiver.error.connection_timeout_fmt", self.agreedTimeoutSeconds))
-                        self.appendEvent("Nessuna risposta dal server entro \(self.agreedTimeoutSeconds)s")
+                        self.appendEvent("No answer from the server within \(self.agreedTimeoutSeconds)s")
                         return
                     }
                 }
@@ -1293,7 +1379,7 @@ public final class ReceiverModel: ObservableObject {
                     streamID: self.controlStreamID,
                     payload: Data("HB01".utf8)
                 ))
-                if self.remoteControlEnabled {
+                if self.wantsRemoteCursorHidden {
                     self.syncRemoteCursorVisibility()
                 }
             }
@@ -1310,14 +1396,14 @@ public final class ReceiverModel: ObservableObject {
 
                 let silenceSeconds = self.secondsSinceLastServerActivity()
                 if silenceSeconds >= 6.0 {
-                    self.triggerAutoReconnect(reason: "Nessuna risposta dal server da \(Int(silenceSeconds))s")
+                    self.triggerAutoReconnect(reason: "No answer from the server for \(Int(silenceSeconds))s")
                     return
                 }
 
                 if self.isResynchronizing,
                    let started = self.resyncStartedAt,
                    started.duration(to: .now) >= .seconds(3) {
-                    self.triggerAutoReconnect(reason: "Resync senza risposta dal server")
+                    self.triggerAutoReconnect(reason: "Resync got no answer from the server")
                     return
                 }
 
@@ -1408,7 +1494,7 @@ public final class ReceiverModel: ObservableObject {
         guard case .changed(let level) = change else { return }
         let config = makeConfiguration()
         send(ReceiverWireHeader.control(.streamConfiguration, streamID: controlStreamID, payload: config.payload))
-        appendEvent("Risoluzione automatica: \(level.map(SPPWResolutionMode.levelTitle) ?? SPPWLocalization.tr("settings.resolution_native"))")
+        appendEvent("Automatic resolution: \(level.map(SPPWResolutionMode.levelTitle) ?? "native")")
     }
 
     private func startAdaptiveBitrateLoop() {
@@ -1445,6 +1531,8 @@ public final class ReceiverModel: ObservableObject {
                 self.abrPrevFECRecoveredFrames = curFECRecovered
                 self.abrPrevLateDroppedFrames = curLateDrop
 
+                self.abrController.prefersHighQuality = self.preferHighQuality
+                self.autoResolution.prefersHighQuality = self.preferHighQuality
                 let decision = self.abrController.evaluate(sample)
                 defer { self.evaluateAutomaticResolution(nowNanos: nowNanos) }
                 switch decision {
@@ -1483,14 +1571,14 @@ public final class ReceiverModel: ObservableObject {
         guard let deadline = reconnectDeadlineNanos else { return }
         if now >= deadline {
             teardownActiveConnection(clearAutoReconnect: true)
-            let msg = "Timeout riconnessione (\(agreedTimeoutSeconds)s)"
+            let msg = "Reconnection timeout (\(agreedTimeoutSeconds)s)"
             lastError = msg
             state = .failed(msg)
-            appendEvent("Riconnessione automatica scaduta dopo \(agreedTimeoutSeconds)s")
+            appendEvent("Automatic reconnection timed out after \(agreedTimeoutSeconds)s")
             return
         }
 
-        appendEvent("\(reason) · avvio riconnessione automatica (timeout \(agreedTimeoutSeconds)s)")
+        appendEvent("\(reason) · reconnecting automatically (timeout \(agreedTimeoutSeconds)s)")
         teardownActiveConnection(clearAutoReconnect: false)
 
         reconnectTask = Task { [weak self] in
@@ -1499,17 +1587,17 @@ public final class ReceiverModel: ObservableObject {
                 let tickNow = DispatchTime.now().uptimeNanoseconds
                 guard let activeDeadline = self.reconnectDeadlineNanos, tickNow < activeDeadline else {
                     self.teardownActiveConnection(clearAutoReconnect: true)
-                    let msg = "Timeout riconnessione (\(self.agreedTimeoutSeconds)s)"
+                    let msg = "Reconnection timeout (\(self.agreedTimeoutSeconds)s)"
                     self.lastError = msg
                     self.state = .failed(msg)
-                    self.appendEvent("Riconnessione automatica scaduta dopo \(self.agreedTimeoutSeconds)s")
+                    self.appendEvent("Automatic reconnection timed out after \(self.agreedTimeoutSeconds)s")
                     return
                 }
 
                 self.reconnectAttempt += 1
                 let remaining = max(1, Int((activeDeadline - tickNow) / 1_000_000_000))
                 self.state = .reconnecting(attempt: self.reconnectAttempt, remainingSeconds: remaining)
-                self.appendEvent("Tentativo riconnessione #\(self.reconnectAttempt) (rimangono \(remaining)s)…")
+                self.appendEvent("Reconnection attempt #\(self.reconnectAttempt) (\(remaining)s left)…")
 
                 self.teardownActiveConnection(clearAutoReconnect: false)
                 self.openConnection(endpoint: self.activeEndpoint, isReconnectAttempt: true)
@@ -1539,7 +1627,9 @@ public final class ReceiverModel: ObservableObject {
         // Keep the last picture on screen (frozen) instead of flashing to black: the
         // server answers with a fresh frame, usually within a few hundred ms.
         frameWaitStartedAt = now
-        state = .waiting
+        if currentPixelBuffer == nil {
+            state = .waiting
+        }
         assemblyLock.lock()
         assembler.reset()
         adaptiveBuffer.reset()
@@ -1555,11 +1645,118 @@ public final class ReceiverModel: ObservableObject {
         appendEvent(reason)
     }
 
+    private func makeClientSecurity() -> SPPWClientSecurity {
+        let id = UUID()
+        activeSecurityID = id
+        securityInfo = nil
+        let security = SPPWClientSecurity(
+            store: .shared,
+            encryptionEnabled: encryptionEnabled,
+            deviceName: Host.current().localizedName ?? "Mac"
+        ) { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeSecurityID == id else { return }
+                self.handleSecurityEvent(event)
+            }
+        }
+        activeSecurity = security
+        return security
+    }
+
+    private func handleSecurityEvent(_ event: SPPWClientSecurityEvent) {
+        switch event {
+        case let .secured(info):
+            pairingRequest = nil
+            securityInfo = info
+            appendEvent(Self.securityStatusText(info))
+        case let .paired(info):
+            pairingRequest = nil
+            securityInfo = info
+            pairedServers = SPPWSecurityStore.shared.trustedPeers(.servers)
+            appendEvent(SPPWLocalization.english("security.log.paired_fmt", info.name, info.fingerprint?.short ?? ""))
+        case let .needsSecret(request):
+            pairingRequest = request
+        case let .failed(failure):
+            pairingRequest = nil
+            let message = Self.failureText(failure)
+            appendEvent(message)
+            teardownActiveConnection(clearAutoReconnect: true)
+            state = .failed(message)
+        }
+    }
+
+    /// The PIN or password typed by the user.
+    public func providePairingSecret(_ secret: String) {
+        connectStartedNanos = DispatchTime.now().uptimeNanoseconds
+        pairingRequest = nil
+        (activeSecurity ?? connectionSecurity.current)?.provideSecret(secret)
+    }
+
+    public func cancelPairing() {
+        (activeSecurity ?? connectionSecurity.current)?.cancelPairing()
+    }
+
+    public func forgetPairedServer(_ peer: SPPWTrustedPeer) {
+        SPPWSecurityStore.shared.forget(.servers, fingerprintHex: peer.fingerprintHex)
+        pairedServers = SPPWSecurityStore.shared.trustedPeers(.servers)
+    }
+
+    public static func securityStatusText(_ info: SPPWServerSecurityInfo) -> String {
+        switch info.trust {
+        case .paired: SPPWLocalization.tr("security.status.paired")
+        case .unverified: SPPWLocalization.tr("security.status.unverified")
+        case .plaintext: SPPWLocalization.tr("security.status.plaintext")
+        }
+    }
+
+    public static func failureText(_ failure: SPPWSecurityFailure) -> String {
+        switch failure {
+        case .serverRequiresEncryption: SPPWLocalization.tr("security.failure.server_requires_encryption")
+        case .serverEncryptionDisabled: SPPWLocalization.tr("security.failure.server_encryption_disabled")
+        case .badServerSignature: SPPWLocalization.tr("security.failure.bad_signature")
+        case .denied: SPPWLocalization.tr("security.failure.denied")
+        case .pairingLocked: SPPWLocalization.tr("security.failure.locked")
+        case .pairingUnavailable: SPPWLocalization.tr("security.failure.unavailable")
+        case .cancelled: SPPWLocalization.tr("security.failure.cancelled")
+        }
+    }
+
+    /// The server's address for background file transfers (the host this receiver streams from).
+    private var clipboardPeerHost: String? {
+        if let udpSocket { return udpSocket.host }
+        if case let .hostPort(host, _)? = controlConnection?.currentPath?.remoteEndpoint {
+            switch host {
+            case let .ipv4(address): return "\(address)"
+            case let .ipv6(address): return "\(address)"
+            case let .name(name, _): return name
+            @unknown default: return nil
+            }
+        }
+        return nil
+    }
+
+    /// Points the clipboard channel at the current control session and sends the subscription.
+    private func startClipboardSession() {
+        let socket = udpSocket
+        let connection = controlConnection
+        let streamID = controlStreamID
+        let connectionSecurity = self.connectionSecurity
+        clipboardSession.start(mtu: Int(makeConfiguration().mtu), enabled: isClipboardSyncActive, peerHost: clipboardPeerHost) { payload in
+            let datagram = ReceiverWireHeader.control(.clipboard, streamID: streamID, payload: payload)
+            if let socket {
+                socket.send(datagram)
+            } else if let sealed = connectionSecurity.seal(datagram) {
+                connection?.send(content: sealed, completion: .idempotent)
+            }
+        }
+    }
+
     private func send(_ data: Data) {
         if let udpSocket {
             udpSocket.send(data)
             return
         }
+        guard let data = connectionSecurity.seal(data) else { return }
         controlConnection?.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let error else { return }
             Task { @MainActor in

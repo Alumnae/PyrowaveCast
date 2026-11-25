@@ -2285,34 +2285,62 @@ public struct SPPWLocalPointer: Sendable, Equatable {
     }
 }
 
-/// Receiver-side magnifier (1×–2×) for the video view.
+/// Receiver-side magnifier (1× up to `scaleLimit`: 2× on macOS, 10× on iOS) for the video view.
 ///
 /// `scale` magnifies the view about its center and `offsetX`/`offsetY` translate the
 /// magnified content, in the caller's view points (UIKit or AppKit axes, used consistently).
-/// The content always covers the view, so no black margin appears while zoomed. Input
-/// mapping undoes the zoom with `contentPoint(...)` before `SPPWInputCoordinateMapper`.
+/// The content always covers the view, so no black margin appears while zoomed; with a
+/// content size (`setContentSize`, the aspect-fit picture centered in the view) only the
+/// picture counts, so a letterboxed picture pans to its own edges and stays centered on an
+/// axis where it is still smaller than the view. Input mapping undoes the zoom with
+/// `contentPoint(...)` before `SPPWInputCoordinateMapper`.
 public struct SPPWViewZoom: Equatable, Sendable {
     public static let minimumScale = 1.0
+    /// Default limit (macOS receiver).
     public static let maximumScale = 2.0
+    /// Limit of the iOS receiver's pinch zoom.
+    public static let iOSMaximumScale = 10.0
 
     public private(set) var scale: Double = 1
     public private(set) var offsetX: Double = 0
     public private(set) var offsetY: Double = 0
+    public private(set) var scaleLimit: Double = SPPWViewZoom.maximumScale
+    /// Size of the picture centered in the view, in unzoomed view points (0: the whole view).
+    public private(set) var contentWidth: Double = 0
+    public private(set) var contentHeight: Double = 0
 
-    public init() {}
+    public init(scaleLimit: Double = SPPWViewZoom.maximumScale) {
+        self.scaleLimit = max(Self.minimumScale, scaleLimit.isFinite ? scaleLimit : Self.maximumScale)
+    }
 
-    public init(scale: Double, offsetX: Double = 0, offsetY: Double = 0, viewWidth: Double, viewHeight: Double) {
-        self.scale = Self.clampedScale(scale)
+    public init(
+        scale: Double,
+        offsetX: Double = 0,
+        offsetY: Double = 0,
+        viewWidth: Double,
+        viewHeight: Double,
+        scaleLimit: Double = SPPWViewZoom.maximumScale
+    ) {
+        self.scaleLimit = max(Self.minimumScale, scaleLimit.isFinite ? scaleLimit : Self.maximumScale)
+        self.scale = Self.clampedScale(scale, limit: self.scaleLimit)
         self.offsetX = offsetX
         self.offsetY = offsetY
         clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
     }
 
+    /// The displayed picture's size (aspect fit, centered), so panning stops at its edges.
+    /// Pass 0 for the whole view. Re-clamps the offset.
+    public mutating func setContentSize(width: Double, height: Double, viewWidth: Double, viewHeight: Double) {
+        contentWidth = width.isFinite ? max(0, width) : 0
+        contentHeight = height.isFinite ? max(0, height) : 0
+        clampOffset(viewWidth: viewWidth, viewHeight: viewHeight)
+    }
+
     public var isZoomed: Bool { scale > 1.0005 }
 
-    public static func clampedScale(_ value: Double) -> Double {
+    public static func clampedScale(_ value: Double, limit: Double = maximumScale) -> Double {
         guard value.isFinite else { return minimumScale }
-        return min(max(value, minimumScale), maximumScale)
+        return min(max(value, minimumScale), max(limit, minimumScale))
     }
 
     /// Multiplies the scale by `factor`, keeping the content under `(anchorX, anchorY)` in place.
@@ -2323,7 +2351,7 @@ public struct SPPWViewZoom: Equatable, Sendable {
 
     /// Sets an absolute scale, keeping the content under the anchor in place.
     public mutating func setScale(_ newScale: Double, anchorX: Double, anchorY: Double, viewWidth: Double, viewHeight: Double) {
-        let target = Self.clampedScale(newScale)
+        let target = Self.clampedScale(newScale, limit: scaleLimit)
         let content = contentPoint(viewX: anchorX, viewY: anchorY, viewWidth: viewWidth, viewHeight: viewHeight)
         let cx = viewWidth * 0.5
         let cy = viewHeight * 0.5
@@ -2354,6 +2382,68 @@ public struct SPPWViewZoom: Equatable, Sendable {
         offsetY = 0
     }
 
+    /// Scale above which a relative pointer (trackpad swipes, mouse) pans the magnified picture
+    /// instead of leaving the visible area (`keepVisible`).
+    public static let pointerFollowMinimumScale = 1.1
+
+    /// A landscape screen showing a landscape picture (as displayed, after rotation): the
+    /// layout where the iOS receiver pans with the pointer and makes room for the keyboard.
+    public static func isLandscapeMatch(
+        viewWidth: Double,
+        viewHeight: Double,
+        videoWidth: Double,
+        videoHeight: Double,
+        orientation: SPPWVideoOrientation
+    ) -> Bool {
+        guard viewWidth > viewHeight, videoWidth > 0, videoHeight > 0 else { return false }
+        let shownWidth = orientation.swapsDimensions ? videoHeight : videoWidth
+        let shownHeight = orientation.swapsDimensions ? videoWidth : videoHeight
+        return shownWidth > shownHeight
+    }
+
+    /// Pans so the view point `(viewX, viewY)` (where the pointer is drawn) stays at least
+    /// `margin` inside the view. The pan is clamped, so at the picture's edges the pointer moves
+    /// on to the real edge and every corner stays reachable without zooming out.
+    /// Returns `true` when the offset changed.
+    @discardableResult
+    public mutating func keepVisible(viewX: Double, viewY: Double, viewWidth: Double, viewHeight: Double, margin: Double) -> Bool {
+        guard isZoomed, viewX.isFinite, viewY.isFinite, viewWidth > 0, viewHeight > 0 else { return false }
+        let marginX = min(max(margin, 0), viewWidth * 0.5)
+        let marginY = min(max(margin, 0), viewHeight * 0.5)
+        let targetX = min(max(viewX, marginX), viewWidth - marginX)
+        let targetY = min(max(viewY, marginY), viewHeight - marginY)
+        guard targetX != viewX || targetY != viewY else { return false }
+        let before = (offsetX, offsetY)
+        pan(dx: targetX - viewX, dy: targetY - viewY, viewWidth: viewWidth, viewHeight: viewHeight)
+        return before.0 != offsetX || before.1 != offsetY
+    }
+
+    /// Center-locked follow (as in Remotix): a pointer moving away from the middle of the view
+    /// stays in the middle and the magnified picture pans the opposite way under it. The pan is
+    /// clamped, so once the picture's edge is reached the pointer leaves the middle and reaches
+    /// the real edge; moving back, it travels freely until it is in the middle again.
+    /// `motionX`/`motionY` give the direction of the last move (any unit, only the sign counts).
+    /// Returns `true` when the offset changed.
+    @discardableResult
+    public mutating func followCentered(
+        viewX: Double,
+        viewY: Double,
+        motionX: Double,
+        motionY: Double,
+        viewWidth: Double,
+        viewHeight: Double
+    ) -> Bool {
+        guard isZoomed, viewX.isFinite, viewY.isFinite, viewWidth > 0, viewHeight > 0 else { return false }
+        let cx = viewWidth * 0.5
+        let cy = viewHeight * 0.5
+        let dx = (viewX - cx) * motionX > 0 ? cx - viewX : 0
+        let dy = (viewY - cy) * motionY > 0 ? cy - viewY : 0
+        guard dx != 0 || dy != 0 else { return false }
+        let before = (offsetX, offsetY)
+        pan(dx: dx, dy: dy, viewWidth: viewWidth, viewHeight: viewHeight)
+        return before.0 != offsetX || before.1 != offsetY
+    }
+
     /// The unzoomed view point shown at `(viewX, viewY)`.
     public func contentPoint(viewX: Double, viewY: Double, viewWidth: Double, viewHeight: Double) -> (x: Double, y: Double) {
         let cx = viewWidth * 0.5
@@ -2368,10 +2458,17 @@ public struct SPPWViewZoom: Equatable, Sendable {
         return (cx + offsetX + scale * (contentX - cx), cy + offsetY + scale * (contentY - cy))
     }
 
+    /// Half the room the magnified picture has to move on one axis: 0 (centered) while it is
+    /// still smaller than the view, so no black margin is ever shown beside it.
+    private static func panLimit(scale: Double, content: Double, view: Double) -> Double {
+        let extent = content > 0 ? min(content, view) : view
+        return max(0, (scale * extent - view) * 0.5)
+    }
+
     /// Re-clamps after the view size changed (rotation, window resize).
     public mutating func clampOffset(viewWidth: Double, viewHeight: Double) {
-        let limitX = max(0, (scale - 1) * viewWidth * 0.5)
-        let limitY = max(0, (scale - 1) * viewHeight * 0.5)
+        let limitX = Self.panLimit(scale: scale, content: contentWidth, view: viewWidth)
+        let limitY = Self.panLimit(scale: scale, content: contentHeight, view: viewHeight)
         offsetX = min(max(offsetX, -limitX), limitX)
         offsetY = min(max(offsetY, -limitY), limitY)
         if !isZoomed {
@@ -2379,6 +2476,28 @@ public struct SPPWViewZoom: Equatable, Sendable {
             offsetX = 0
             offsetY = 0
         }
+    }
+}
+
+/// How this build is distributed. The Mac App Store build is compiled with
+/// `-DPYROWAVE_APP_STORE` (`./scripts/build-app.sh --app-store`) and runs in the App Sandbox,
+/// which does not let an app post keyboard and mouse events to other apps (`CGEventPost`
+/// needs Accessibility trust). That build keeps streaming, receiving and clipboard sync but
+/// never injects remote input, never asks for Accessibility and says so in the server UI.
+public enum SPPWDistribution {
+    #if PYROWAVE_APP_STORE
+    public static let isMacAppStore = true
+    #else
+    public static let isMacAppStore = false
+    #endif
+
+    /// Whether this Mac may be controlled by receivers (keyboard, mouse, touch injection).
+    public static var allowsRemoteInputInjection: Bool {
+        #if os(macOS)
+        !isMacAppStore
+        #else
+        false
+        #endif
     }
 }
 
@@ -2393,12 +2512,13 @@ public enum SPPWMacInputInjector {
     /// Returns `true` when the current process has macOS Accessibility permission
     /// (`Privacy & Security → Accessibility`), required to post synthetic `CGEvent`s.
     public static var isAccessibilityTrusted: Bool {
-        AXIsProcessTrusted()
+        SPPWDistribution.allowsRemoteInputInjection && AXIsProcessTrusted()
     }
 
     /// Prompts macOS to show the Accessibility permission dialog if not yet granted.
     @discardableResult
     public static func requestAccessibilityPermission() -> Bool {
+        guard SPPWDistribution.allowsRemoteInputInjection else { return false }
         let promptKey = "AXTrustedCheckOptionPrompt" as CFString
         let options = [promptKey: kCFBooleanTrue] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
@@ -2504,6 +2624,8 @@ public final class SPPWMacInputController: @unchecked Sendable {
         displayBounds: CGRect,
         nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
+        // Mac App Store build: the sandbox does not allow injecting input into other apps.
+        guard SPPWDistribution.allowsRemoteInputInjection else { return }
         lock.lock()
         defer { lock.unlock() }
 
@@ -2917,13 +3039,101 @@ public final class SPPWMacInputController: @unchecked Sendable {
 public enum SPPWClipboardFormat: UInt8, Sendable, Equatable {
     case utf8Text = 1
     case png = 2
+    /// One or more files (`SPPWClipboardFiles` container), e.g. copied in Finder.
+    case files = 3
+    /// Placeholder for large files and folders sent in the background (`SPPWFileTransferOffer`).
+    case fileOffer = 4
 
     /// Largest clipboard item each side sends or accepts.
     public var maximumByteCount: Int {
         switch self {
         case .utf8Text: return 1 << 20
         case .png: return 8 << 20
+        case .files: return 16 << 20
+        case .fileOffer: return 4 << 20
         }
+    }
+}
+
+/// Container for the `.files` clipboard format (big-endian):
+/// `UInt16 count`, then per file `UInt16 nameByteCount`, UTF-8 name, `UInt32 byteCount`, bytes.
+/// Names are plain file names (no folders); folders themselves are not sent.
+public struct SPPWClipboardFiles: Sendable, Equatable {
+    public struct File: Sendable, Equatable {
+        public let name: String
+        public let data: Data
+
+        public init(name: String, data: Data) {
+            self.name = name
+            self.data = data
+        }
+    }
+
+    public static let maximumFileCount = 64
+    public static let maximumNameBytes = 255
+
+    public let files: [File]
+
+    public init(files: [File]) {
+        self.files = files
+    }
+
+    /// Reduces a name to a safe single path component (no `/`, `:`, control characters or
+    /// leading dots), at most `maximumNameBytes` UTF-8 bytes. Returns `nil` when nothing is left.
+    public static func sanitizedName(_ raw: String) -> String? {
+        var name = String(raw.unicodeScalars.map { scalar -> Character in
+            if scalar == "/" || scalar == ":" || scalar == "\\" || scalar.value < 0x20 || scalar.value == 0x7F {
+                return "_"
+            }
+            return Character(scalar)
+        })
+        while name.hasPrefix(".") { name.removeFirst() }
+        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        while name.utf8.count > maximumNameBytes { name.removeLast() }
+        return name.isEmpty ? nil : name
+    }
+
+    public func encoded() -> Data? {
+        guard !files.isEmpty, files.count <= Self.maximumFileCount else { return nil }
+        var data = Data()
+        func put16(_ value: Int) { data.append(UInt8(truncatingIfNeeded: value >> 8)); data.append(UInt8(truncatingIfNeeded: value)) }
+        func put32(_ value: Int) { put16(value >> 16); put16(value & 0xFFFF) }
+        put16(files.count)
+        for file in files {
+            guard let name = Self.sanitizedName(file.name), file.data.count <= Int(UInt32.max) else { return nil }
+            let nameBytes = Data(name.utf8)
+            put16(nameBytes.count)
+            data.append(nameBytes)
+            put32(file.data.count)
+            data.append(file.data)
+        }
+        return data
+    }
+
+    public init?(decoding payload: Data) {
+        let bytes = [UInt8](payload)
+        var offset = 0
+        func read(_ length: Int) -> ArraySlice<UInt8>? {
+            guard length >= 0, offset + length <= bytes.count else { return nil }
+            defer { offset += length }
+            return bytes[offset..<(offset + length)]
+        }
+        func u16() -> Int? { read(2).map { Int($0[$0.startIndex]) << 8 | Int($0[$0.startIndex + 1]) } }
+        func u32() -> Int? {
+            guard let high = u16(), let low = u16() else { return nil }
+            return high << 16 | low
+        }
+        guard let count = u16(), (1...Self.maximumFileCount).contains(count) else { return nil }
+        var files: [File] = []
+        for _ in 0..<count {
+            guard let nameLength = u16(), let nameBytes = read(nameLength),
+                  let rawName = String(bytes: nameBytes, encoding: .utf8),
+                  let name = Self.sanitizedName(rawName),
+                  let size = u32(), let body = read(size) else { return nil }
+            files.append(File(name: name, data: Data(body)))
+        }
+        guard offset == bytes.count else { return nil }
+        self.files = files
     }
 }
 
@@ -3150,7 +3360,7 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
     private var nextTransferID = UInt32.random(in: 1...UInt32.max / 2)
     private var reassembler = SPPWClipboardReassembler()
     private var lastDigest: UInt64?
-    private var pending: (id: UInt32, chunks: [Data], attempts: Int)?
+    private var pending: (id: UInt32, chunks: [Data], attempts: Int, maxAttempts: Int)?
     private var timer: DispatchSourceTimer?
 
     /// - Parameters:
@@ -3174,7 +3384,8 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
 
     /// Chunk payload size for a datagram budget (`mtu`).
     public static func chunkBytes(forMTU mtu: Int) -> Int {
-        max(256, min(mtu, 9000) - SPPWDatagramHeader.byteCount - SPPWClipboardMessage.headerByteCount)
+        // Room for the secure envelope too (PROTOCOL.md §7), so a sealed chunk never exceeds the budget.
+        max(256, min(mtu, 9000) - SPPWDatagramHeader.byteCount - SPPWClipboardMessage.headerByteCount - SPPWSecureEnvelope.overheadBytes)
     }
 
     /// Sends a subscription change (receiver → server).
@@ -3198,10 +3409,10 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
         nextTransferID &+= 1
         if nextTransferID == 0 { nextTransferID = 1 }
         let chunks = SPPWClipboardMessage.chunks(for: content, transferID: id, maxChunkBytes: maxChunkBytes).map { $0.encoded() }
-        pending = (id, chunks, 1)
+        pending = (id, chunks, 1, Self.attemptBudget(base: maxAttempts, chunkCount: chunks.count))
         lock.unlock()
-        transmit(chunks)
-        scheduleRetransmit()
+        transmit(chunks, transferID: id)
+        scheduleRetransmit(interval: Self.retransmitInterval(base: retransmitIntervalNanos, chunkCount: chunks.count))
         return true
     }
 
@@ -3260,23 +3471,45 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func transmit(_ chunks: [Data]) {
+    private func transmit(_ chunks: [Data], transferID: UInt32) {
         let send = self.send
-        queue.async {
+        queue.async { [weak self] in
             for (index, chunk) in chunks.enumerated() {
+                // A newer item (or an ack) ends this round at once, so a fresh copy is never
+                // stuck behind the rest of an older, larger one.
+                if index % 16 == 0, self?.isPending(transferID) != true { return }
                 send(chunk)
-                // Large images: short pauses keep socket buffers and Wi-Fi from dropping bursts.
-                if index % 32 == 31 { usleep(1_000) }
+                // Large items: short pauses keep socket buffers and Wi-Fi from dropping bursts
+                // (about 20 MB/s with 1.4 kB chunks).
+                if index % 16 == 15 { usleep(1_000) }
             }
         }
     }
 
-    private func scheduleRetransmit() {
+    private func isPending(_ transferID: UInt32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending?.id == transferID
+    }
+
+    /// Retransmission rounds for an item: large items get more, since each round only has to
+    /// fill the holes the previous one left.
+    public static func attemptBudget(base: Int, chunkCount: Int) -> Int {
+        min(base + max(chunkCount, 0) / 500, 30)
+    }
+
+    /// Time between retransmission rounds: the base interval, stretched for large items so a
+    /// round is never queued while the previous one is still being sent (~120 µs per chunk).
+    public static func retransmitInterval(base: UInt64, chunkCount: Int) -> UInt64 {
+        max(base, UInt64(max(chunkCount, 0)) * 120_000)
+    }
+
+    private func scheduleRetransmit(interval intervalNanos: UInt64) {
         lock.lock()
         defer { lock.unlock() }
         timer?.cancel()
         let source = DispatchSource.makeTimerSource(queue: queue)
-        let interval = DispatchTimeInterval.nanoseconds(Int(retransmitIntervalNanos))
+        let interval = DispatchTimeInterval.nanoseconds(Int(intervalNanos))
         source.schedule(deadline: .now() + interval, repeating: interval)
         source.setEventHandler { [weak self] in self?.retransmitTick() }
         timer = source
@@ -3285,7 +3518,7 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
 
     private func retransmitTick() {
         lock.lock()
-        guard var current = pending, current.attempts < maxAttempts else {
+        guard var current = pending, current.attempts < current.maxAttempts else {
             pending = nil
             timer?.cancel()
             timer = nil
@@ -3295,7 +3528,7 @@ public final class SPPWClipboardChannel: @unchecked Sendable {
         current.attempts += 1
         pending = current
         lock.unlock()
-        transmit(current.chunks)
+        transmit(current.chunks, transferID: current.id)
     }
 }
 
@@ -3347,26 +3580,186 @@ public final class SPPWMacPasteboardBridge: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// The background download feeding the pasteboard (a newer item cancels it).
+    private var activeDownload: UUID?
+
     /// Writes an item received from the peer; the resulting change is not reported back.
-    public func write(_ content: SPPWClipboardContent) {
+    /// `peerHost` is where a `.fileOffer` is downloaded from (the peer's SPPW/1 address).
+    public func write(_ content: SPPWClipboardContent, peerHost: String? = nil) {
         let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
+        lock.lock()
+        let previousDownload = activeDownload
+        activeDownload = nil
+        lock.unlock()
+        if let previousDownload { SPPWFileTransfers.shared.cancel(previousDownload) }
         switch content.format {
         case .utf8Text:
+            pasteboard.clearContents()
             pasteboard.setString(content.text ?? "", forType: .string)
         case .png:
+            pasteboard.clearContents()
             pasteboard.setData(content.data, forType: .png)
+        case .files:
+            guard let urls = Self.storeReceivedFiles(content.data), !urls.isEmpty else { return }
+            pasteboard.clearContents()
+            pasteboard.writeObjects(urls.map { $0 as NSURL })
+        case .fileOffer:
+            guard let offer = SPPWFileTransferOffer(decoding: content.data) else { return }
+            // Until the files are here, the pasteboard holds their names (as Finder's own copy
+            // does), so an older item is never pasted by mistake.
+            pasteboard.clearContents()
+            pasteboard.setString(offer.topLevelNames.joined(separator: "\n"), forType: .string)
+            let placeholderCount = pasteboard.changeCount
+            lock.lock()
+            lastChangeCount = placeholderCount
+            lock.unlock()
+            guard let peerHost else { return }
+            let directory = Self.backgroundDownloadsDirectory
+            if let previous = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+                previous.forEach { try? FileManager.default.removeItem(at: $0) }
+            }
+            let id = SPPWFileTransfers.shared.download(offer, from: peerHost, into: directory) { [weak self] urls in
+                guard let self, let urls, !urls.isEmpty else { return }
+                self.finishBackgroundDownload(urls, placeholderCount: placeholderCount)
+            }
+            lock.lock()
+            activeDownload = id
+            lock.unlock()
+            return
         }
         lock.lock()
         lastChangeCount = pasteboard.changeCount
         lock.unlock()
     }
 
-    /// Reads the current pasteboard item (text first, then an image converted to PNG).
+    /// Replaces the names placeholder with the downloaded files, unless something else was copied
+    /// in the meantime.
+    private func finishBackgroundDownload(_ urls: [URL], placeholderCount: Int) {
+        DispatchQueue.main.async { [self] in
+            let pasteboard = NSPasteboard.general
+            guard pasteboard.changeCount == placeholderCount else { return }
+            pasteboard.clearContents()
+            pasteboard.writeObjects(urls.map { $0 as NSURL })
+            lock.lock()
+            lastChangeCount = pasteboard.changeCount
+            activeDownload = nil
+            lock.unlock()
+        }
+    }
+
+    /// Where background downloads land (kept apart from inline items, which replace each other).
+    public static var backgroundDownloadsDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PyrowaveCast Transfers", isDirectory: true)
+    }
+
+    /// The general pasteboard's change counter (any change, by any app, increments it).
+    public static var currentChangeCount: Int {
+        NSPasteboard.general.changeCount
+    }
+
+    /// Folder for files received from the peer (`<temporary>/PyrowaveCast Clipboard/<id>/`).
+    /// Only the latest item is kept: pasting in Finder copies the files out of it.
+    public static var receivedFilesDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PyrowaveCast Clipboard", isDirectory: true)
+    }
+
+    /// Writes received files to a fresh folder, marks them quarantined like other downloads,
+    /// and returns their URLs (names made unique within the item).
+    static func storeReceivedFiles(_ payload: Data) -> [URL]? {
+        guard let container = SPPWClipboardFiles(decoding: payload) else { return nil }
+        let fileManager = FileManager.default
+        let root = receivedFilesDirectory
+        if let previous = try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+            previous.forEach { try? fileManager.removeItem(at: $0) }
+        }
+        let folder = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        var used: Set<String> = []
+        var urls: [URL] = []
+        for file in container.files {
+            var name = file.name
+            var suffix = 2
+            while used.contains(name.lowercased()) {
+                let base = (file.name as NSString).deletingPathExtension
+                let ext = (file.name as NSString).pathExtension
+                name = ext.isEmpty ? "\(base) \(suffix)" : "\(base) \(suffix).\(ext)"
+                suffix += 1
+            }
+            used.insert(name.lowercased())
+            var url = folder.appendingPathComponent(name, isDirectory: false)
+            guard (try? file.data.write(to: url, options: .atomic)) != nil else { continue }
+            var values = URLResourceValues()
+            values.quarantineProperties = [
+                kLSQuarantineAgentNameKey as String: "PyrowaveCast",
+                kLSQuarantineTypeKey as String: kLSQuarantineTypeOtherDownload as String
+            ]
+            try? url.setResourceValues(values)
+            urls.append(url)
+        }
+        return urls
+    }
+
+    /// Regular files referenced by the pasteboard (Finder copy) packed as `.files`, or `nil`
+    /// when there are none, a folder is among them, or they exceed the size limit.
+    private static let offerCacheLock = NSLock()
+    nonisolated(unsafe) private static var offerCache: (changeCount: Int, content: SPPWClipboardContent)?
+
+    static func readFiles(from pasteboard: NSPasteboard) -> SPPWClipboardContent?? {
+        guard let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL], !urls.isEmpty else { return .none }
+        // Small regular files travel inline; folders and large files go in the background, with
+        // only an offer on the clipboard channel. `.some(nil)`: the caller falls back to names.
+        var inline = urls.count <= SPPWClipboardFiles.maximumFileCount
+        var total = 0
+        for url in urls where inline {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else {
+                inline = false
+                break
+            }
+            total += values.fileSize ?? 0
+            if total > SPPWFileTransferLimits.inlineByteLimit { inline = false }
+        }
+        guard inline else {
+            // The same copy read again (another receiver subscribes) reuses its open offer.
+            let changeCount = pasteboard.changeCount
+            offerCacheLock.lock()
+            defer { offerCacheLock.unlock() }
+            if let cached = offerCache, cached.changeCount == changeCount { return .some(cached.content) }
+            guard let offer = SPPWFileTransfers.shared.offer(urls), let encoded = offer.encoded() else { return .some(nil) }
+            let content = SPPWClipboardContent(format: .fileOffer, data: encoded)
+            offerCache = (changeCount, content)
+            return .some(content)
+        }
+        var files: [SPPWClipboardFiles.File] = []
+        for url in urls {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return .some(nil) }
+            files.append(SPPWClipboardFiles.File(name: url.lastPathComponent, data: data))
+        }
+        guard let encoded = SPPWClipboardFiles(files: files).encoded(),
+              encoded.count <= SPPWClipboardFormat.files.maximumByteCount else { return .some(nil) }
+        return .some(SPPWClipboardContent(format: .files, data: encoded))
+    }
+
+    /// Reads the current pasteboard item: files (Finder), then text, then an image as PNG.
     public static func readCurrent() -> SPPWClipboardContent? {
         let pasteboard = NSPasteboard.general
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard types.isDisjoint(with: skippedTypes) else { return nil }
+        if case let .some(files) = readFiles(from: pasteboard) {
+            if let files { return files }
+            // Files that cannot be sent (a folder, or over the limit): send their names as text,
+            // as Finder itself does, so the peer never keeps pasting an older item.
+            let names = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])?
+                .map(\.lastPathComponent).joined(separator: "\n") ?? ""
+            return names.isEmpty ? nil : SPPWClipboardContent(text: names)
+        }
         if let text = pasteboard.string(forType: .string), !text.isEmpty {
             let content = SPPWClipboardContent(text: text)
             return content.data.count <= SPPWClipboardFormat.utf8Text.maximumByteCount ? content : nil

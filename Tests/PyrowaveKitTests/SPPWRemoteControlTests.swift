@@ -506,3 +506,171 @@ private func chordResults(_ steps: [SPPWKeyModifiers?]) -> [Bool] {
     #expect(abs(rotated.height - 390) < 1e-9)
     #expect(abs(rotated.width - 1920.0 * 390 / 1080) < 1e-9)
 }
+
+// MARK: - Clipboard files
+
+@Test func clipboardFilesRoundTripKeepsNamesAndBytes() throws {
+    let files = SPPWClipboardFiles(files: [
+        .init(name: "notes.txt", data: Data("hello".utf8)),
+        .init(name: "empty.bin", data: Data()),
+        .init(name: "foto 1.png", data: Data([0x89, 0x50, 0x4E, 0x47]))
+    ])
+    let encoded = try #require(files.encoded())
+    #expect(SPPWClipboardFiles(decoding: encoded) == files)
+    // Truncated or padded containers are rejected.
+    #expect(SPPWClipboardFiles(decoding: encoded.dropLast()) == nil)
+    #expect(SPPWClipboardFiles(decoding: encoded + Data([0])) == nil)
+    #expect(SPPWClipboardFiles(decoding: Data([0, 0])) == nil)
+}
+
+@Test func clipboardFileNamesCannotEscapeTheirFolder() {
+    #expect(SPPWClipboardFiles.sanitizedName("../../etc/passwd") == "_.._etc_passwd")
+    #expect(SPPWClipboardFiles.sanitizedName("/tmp/x") == "_tmp_x")
+    #expect(SPPWClipboardFiles.sanitizedName(".hidden") == "hidden")
+    #expect(SPPWClipboardFiles.sanitizedName("a:b\\c\u{1}") == "a_b_c_")
+    #expect(SPPWClipboardFiles.sanitizedName("...") == nil)
+    #expect(SPPWClipboardFiles.sanitizedName("   ") == nil)
+    let long = String(repeating: "é", count: 300)
+    #expect((SPPWClipboardFiles.sanitizedName(long)?.utf8.count ?? 0) <= SPPWClipboardFiles.maximumNameBytes)
+}
+
+@Test func clipboardFilesTravelAsChunksAndReassemble() throws {
+    let payload = Data((0..<5000).map { UInt8(truncatingIfNeeded: $0) })
+    let container = try #require(SPPWClipboardFiles(files: [.init(name: "data.bin", data: payload)]).encoded())
+    let content = SPPWClipboardContent(format: .files, data: container)
+    let messages = SPPWClipboardMessage.chunks(for: content, transferID: 9, maxChunkBytes: 1000)
+    var reassembler = SPPWClipboardReassembler()
+    var result: SPPWClipboardReassembler.Result = .pending
+    for message in messages.reversed() {
+        let parsed = try #require(SPPWClipboardMessage(parsing: message.encoded()))
+        guard case let .chunk(id, format, index, count, total, bytes) = parsed else {
+            Issue.record("expected a chunk"); return
+        }
+        result = reassembler.add(transferID: id, format: format, index: index, count: count, totalByteCount: total, bytes: bytes)
+    }
+    #expect(result == .complete(content))
+    #expect(SPPWClipboardFormat.files.maximumByteCount == 16 << 20)
+}
+
+@Test func clipboardRetransmitIntervalStretchesForLargeItems() {
+    #expect(SPPWClipboardChannel.retransmitInterval(base: 400_000_000, chunkCount: 1) == 400_000_000)
+    #expect(SPPWClipboardChannel.retransmitInterval(base: 400_000_000, chunkCount: 12_000) == 1_440_000_000)
+}
+
+#if os(macOS)
+@Test func receivedClipboardFilesAreStoredWithUniqueNames() throws {
+    let container = try #require(SPPWClipboardFiles(files: [
+        .init(name: "a.txt", data: Data("1".utf8)),
+        .init(name: "a.txt", data: Data("2".utf8))
+    ]).encoded())
+    let urls = try #require(SPPWMacPasteboardBridge.storeReceivedFiles(container))
+    #expect(urls.map(\.lastPathComponent) == ["a.txt", "a 2.txt"])
+    #expect(try urls.map { try Data(contentsOf: $0) } == [Data("1".utf8), Data("2".utf8)])
+    #expect(urls.allSatisfy { $0.path.hasPrefix(SPPWMacPasteboardBridge.receivedFilesDirectory.path) })
+    try? FileManager.default.removeItem(at: urls[0].deletingLastPathComponent())
+}
+#endif
+
+// MARK: - iOS zoom follow and landscape layout
+
+@Test func zoomKeepVisiblePansTowardThePointerUntilTheEdge() {
+    var zoom = SPPWViewZoom(scale: 2, viewWidth: 800, viewHeight: 400)
+    // Not near an edge: nothing moves.
+    let moved1 = zoom.keepVisible(viewX: 400, viewY: 200, viewWidth: 800, viewHeight: 400, margin: 60)
+    #expect(!moved1)
+    // Past the right margin: the content shifts left by the overshoot.
+    let moved2 = zoom.keepVisible(viewX: 790, viewY: 200, viewWidth: 800, viewHeight: 400, margin: 60)
+    #expect(moved2)
+    #expect(zoom.offsetX == -50)
+    // Far beyond: the pan stops at the picture's edge (offset limit (2-1)*800/2).
+    zoom.keepVisible(viewX: 5000, viewY: -5000, viewWidth: 800, viewHeight: 400, margin: 60)
+    #expect(zoom.offsetX == -400)
+    #expect(zoom.offsetY == 200)
+    // At the limit nothing changes any more, so the pointer itself reaches the corner.
+    let moved3 = zoom.keepVisible(viewX: 790, viewY: 10, viewWidth: 800, viewHeight: 400, margin: 60)
+    #expect(!moved3)
+    // Not zoomed: never pans.
+    var plain = SPPWViewZoom()
+    let moved4 = plain.keepVisible(viewX: 790, viewY: 10, viewWidth: 800, viewHeight: 400, margin: 60)
+    #expect(!moved4)
+}
+
+@Test func zoomFollowCenteredLocksThePointerInTheMiddleUntilTheEdge() {
+    var zoom = SPPWViewZoom(scale: 2, viewWidth: 800, viewHeight: 400)
+    // Left of the middle moving right: the pointer travels freely toward the middle.
+    let moved1 = zoom.followCentered(viewX: 300, viewY: 200, motionX: 1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(!moved1)
+    // Past the middle moving right: the picture shifts left, pointer back in the middle.
+    let moved2 = zoom.followCentered(viewX: 430, viewY: 200, motionX: 1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(moved2)
+    #expect(zoom.offsetX == -30)
+    #expect(zoom.viewPoint(contentX: zoom.contentPoint(viewX: 430, viewY: 200, viewWidth: 800, viewHeight: 400).x,
+                           contentY: 200, viewWidth: 800, viewHeight: 400).x == 430)
+    // Far right: the pan stops at the picture's edge, so the pointer can reach the right edge.
+    zoom.followCentered(viewX: 5000, viewY: 200, motionX: 1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(zoom.offsetX == -400)
+    let moved3 = zoom.followCentered(viewX: 790, viewY: 200, motionX: 1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(!moved3)
+    // Coming back from the edge: free travel until the middle, then the picture pans again.
+    let moved4 = zoom.followCentered(viewX: 600, viewY: 200, motionX: -1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(!moved4)
+    let moved5 = zoom.followCentered(viewX: 380, viewY: 200, motionX: -1, motionY: 0, viewWidth: 800, viewHeight: 400)
+    #expect(moved5)
+    #expect(zoom.offsetX == -380)
+    // Vertical axis independently; not zoomed never pans.
+    zoom.followCentered(viewX: 400, viewY: 260, motionX: 0, motionY: 1, viewWidth: 800, viewHeight: 400)
+    #expect(zoom.offsetY == -60)
+    var plain = SPPWViewZoom()
+    let moved6 = plain.followCentered(viewX: 700, viewY: 300, motionX: 1, motionY: 1, viewWidth: 800, viewHeight: 400)
+    #expect(!moved6)
+}
+
+@Test func zoomStopsAtTheLetterboxedPictureAndReachesTenTimesOnIOS() {
+    // Portrait iPhone (390×844) showing a 16:9 Mac as a 390×219 band.
+    var zoom = SPPWViewZoom(scaleLimit: SPPWViewZoom.iOSMaximumScale)
+    zoom.setContentSize(width: 390, height: 219.375, viewWidth: 390, viewHeight: 844)
+    zoom.setScale(50, anchorX: 195, anchorY: 422, viewWidth: 390, viewHeight: 844)
+    #expect(zoom.scale == 10)
+    // Default limit stays 2× (macOS receiver).
+    var mac = SPPWViewZoom()
+    mac.setScale(50, anchorX: 0, anchorY: 0, viewWidth: 1000, viewHeight: 600)
+    #expect(mac.scale == SPPWViewZoom.maximumScale)
+
+    // At 2× the band is 439 high: it may move only by (439 - 844)/2 < 0 → stays centered.
+    zoom.setScale(2, anchorX: 195, anchorY: 422, viewWidth: 390, viewHeight: 844)
+    zoom.pan(dx: 0, dy: 500, viewWidth: 390, viewHeight: 844)
+    #expect(zoom.offsetY == 0)
+    // Horizontally the band fills the width: the usual (2-1)*390/2 room.
+    zoom.pan(dx: 1000, dy: 0, viewWidth: 390, viewHeight: 844)
+    #expect(zoom.offsetX == 195)
+    // At 6× the band (1316 high) exceeds the view: it pans to its own edge, never past it.
+    zoom.setScale(6, anchorX: 195, anchorY: 422, viewWidth: 390, viewHeight: 844)
+    zoom.pan(dx: 0, dy: 5000, viewWidth: 390, viewHeight: 844)
+    #expect(abs(zoom.offsetY - (6 * 219.375 - 844) / 2) < 1e-9)
+    // Shown at its bottom edge: a pointer moving up past the middle pans the band back down.
+    zoom.pan(dx: 0, dy: -5000, viewWidth: 390, viewHeight: 844)
+    let moved = zoom.followCentered(viewX: 195, viewY: 300, motionX: 0, motionY: -1, viewWidth: 390, viewHeight: 844)
+    #expect(moved)
+    // Without a content size the whole view counts, as before.
+    var whole = SPPWViewZoom(scale: 2, viewWidth: 390, viewHeight: 844)
+    whole.pan(dx: 0, dy: 5000, viewWidth: 390, viewHeight: 844)
+    #expect(whole.offsetY == 422)
+}
+
+@Test func landscapeMatchNeedsLandscapeScreenAndPicture() {
+    let none = SPPWVideoOrientation()
+    var rotated = SPPWVideoOrientation()
+    _ = rotated.rotate()
+    #expect(SPPWViewZoom.isLandscapeMatch(viewWidth: 844, viewHeight: 390, videoWidth: 1920, videoHeight: 1080, orientation: none))
+    #expect(!SPPWViewZoom.isLandscapeMatch(viewWidth: 390, viewHeight: 844, videoWidth: 1920, videoHeight: 1080, orientation: none))
+    #expect(!SPPWViewZoom.isLandscapeMatch(viewWidth: 844, viewHeight: 390, videoWidth: 1080, videoHeight: 1920, orientation: none))
+    // A portrait picture turned sideways is shown landscape.
+    #expect(SPPWViewZoom.isLandscapeMatch(viewWidth: 844, viewHeight: 390, videoWidth: 1080, videoHeight: 1920, orientation: rotated))
+    #expect(!SPPWViewZoom.isLandscapeMatch(viewWidth: 844, viewHeight: 390, videoWidth: 0, videoHeight: 0, orientation: none))
+}
+
+@Test func clipboardLargeItemsGetMoreRetransmissionRounds() {
+    #expect(SPPWClipboardChannel.attemptBudget(base: 5, chunkCount: 1) == 5)
+    #expect(SPPWClipboardChannel.attemptBudget(base: 5, chunkCount: 12_000) == 29)
+    #expect(SPPWClipboardChannel.attemptBudget(base: 5, chunkCount: 60_000) == 30)
+}

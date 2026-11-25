@@ -57,6 +57,11 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 
 cp "$BIN" "$OUT/Contents/MacOS/PyrowaveCastReceiver"
+# Strip debug symbols: they list every object file by absolute build path, which
+# exposes the builder's home folder (the repositories are public).
+strip -S -x "$OUT/Contents/MacOS/PyrowaveCastReceiver"
+# strip invalidates the linker's ad-hoc signature; arm64 needs one to launch.
+codesign --force --sign - "$OUT/Contents/MacOS/PyrowaveCastReceiver"
 cp -R "$BUNDLE" "$OUT/Contents/Resources/"
 cp "$ROOT/Resources/AppIcon/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
 

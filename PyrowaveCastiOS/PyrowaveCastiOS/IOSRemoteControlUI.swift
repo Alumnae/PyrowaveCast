@@ -143,7 +143,7 @@ final class IOSRemoteInputDock: UIView {
     private static let doubleTapInterval: CFTimeInterval = 0.35
     static let height: CGFloat = 44
 
-    init(pasteControl: UIView) {
+    init() {
         super.init(frame: .zero)
         backgroundColor = IOSRemoteStyle.dockBackground
         layer.cornerRadius = Self.height / 2
@@ -177,16 +177,9 @@ final class IOSRemoteInputDock: UIView {
             self?.onAction?(.collapse)
         }
 
-        pasteControl.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            pasteControl.widthAnchor.constraint(equalToConstant: 36),
-            pasteControl.heightAnchor.constraint(equalToConstant: 32)
-        ])
-
         stack.addArrangedSubview(modeButton)
         stack.addArrangedSubview(keyboardButton)
         stack.addArrangedSubview(specialKeysButton)
-        stack.addArrangedSubview(pasteControl)
         stack.addArrangedSubview(Self.separator())
         let modifiers: [(SPPWKeyModifiers, String, String)] = [
             (.shift, "⇧", "Shift"), (.control, "⌃", "Control"), (.option, "⌥", "Option"), (.command, "⌘", "Command")
@@ -785,8 +778,8 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     /// Returns `true` (and disarms) when the next tap should be a right click.
     var consumeRightClickArm: (() -> Bool)?
     var onToggleControls: (() -> Void)?
-    /// Local magnifier (1×–2×) of the video; touches are mapped through it.
-    var zoom = SPPWViewZoom()
+    /// Local magnifier (1×–10×) of the video; touches are mapped through it.
+    var zoom = SPPWViewZoom(scaleLimit: SPPWViewZoom.iOSMaximumScale)
     var onZoomChanged: ((SPPWViewZoom) -> Void)?
 
     var mode: IOSRemoteInputMode = .trackpad {
@@ -804,10 +797,17 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
     private var pinchScaleTotal: CGFloat = 1
     private var pinchEngaged = false
     private var lastPinchLocation: CGPoint = .zero
+    /// Fingers on the pinch at the last sample. When one finger lifts first the recognizer's
+    /// location jumps to the remaining finger: that sample re-bases instead of panning.
+    private var lastPinchTouches = 0
 
     private var lastMoveTranslation: CGPoint = .zero
     private var lastMoveTime: CFTimeInterval = 0
     private var lastScrollTranslation: CGPoint = .zero
+    /// Fingers at the last scroll sample, and the velocity measured while both were down (the
+    /// centroid jumps when one finger lifts first, which would fling the scroll sideways).
+    private var lastScrollTouches = 0
+    private var scrollVelocity: CGPoint = .zero
     private var lastHoldLocation: CGPoint = .zero
     private var lastHoldTime: CFTimeInterval = 0
     private var isHoldDragging = false
@@ -912,14 +912,24 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
         case .began:
             stopMomentum()
             lastScrollTranslation = translation
+            lastScrollTouches = recognizer.numberOfTouches
+            scrollVelocity = .zero
         case .changed:
-            if !pinchEngaged {
-                sendScroll(dx: translation.x - lastScrollTranslation.x, dy: translation.y - lastScrollTranslation.y)
+            let touches = recognizer.numberOfTouches
+            if touches >= 2, touches == lastScrollTouches {
+                if !pinchEngaged {
+                    sendScroll(dx: translation.x - lastScrollTranslation.x, dy: translation.y - lastScrollTranslation.y)
+                }
+                scrollVelocity = recognizer.velocity(in: self)
+            } else {
+                // A finger lifted (or came back): re-base without scrolling and stop the fling.
+                scrollVelocity = .zero
             }
             lastScrollTranslation = translation
+            lastScrollTouches = touches
         case .ended:
             if !pinchEngaged {
-                startMomentum(velocity: recognizer.velocity(in: self))
+                startMomentum(velocity: scrollVelocity)
             }
         default:
             break
@@ -970,8 +980,17 @@ final class IOSTouchInputView: UIView, UIGestureRecognizerDelegate {
             pinchScaleTotal = 1
             pinchEngaged = false
             lastPinchLocation = location
+            lastPinchTouches = recognizer.numberOfTouches
             recognizer.scale = 1
         case .changed:
+            let touches = recognizer.numberOfTouches
+            defer { lastPinchTouches = touches }
+            guard touches >= 2, touches == lastPinchTouches else {
+                // One finger lifted first: the location is now that of the other finger alone.
+                recognizer.scale = 1
+                lastPinchLocation = location
+                return
+            }
             let factor = recognizer.scale
             recognizer.scale = 1
             pinchScaleTotal *= factor
@@ -1159,6 +1178,11 @@ final class IOSLocalPointerView: UIView {
     func place(tipAt point: CGPoint) {
         frame = CGRect(origin: CGPoint(x: point.x - 1, y: point.y - 1), size: Self.size)
     }
+
+    /// Where the tip is (inverse of `place(tipAt:)`).
+    var tipPosition: CGPoint {
+        CGPoint(x: frame.minX + 1, y: frame.minY + 1)
+    }
 }
 
 // MARK: - iPad mouse / trackpad (GameController)
@@ -1269,6 +1293,8 @@ final class IOSRemoteControlSettingsCard: UIView {
     private let naturalSwitch = UISwitch()
     private let clipboardTitle = UILabel()
     private let clipboardSwitch = UISwitch()
+    private let autoSendTitle = UILabel()
+    private let autoSendSwitch = UISwitch()
     private let footer = UILabel()
 
     init(model: IOSReceiverModel) {
@@ -1285,7 +1311,7 @@ final class IOSRemoteControlSettingsCard: UIView {
         header.spacing = 8
         header.alignment = .center
 
-        for label in [modeTitle, speedTitle, naturalTitle, clipboardTitle] {
+        for label in [modeTitle, speedTitle, naturalTitle, clipboardTitle, autoSendTitle] {
             label.font = .preferredFont(forTextStyle: .subheadline)
         }
         modeControl.selectedSegmentIndex = model.remoteInputMode == .trackpad ? 0 : 1
@@ -1312,6 +1338,15 @@ final class IOSRemoteControlSettingsCard: UIView {
         clipboardSwitch.addAction(UIAction { [weak self] _ in
             guard let self else { return }
             self.model.clipboardSyncEnabled = self.clipboardSwitch.isOn
+            self.autoSendSwitch.isEnabled = self.clipboardSwitch.isOn
+        }, for: .valueChanged)
+
+        autoSendTitle.numberOfLines = 0
+        autoSendSwitch.isOn = model.clipboardAutoSend
+        autoSendSwitch.isEnabled = model.clipboardSyncEnabled
+        autoSendSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.model.clipboardAutoSend = self.autoSendSwitch.isOn
         }, for: .valueChanged)
 
         footer.font = .preferredFont(forTextStyle: .footnote)
@@ -1327,6 +1362,7 @@ final class IOSRemoteControlSettingsCard: UIView {
             speedRow,
             Self.row(naturalTitle, naturalSwitch),
             Self.row(clipboardTitle, clipboardSwitch),
+            Self.row(autoSendTitle, autoSendSwitch),
             footer
         ])
         stack.axis = .vertical
@@ -1355,6 +1391,7 @@ final class IOSRemoteControlSettingsCard: UIView {
         speedTitle.text = SPPWLocalization.tr("remote.pointer_speed")
         naturalTitle.text = SPPWLocalization.tr("remote.natural_scroll")
         clipboardTitle.text = SPPWLocalization.tr("remote.clipboard_sync")
+        autoSendTitle.text = SPPWLocalization.tr("remote.clipboard_auto_send")
         footer.text = SPPWLocalization.tr("remote.clipboard_footer")
     }
 
@@ -1363,6 +1400,8 @@ final class IOSRemoteControlSettingsCard: UIView {
         speedSlider.value = Float(model.pointerSpeed)
         naturalSwitch.isOn = model.naturalScrolling
         clipboardSwitch.isOn = model.clipboardSyncEnabled
+        autoSendSwitch.isOn = model.clipboardAutoSend
+        autoSendSwitch.isEnabled = model.clipboardSyncEnabled
     }
 
     private static func row(_ label: UILabel, _ control: UIView) -> UIStackView {
@@ -1378,6 +1417,86 @@ final class IOSRemoteControlSettingsCard: UIView {
 
 /// Container that only takes touches landing on its subviews (the fullscreen HUD), so the
 /// trackpad surface underneath receives everything else.
+/// The app logo as a small floating button over the fullscreen video, as on macOS: 50 %
+/// opacity while idle, drag it anywhere (the position is kept as fractions of the free area),
+/// tap it for the controls menu.
+@MainActor
+final class IOSControlPuckView: UIView {
+    static let size: CGFloat = 44
+
+    var onTap: (() -> Void)?
+    /// Translation of the drag in progress (`nil` at the end), in the superview's points.
+    var onDrag: ((CGPoint?) -> Void)?
+    var isActive = false {
+        didSet { updateAppearance(animated: true) }
+    }
+
+    private let icon = UIImageView(image: UIImage(systemName: "wave.3.right"))
+    private var dragging = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor.black.withAlphaComponent(0.72)
+        layer.cornerRadius = Self.size / 2
+        layer.borderWidth = 1
+        layer.borderColor = UIColor.white.withAlphaComponent(0.35).cgColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.tintColor = .white
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        addSubview(icon)
+        NSLayoutConstraint.activate([
+            icon.centerXAnchor.constraint(equalTo: centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            widthAnchor.constraint(equalToConstant: Self.size),
+            heightAnchor.constraint(equalToConstant: Self.size)
+        ])
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+        accessibilityLabel = SPPWLocalization.tr("receiver.controls_puck_help")
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        addGestureRecognizer(tap)
+        addGestureRecognizer(pan)
+        updateAppearance(animated: false)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        // A slightly larger target than the drawn circle.
+        bounds.insetBy(dx: -6, dy: -6).contains(point)
+    }
+
+    @objc private func handleTap() {
+        onTap?()
+    }
+
+    @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began, .changed:
+            dragging = true
+            updateAppearance(animated: true)
+            onDrag?(recognizer.translation(in: superview))
+        default:
+            dragging = false
+            updateAppearance(animated: true)
+            onDrag?(nil)
+        }
+    }
+
+    private func updateAppearance(animated: Bool) {
+        let changes = {
+            self.alpha = self.isActive || self.dragging ? 1 : 0.5
+            self.transform = self.dragging ? CGAffineTransform(scaleX: 1.08, y: 1.08) : .identity
+        }
+        if animated {
+            UIView.animate(withDuration: 0.15, animations: changes)
+        } else {
+            changes()
+        }
+    }
+}
+
 final class IOSPassthroughView: UIView {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)

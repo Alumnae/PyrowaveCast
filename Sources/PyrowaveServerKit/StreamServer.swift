@@ -122,6 +122,13 @@ private final class ServerEncodeWorker: @unchecked Sendable {
         refreshTimer?.cancel()
     }
 
+    /// Drops the frame kept for still-screen refreshes (the source changed size in place).
+    func forgetLastFrame() {
+        queue.async { [weak self] in
+            self?.lastSentFrame = nil
+        }
+    }
+
     /// Sends the last frame again as soon as possible (a receiver asked for a resync).
     func requestRefresh() {
         lock.lock()
@@ -382,6 +389,13 @@ public actor StreamServer {
     private var sourceTask: Task<Void, Never>?
     /// The geometry the running source produces.
     private var sourceGeometry: (width: Int, height: Int)?
+    /// Frame rate the running source was started or reconfigured with.
+    private var sourceFPS = 0
+    /// Keeps the capture alive for `idleGraceNanoseconds` after the last client left, so a
+    /// receiver that drops for a moment (Wi-Fi hiccup, automatic reconnect) gets the same
+    /// stream back instead of a capture stop and start.
+    private var idleDiscardTask: Task<Void, Never>?
+    private static let idleGraceNanoseconds: UInt64 = 10_000_000_000
     private var isScreenCaptureMode: Bool { testContentMode == nil }
     private var agreedTimeoutSeconds: UInt16 { UInt16(clamping: clientSessionTimeoutNanos / 1_000_000_000) }
     /// One shared configuration and frame sequence feed the video stream.
@@ -474,6 +488,9 @@ public actor StreamServer {
     private nonisolated let clipboardSync = RemoteClipboardSync()
     #endif
 
+    /// Secure transport (encryption and pairing, PROTOCOL.md §7); `nil` = plain `SPPW/1`.
+    /// It sits on the UDP socket, so everything below sees plaintext datagrams.
+    private nonisolated let security: SPPWServerSecurity?
     /// Receives every log line the server produces.
     private let logHandler: (@Sendable (ServerLogEntry) -> Void)?
     /// Receives the encoded frames so the user interface can show a preview of
@@ -489,15 +506,17 @@ public actor StreamServer {
         audioSource: SPPWAudioSourceOption.Kind = .system,
         audioInputGain: Float = 1,
         remoteInputEnabled: Bool = false,
+        security: SPPWServerSecurity? = nil,
         logHandler: (@Sendable (ServerLogEntry) -> Void)? = nil,
         previewHandler: (@Sendable (Data, Int, Int) -> Void)? = nil
     ) {
+        self.security = security
         self.testContentMode = testContentMode
         self.fullChroma444 = fullChroma444
         self.audioSource = audioSource
         audioPacketizer.gain = audioInputGain
         #if os(macOS)
-        self.remoteInputState = RemoteInputState(enabled: remoteInputEnabled)
+        self.remoteInputState = RemoteInputState(enabled: remoteInputEnabled && SPPWDistribution.allowsRemoteInputInjection)
         self.clipboardSync.setEnabled(remoteInputEnabled)
         #endif
         self.logHandler = logHandler
@@ -533,8 +552,11 @@ public actor StreamServer {
     /// Takes effect immediately while streaming; disabling releases any currently held keys/buttons.
     public nonisolated func setRemoteInputEnabled(_ enabled: Bool) {
         #if os(macOS)
-        let (wasEnabled, displayID) = remoteInputState.setEnabled(enabled)
-        if wasEnabled && !enabled {
+        // Clipboard sync follows the switch in every build; keyboard and mouse injection only
+        // where the distribution allows it (not in the sandboxed Mac App Store build).
+        let injects = enabled && SPPWDistribution.allowsRemoteInputInjection
+        let (wasEnabled, displayID) = remoteInputState.setEnabled(injects)
+        if wasEnabled && !injects {
             inputController.releaseAll(displayID: displayID)
         }
         clipboardSync.setEnabled(enabled)
@@ -545,7 +567,7 @@ public actor StreamServer {
     #if os(macOS)
     /// Whether the captured video should include the host cursor right now.
     private var desiredCaptureShowsCursor: Bool {
-        !(remoteInputState.snapshot().enabled && !cursorHiddenClients.isEmpty)
+        cursorHiddenClients.isEmpty
     }
 
     private func setCursorHidden(_ hidden: Bool, streamID: UInt32) {
@@ -562,7 +584,7 @@ public actor StreamServer {
         let shows = desiredCaptureShowsCursor
         guard shows != captureShowsCursor else { return }
         captureShowsCursor = shows
-        log(shows ? "Cursore del Mac di nuovo visibile nel video" : "Cursore del Mac nascosto nel video (il client mostra il proprio puntatore)")
+        log(shows ? "Mac cursor visible in the video again" : "Mac cursor hidden in the video (the client shows its own pointer)")
         guard let engine = captureEngine else { return }
         Task { await engine.setShowsCursor(shows) }
     }
@@ -693,8 +715,16 @@ public actor StreamServer {
             sendBufferBytes: SPPWSocketBufferTuning.defaultSendBufferBytes,
             receiveBufferBytes: SPPWSocketBufferTuning.defaultReceiveBufferBytes
         )
+        socket.security = security
         let ipv4 = preferredLocalIPv4Address()
         let serviceName = SPPWNetworkInterface.localBonjourServiceName()
+        security?.setServerName(serviceName)
+        if let security {
+            let configuration = security.currentConfiguration
+            log(configuration.encryptionEnabled
+                ? "Encryption on (pairing: \(configuration.pairingMode)) · server fingerprint \(security.store.identity.fingerprint.display)"
+                : "Encryption off: SPPW/1 in clear text")
+        }
         let hostName = ipv4 ?? SPPWNetworkInterface.sanitizedMDNSHostname(serviceName: serviceName)
         var txtRecords: [String: String] = [
             "port": String(port),
@@ -761,6 +791,8 @@ public actor StreamServer {
 
     /// Stops the listener and the frame source.
     public func stop() async {
+        idleDiscardTask?.cancel()
+        idleDiscardTask = nil
         #if os(macOS)
         inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
         #endif
@@ -810,7 +842,7 @@ public actor StreamServer {
             let requested = parseClientConfig(payload)?.sanitised() ?? ClientConfiguration()
             let config = applyingServerResolution(to: requested)
             if config.width != requested.width || config.height != requested.height {
-                log("Cattura schermo: risoluzione del server \(config.width)x\(config.height) (richiesta client \(requested.width)x\(requested.height))")
+                log("Screen capture: server resolution \(config.width)x\(config.height) (client requested \(requested.width)x\(requested.height))")
             }
 
             // A hello from the same LAN host replaces its old control session.
@@ -829,15 +861,14 @@ public actor StreamServer {
                 inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
                 #endif
                 log("Replacing stale client session(s) \(replacedIDs) for \(peerAddress)")
-                let compatibleRunningStream = (sourceTask != nil || startingGeneration != nil)
-                    && sharedConfig != nil
-                    && sharedConfig!.width == config.width
-                    && sharedConfig!.height == config.height
-                    && sharedConfig!.fps == config.fps
-                if clients.isEmpty && !compatibleRunningStream {
-                    await discardSharedStream(reason: "last client reconnected with new configuration")
-                }
             }
+            // A running (or starting) source is kept: a different size or frame rate is
+            // applied to it in place below, instead of stopping and restarting the capture.
+            let sourceAlive = sourceTask != nil || startingGeneration != nil
+            if !sourceAlive && clients.isEmpty && sharedConfig != nil {
+                await discardSharedStream(reason: "last client reconnected, no running source")
+            }
+            cancelIdleDiscard()
 
             let streamID = allocateStreamID()
             clients[streamID] = ClientSession(
@@ -862,6 +893,11 @@ public actor StreamServer {
             log("Client connected from \(peer.displayAddress): controlID=\(streamID), shared stream=\(sharedStreamID), config: \(effectiveConfig.width)x\(effectiveConfig.height) @ \(effectiveConfig.fps)fps, quality=\(effectiveConfig.quality), fec=\(effectiveConfig.fecPercent)%, timeout=\(agreedTimeoutSeconds)s")
             sendServerHello(to: peer, controlStreamID: streamID, config: effectiveConfig)
             // Streaming starts right after the hello; no READY ping is needed.
+            if sourceTask != nil, clients.count == 1 {
+                await applySourceGeometryChange(streamID: streamID)
+                // PyroWave frames are intra-only: the last one is a full picture right away.
+                encodeWorker?.requestRefresh()
+            }
             await startStreaming(streamID: streamID)
             return
         }
@@ -916,7 +952,7 @@ public actor StreamServer {
             let sourceRunning = sourceTask != nil || startingGeneration != nil
             var resendAfterHello = false
             if geometryOrRateChanged {
-                await restartSharedSource(streamID: responseStreamID)
+                await applySourceGeometryChange(streamID: responseStreamID)
             } else if isResync {
                 let silence = captureEngine?.activity.silenceNanoseconds()
                 if SPPWStillScreenPolicy.resyncNeedsSourceRestart(
@@ -979,7 +1015,8 @@ public actor StreamServer {
         let result = clipboardSync.receive(
             payload,
             streamID: streamID,
-            mtu: client.config.mtu
+            mtu: client.config.mtu,
+            peerHost: peer.hostKey
         ) { clipboardPayload in
             socket.send(
                 makeWireDatagram(kind: .clipboard, streamID: streamID, payload: clipboardPayload),
@@ -988,9 +1025,9 @@ public actor StreamServer {
         }
         switch result {
         case let .subscription(enabled):
-            log("Appunti condivisi \(enabled ? "attivi" : "disattivati") per il client \(streamID)")
+            log("Shared clipboard \(enabled ? "enabled" : "disabled") for client \(streamID)")
         case let .content(content):
-            log("Appunti ricevuti dal client \(streamID): \(content.format == .png ? "immagine" : "testo"), \(content.data.count) B")
+            log("Clipboard received from client \(streamID): \(content.format == .png ? "image" : content.format == .files ? "files" : content.format == .fileOffer ? "files (background transfer)" : "text"), \(content.data.count) B")
         case .none:
             break
         }
@@ -1000,19 +1037,20 @@ public actor StreamServer {
     private func handleClientInputPayload(_ payload: Data, streamID: UInt32) {
         #if os(macOS)
         guard isScreenCaptureMode else { return }
-        let state = remoteInputState.snapshot()
-        guard state.enabled else { return }
         let decoded = SPPWInputEvent.decode(from: payload)
         if let decoded, case let .cursorVisibility(hidden) = decoded.unwrapped {
-            // A capture setting, not an injected event: no Accessibility permission needed.
+            // A capture setting, not an injected event: honored with remote control off too
+            // (a viewer can ask for the cursor to be left out) and without Accessibility.
             if remoteInputState.filter(decoded, streamID: streamID) != nil {
                 setCursorHidden(hidden, streamID: streamID)
             }
             return
         }
+        let state = remoteInputState.snapshot()
+        guard state.enabled else { return }
         guard SPPWMacInputInjector.isAccessibilityTrusted else {
             if remoteInputState.shouldLogMissingAccessibilityWarning() {
-                log(SPPWLocalization.tr("server.log.accessibility_missing_warning"), isError: true)
+                log(SPPWLocalization.english("server.log.accessibility_missing_warning"), isError: true)
             }
             return
         }
@@ -1059,7 +1097,7 @@ public actor StreamServer {
         lastStallRestartNanos = now
         let streamID = sharedStreamID != 0 ? sharedStreamID : (clients.keys.first ?? 0)
         guard streamID != 0 else { return }
-        log("Cattura schermo ferma da \(silence / 1_000_000_000) s mentre il client interagisce: riavvio della cattura", isError: true)
+        log("Screen capture stalled for \(silence / 1_000_000_000) s while the client is interacting: restarting capture", isError: true)
         Task { [weak self] in
             await self?.restartSharedSource(streamID: streamID)
         }
@@ -1137,11 +1175,58 @@ public actor StreamServer {
         syncEncodeWorkerSnapshot()
         log("Expired \(staleSessions.count) inactive client session(s) after \(clientSessionTimeoutNanos / 1_000_000_000)s timeout: \(staleSessions.map(\.streamID))")
         if clients.isEmpty {
-            await discardSharedStream(reason: "no active clients")
+            scheduleIdleDiscard()
         }
     }
 
+    /// Discards the shared stream only if no client came back within the grace period.
+    private func scheduleIdleDiscard() {
+        guard idleDiscardTask == nil else { return }
+        log("No clients: capture stays active for \(Self.idleGraceNanoseconds / 1_000_000_000) s waiting for a reconnection")
+        idleDiscardTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: Self.idleGraceNanoseconds) } catch { return }
+            await self?.finishIdleDiscard()
+        }
+    }
+
+    private func finishIdleDiscard() async {
+        idleDiscardTask = nil
+        guard clients.isEmpty else { return }
+        await discardSharedStream(reason: "no active clients for \(Self.idleGraceNanoseconds / 1_000_000_000) s")
+    }
+
+    private func cancelIdleDiscard() {
+        guard let task = idleDiscardTask else { return }
+        task.cancel()
+        idleDiscardTask = nil
+        log("Client back within the grace period: same capture, no restart")
+    }
+
+    /// Applies a new stream size / frame rate. Screen capture changes the running
+    /// ScreenCaptureKit stream in place; anything else (or a failed update) restarts the source.
+    private func applySourceGeometryChange(streamID: UInt32) async {
+        guard let config = sharedConfig else { return }
+        let target = applyingServerResolution(to: config)
+        let width = target.width > 0 ? target.width : 1920
+        let height = target.height > 0 ? target.height : 1080
+        let fps = target.fps > 0 ? target.fps : 60
+        if let geometry = sourceGeometry, geometry.width == width, geometry.height == height, sourceFPS == fps {
+            return
+        }
+        if isScreenCaptureMode, let engine = captureEngine, sourceTask != nil, startingGeneration == nil,
+           await engine.reconfigure(width: width, height: height, fps: fps) {
+            sourceGeometry = (width, height)
+            sourceFPS = fps
+            encodeWorker?.forgetLastFrame()
+            syncEncodeWorkerSnapshot()
+            return
+        }
+        await restartSharedSource(streamID: streamID)
+    }
+
     private func discardSharedStream(reason: String) async {
+        idleDiscardTask?.cancel()
+        idleDiscardTask = nil
         #if os(macOS)
         inputController.releaseAll(displayID: remoteInputState.snapshot().displayID)
         #endif
@@ -1256,6 +1341,7 @@ public actor StreamServer {
         captureEngine = startedCaptureEngine
         testSource = startedTestSource
         sourceGeometry = (captureWidth, captureHeight)
+        sourceFPS = fps
         syncEncodeWorkerSnapshot()
 
         let generation = startGeneration
@@ -1301,7 +1387,7 @@ public actor StreamServer {
         if now &- sourceStartedAtNanos >= SPPWSourceRestartPolicy.healthyRunNanoseconds {
             sourceRestartAttempts = 0
         }
-        log("Sorgente video terminata", isError: true)
+        log("Video source ended", isError: true)
         scheduleSourceRestart()
     }
 
@@ -1313,7 +1399,7 @@ public actor StreamServer {
         guard sourceRestartTask == nil, udpSocket != nil, !clients.isEmpty else { return }
         let delay = SPPWSourceRestartPolicy.delayNanoseconds(attempt: sourceRestartAttempts)
         sourceRestartAttempts += 1
-        log("Riavvio automatico della sorgente tra \(delay / 1_000_000_000) s")
+        log("Restarting the source automatically in \(delay / 1_000_000_000) s")
         sourceRestartTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: delay) } catch { return }
             await self?.performSourceRestart()
@@ -1384,9 +1470,9 @@ final class CaptureActivityMonitor: @unchecked Sendable {
 
 actor ScreenCaptureEngine {
     nonisolated let activity = CaptureActivityMonitor()
-    private let width: Int
-    private let height: Int
-    private let fps: Int
+    private var width: Int
+    private var height: Int
+    private var fps: Int
     private let fullChroma444: Bool
     /// Draw the host cursor into the video; changed live by `setShowsCursor`.
     private var showsCursor: Bool
@@ -1453,7 +1539,7 @@ actor ScreenCaptureEngine {
         frameContinuation = continuation
 
         if !CGPreflightScreenCaptureAccess() {
-            logHandler("Permesso Registrazione schermo non attivo. Abilita PyrowaveCast in Impostazioni di Sistema → Privacy e sicurezza → Registrazione schermo e riavvia l'app.", true)
+            logHandler("Screen Recording permission is off. Enable PyrowaveCast in System Settings → Privacy & Security → Screen Recording and restart the app.", true)
         }
 
         do {
@@ -1463,7 +1549,7 @@ actor ScreenCaptureEngine {
             )
 
             guard let display = Self.preferredDisplay(from: availableContent.displays) else {
-                logHandler("Nessun display disponibile per la cattura schermo.", true)
+                logHandler("No display available for screen capture.", true)
                 continuation.finish()
                 return stream
             }
@@ -1500,7 +1586,7 @@ actor ScreenCaptureEngine {
                     streamConfig.microphoneCaptureDeviceID = deviceID
                     capturesMicrophone = true
                 } else {
-                    logHandler("La cattura del microfono richiede macOS 15; audio disattivato.", true)
+                    logHandler("Microphone capture requires macOS 15; audio disabled.", true)
                 }
             }
             streamConfig.sampleRate = SPPWAudioPacketHeader.sampleRate
@@ -1509,7 +1595,7 @@ actor ScreenCaptureEngine {
 
             let contentFilter = SCContentFilter(display: display, excludingWindows: [])
             let sDelegate = CaptureStreamDelegate { [logHandler] error in
-                logHandler("Cattura schermo interrotta dal sistema: \(error.localizedDescription)", true)
+                logHandler("Screen capture stopped by the system: \(error.localizedDescription)", true)
                 continuation.finish()
             }
             let scStream = SCStream(
@@ -1568,13 +1654,34 @@ actor ScreenCaptureEngine {
             self.stream = scStream
             self.activeConfiguration = streamConfig
             try await scStream.startCapture()
-            logHandler("Cattura schermo avviata: \(width)x\(height) @ \(fps) fps", false)
+            logHandler("Screen capture started: \(width)x\(height) @ \(fps) fps", false)
         } catch {
-            logHandler("Errore avvio cattura schermo: \(error.localizedDescription). Controlla Impostazioni di Sistema → Privacy e sicurezza → Registrazione schermo (e riavvia PyrowaveCast dopo aver attivato il permesso).", true)
+            logHandler("Screen capture failed to start: \(error.localizedDescription). Check System Settings → Privacy & Security → Screen Recording (and restart PyrowaveCast after enabling the permission).", true)
             continuation.finish()
         }
 
         return stream
+    }
+
+    /// Changes the output size and frame rate of the running capture without stopping it,
+    /// so the system screen-sharing indicator does not flicker and receivers keep their
+    /// picture. Returns false when there is no running stream or the update failed.
+    func reconfigure(width newWidth: Int, height newHeight: Int, fps newFPS: Int) async -> Bool {
+        guard let stream, let configuration = activeConfiguration else { return false }
+        configuration.width = newWidth
+        configuration.height = newHeight
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(newFPS, 1)))
+        do {
+            try await stream.updateConfiguration(configuration)
+        } catch {
+            logHandler("Could not update the capture to \(newWidth)x\(newHeight) @ \(newFPS) fps: \(error.localizedDescription)", true)
+            return false
+        }
+        width = newWidth
+        height = newHeight
+        fps = newFPS
+        logHandler("Screen capture updated without restart: \(newWidth)x\(newHeight) @ \(newFPS) fps", false)
+        return true
     }
 
     /// Shows or hides the host cursor in the running capture without restarting it.
@@ -1586,7 +1693,7 @@ actor ScreenCaptureEngine {
         do {
             try await stream.updateConfiguration(configuration)
         } catch {
-            logHandler("Impossibile aggiornare la visibilità del cursore: \(error.localizedDescription)", true)
+            logHandler("Could not update the cursor visibility: \(error.localizedDescription)", true)
         }
     }
 
@@ -1800,12 +1907,19 @@ final class RemoteClipboardSync: @unchecked Sendable {
     private let lock = NSLock()
     private var enabled = false
     private var peers: [UInt32: Peer] = [:]
+    /// Pasteboard `changeCount` when sync was turned on. What was copied before stays private;
+    /// anything copied since is shared, even if it changed while no client was subscribed (a
+    /// reconnect stops the poller, and that copy would otherwise never be sent).
+    private var baselineChangeCount: Int?
     private lazy var bridge = SPPWMacPasteboardBridge { [weak self] content in
         self?.localPasteboardChanged(content)
     }
 
     func setEnabled(_ value: Bool) {
         lock.lock()
+        if value && !enabled {
+            baselineChangeCount = SPPWMacPasteboardBridge.currentChangeCount
+        }
         enabled = value
         if !value {
             peers.values.forEach { $0.channel.cancel() }
@@ -1819,6 +1933,7 @@ final class RemoteClipboardSync: @unchecked Sendable {
         _ payload: Data,
         streamID: UInt32,
         mtu: Int,
+        peerHost: String,
         send: @escaping @Sendable (Data) -> Void
     ) -> SPPWClipboardChannel.Incoming {
         lock.lock()
@@ -1842,13 +1957,23 @@ final class RemoteClipboardSync: @unchecked Sendable {
             peers[streamID]?.subscribed = isOn
             if !isOn { channel.cancel() }
             lock.unlock()
+            lock.lock()
+            let baseline = baselineChangeCount
+            lock.unlock()
             if isOn, let current = SPPWMacPasteboardBridge.readCurrent() {
-                // What is already on the Mac stays private until it changes.
-                channel.noteLocalContent(current)
+                if baseline == SPPWMacPasteboardBridge.currentChangeCount {
+                    // What was on the Mac before sync started stays private until it changes.
+                    channel.noteLocalContent(current)
+                } else {
+                    // Copied during this session (perhaps while the client was reconnecting).
+                    channel.offer(current)
+                }
             }
             updateBridge()
         case let .content(content):
-            bridge.write(content)
+            bridge.write(content, peerHost: peerHost)
+            // An offer points at that client's own listener: not something to pass on.
+            guard content.format != .fileOffer else { break }
             lock.lock()
             let others = peers.filter { $0.key != streamID && $0.value.subscribed }.map(\.value.channel)
             lock.unlock()

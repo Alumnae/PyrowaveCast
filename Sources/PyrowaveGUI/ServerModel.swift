@@ -111,8 +111,8 @@ actor PreviewDecoder {
 public final class ServerModel: ObservableObject {
     public enum Mode: String, CaseIterable, Identifiable {
         case card = "Test card"
-        case screen = "Schermo"
-        case image = "Immagine"
+        case screen = "Screen"
+        case image = "Image"
         case video = "Video"
 
         public var id: String { rawValue }
@@ -243,6 +243,91 @@ public final class ServerModel: ObservableObject {
         }
     }
     @Published public var errorMessage: String?
+
+    // MARK: Security (encryption and pairing, PROTOCOL.md §7)
+
+    public let securityStore = SPPWSecurityStore.shared
+    /// Lives as long as the model, so a PIN on screen and the settings survive start/stop.
+    public private(set) lazy var security: SPPWServerSecurity = {
+        let security = SPPWServerSecurity(
+            store: securityStore,
+            configuration: securityConfiguration,
+            serverName: Host.current().localizedName ?? "Mac"
+        ) { [weak self] event in
+            Task { @MainActor in self?.handleSecurityEvent(event) }
+        }
+        securityStore.onChange = { [weak self] in
+            Task { @MainActor in self?.refreshPairedClients() }
+        }
+        return security
+    }()
+    /// Encrypt the stream and require the secure handshake (receivers must match).
+    @Published public var encryptionEnabled: Bool = UserDefaults.standard.object(forKey: "serverEncryptionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(encryptionEnabled, forKey: "serverEncryptionEnabled")
+            security.update(securityConfiguration)
+        }
+    }
+    /// How unknown receivers are admitted while encryption is on.
+    @Published public var pairingMode: SPPWPairingMode = SPPWPairingMode(rawValue: UInt8(UserDefaults.standard.integer(forKey: "serverPairingMode"))) ?? .pin {
+        didSet {
+            UserDefaults.standard.set(Int(pairingMode.rawValue), forKey: "serverPairingMode")
+            security.update(securityConfiguration)
+        }
+    }
+    /// The PIN to show while a receiver is pairing.
+    @Published public private(set) var pairingPIN: SPPWPairingPINPrompt?
+    @Published public private(set) var pairedClients: [SPPWTrustedPeer] = SPPWSecurityStore.shared.trustedPeers(.clients)
+    @Published public private(set) var hasPairingPassword: Bool = SPPWSecurityStore.shared.hasServerPassword
+
+    private var securityConfiguration: SPPWServerSecurityConfiguration {
+        SPPWServerSecurityConfiguration(encryptionEnabled: encryptionEnabled, pairingMode: pairingMode)
+    }
+
+    /// This Mac's fingerprint, to compare with what a receiver shows.
+    public var serverFingerprint: String { securityStore.identity.fingerprint.display }
+
+    public func setPairingPassword(_ password: String) {
+        securityStore.setServerPassword(password)
+        hasPairingPassword = securityStore.hasServerPassword
+    }
+
+    public func forgetPairedClient(_ peer: SPPWTrustedPeer) {
+        securityStore.forget(.clients, fingerprintHex: peer.fingerprintHex)
+        security.revoke(fingerprintHex: peer.fingerprintHex)
+        refreshPairedClients()
+    }
+
+    public func dismissPairingPIN() {
+        security.cancelPIN()
+    }
+
+    private func refreshPairedClients() {
+        pairedClients = securityStore.trustedPeers(.clients)
+    }
+
+    private func handleSecurityEvent(_ event: SPPWServerSecurityEvent) {
+        let text: String
+        switch event {
+        case let .pinRequested(prompt):
+            pairingPIN = prompt
+            NSApp.requestUserAttention(.informationalRequest)
+            text = SPPWLocalization.english("security.log.pin_requested_fmt", prompt.clientName, prompt.clientFingerprint.short)
+        case .pinCleared:
+            pairingPIN = nil
+            return
+        case let .paired(peer):
+            pairingPIN = nil
+            refreshPairedClients()
+            text = SPPWLocalization.english("security.log.paired_fmt", peer.name, peer.fingerprint.short)
+        case let .clientAuthenticated(name, fingerprint, paired):
+            text = SPPWLocalization.english(paired ? "security.log.session_paired_fmt" : "security.log.session_fmt", name, fingerprint.short)
+        case let .log(message):
+            text = message
+        }
+        append(ServerLogEntry(id: logs.count + 1, timestamp: Date(), text: text, isError: false))
+    }
+
     @Published public var hasScreenRecordingPermission: Bool = CGPreflightScreenCaptureAccess()
     @Published public var hasAccessibilityPermission: Bool = SPPWMacInputInjector.isAccessibilityTrusted
     @Published public var serverScreenResolutionText: String = ServerDisplay.streamResolutionText
@@ -339,15 +424,15 @@ public final class ServerModel: ObservableObject {
                 append(ServerLogEntry(
                     id: logs.count + 1,
                     timestamp: Date(),
-                    text: SPPWLocalization.tr("server.log.permission_missing_warning"),
+                    text: SPPWLocalization.english("server.log.permission_missing_warning"),
                     isError: true
                 ))
             }
-            if remoteControlEnabled && !hasAccessibilityPermission {
+            if remoteControlEnabled && !hasAccessibilityPermission && SPPWDistribution.allowsRemoteInputInjection {
                 append(ServerLogEntry(
                     id: logs.count + 1,
                     timestamp: Date(),
-                    text: SPPWLocalization.tr("server.log.accessibility_missing_warning"),
+                    text: SPPWLocalization.english("server.log.accessibility_missing_warning"),
                     isError: true
                 ))
             }
@@ -373,6 +458,7 @@ public final class ServerModel: ObservableObject {
             audioSource: SPPWAudioSourceCatalog.source(withID: audioSourceID, in: audioSources).kind,
             audioInputGain: Float(audioInputVolume),
             remoteInputEnabled: remoteControlEnabled,
+            security: security,
             logHandler: { [weak self] entry in
                 Task { @MainActor in self?.append(entry) }
             },
@@ -404,7 +490,7 @@ public final class ServerModel: ObservableObject {
                 append(ServerLogEntry(
                     id: logs.count + 1,
                     timestamp: Date(),
-                    text: SPPWLocalization.tr("server.log.started_port_fmt", Int(port)),
+                    text: SPPWLocalization.english("server.log.started_port_fmt", Int(port)),
                     isError: false
                 ))
             } catch {

@@ -232,6 +232,22 @@ public final class SPPWUDPServerSocket: @unchecked Sendable {
     private var datagramHandler: DatagramHandler?
     /// Pre-allocated 64 KB receive buffer reused across all `DispatchSourceRead` wakeups on `queue`.
     private let receiveScratch = SPPWReceiveScratchBuffer(capacity: 65_536)
+    private var securityLayer: SPPWServerSecurity?
+
+    /// Secure transport (PROTOCOL.md §7). When set, handshake and pairing are answered here,
+    /// the handler only sees plaintext datagrams of authorised peers, and `send` seals them.
+    public var security: SPPWServerSecurity? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return securityLayer
+        }
+        set {
+            lock.lock()
+            securityLayer = newValue
+            lock.unlock()
+        }
+    }
 
     public init(
         port: UInt16,
@@ -393,18 +409,36 @@ public final class SPPWUDPServerSocket: @unchecked Sendable {
                 }
             }
             if let peer {
-                onDatagram(packet, peer)
+                if let security {
+                    let plain = security.incoming(packet, from: peer.peerKey) { [weak self] reply in
+                        self?.sendRaw(reply, to: peer)
+                    }
+                    if let plain { onDatagram(plain, peer) }
+                } else {
+                    onDatagram(packet, peer)
+                }
             }
         }
     }
 
-    /// Sends a single datagram to `peer`. Returns `true` if sent or queued by kernel.
+    /// Sends a single datagram to `peer` (sealed when `security` is set; dropped if the peer
+    /// has no secure session). Returns `true` if sent or queued by kernel.
     @discardableResult
     public func send(_ data: Data, to peer: SPPWUDPPeerAddress) -> Bool {
         lock.lock()
         let isClosed = closed
+        let security = securityLayer
         lock.unlock()
         guard !isClosed else { return false }
+        if let security {
+            guard let sealed = security.outgoing(data, to: peer.peerKey) else { return false }
+            return sendRaw(sealed, to: peer)
+        }
+        return sendRaw(data, to: peer)
+    }
+
+    @discardableResult
+    private func sendRaw(_ data: Data, to peer: SPPWUDPPeerAddress) -> Bool {
 
         return data.withUnsafeBytes { payloadBuf in
             peer.rawAddress.withUnsafeBytes { addrBuf in
@@ -498,6 +532,25 @@ public final class SPPWUDPClientSocket: @unchecked Sendable {
     private let lock = NSLock()
     private var closed = false
     private var fdManagedBySource = false
+    private var securityLayer: SPPWClientSecurity?
+
+    /// Secure transport (PROTOCOL.md §7), attached with `attachSecurity(_:)`.
+    public var security: SPPWClientSecurity? {
+        lock.lock()
+        defer { lock.unlock() }
+        return securityLayer
+    }
+
+    /// Runs `security` on this socket: it starts the handshake now; app datagrams sent before
+    /// the session is ready are queued and sent sealed once it is.
+    public func attachSecurity(_ security: SPPWClientSecurity) {
+        lock.lock()
+        securityLayer = security
+        lock.unlock()
+        security.start { [weak self] datagram in
+            _ = self?.sendRawWithErrno(datagram)
+        }
+    }
     private var datagramHandler: DatagramHandler?
     /// Pre-allocated 64 KB receive buffer reused across all `DispatchSourceRead` wakeups on `queue`.
     private let receiveScratch = SPPWReceiveScratchBuffer(capacity: 65_536)
@@ -521,7 +574,7 @@ public final class SPPWUDPClientSocket: @unchecked Sendable {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(status != 0 ? status : EHOSTUNREACH),
-                userInfo: [NSLocalizedDescriptionKey: "Impossibile risolvere l'host \(host):\(port)"]
+                userInfo: [NSLocalizedDescriptionKey: "Could not resolve host \(host):\(port)"]
             )
         }
         defer { freeaddrinfo(firstAddr) }
@@ -682,13 +735,31 @@ public final class SPPWUDPClientSocket: @unchecked Sendable {
                 break
             }
             let packet = Data(bytes: base, count: received)
-            onDatagram(packet)
+            if let security {
+                if let plain = security.incoming(packet) { onDatagram(plain) }
+            } else {
+                onDatagram(packet)
+            }
         }
     }
 
     /// Sends a datagram on the connected UDP socket, returning `0` on success or `errno` on failure.
     @discardableResult
     public func sendWithErrno(_ data: Data) -> Int32 {
+        lock.lock()
+        let isClosed = closed
+        let security = securityLayer
+        lock.unlock()
+        guard !isClosed else { return EBADF }
+        if let security {
+            // Queued until the secure session is ready: not an error for the caller.
+            guard let sealed = security.outgoing(data) else { return 0 }
+            return sendRawWithErrno(sealed)
+        }
+        return sendRawWithErrno(data)
+    }
+
+    private func sendRawWithErrno(_ data: Data) -> Int32 {
         lock.lock()
         let isClosed = closed
         lock.unlock()
@@ -713,6 +784,7 @@ public final class SPPWUDPClientSocket: @unchecked Sendable {
             return
         }
         closed = true
+        securityLayer?.stop()
         let src = readSource
         readSource = nil
         let managed = fdManagedBySource
@@ -1626,8 +1698,9 @@ public enum SPPWAdaptiveBitrateDecision: Sendable, Equatable {
 /// Behavior:
 /// - Evaluates network health every **1 second** and steps bitrate down immediately
 ///   whenever loss/jitter occurs until the stream stabilizes.
-/// - Never ramps bitrate back up before at least **10 seconds** of consecutive clean
-///   network operation (with exponential backoff after a failed upward probe).
+/// - Never ramps bitrate back up before at least **5 seconds** of consecutive clean
+///   network operation (the interval WebRTC GCC uses between probes); after a failed
+///   upward probe the wait grows to 20 s, then 40 s.
 /// - If probing higher bitrate reproduces packet loss/jitter, immediately reverts to
 ///   the last problem-free bitrate and locks the learned ceiling if instability persists,
 ///   avoiding oscillation on penalized links.
@@ -1635,7 +1708,11 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
     public static let defaultMinBitrateBps = 5_000_000
     public static let defaultMaxBitrateBps = 1_000_000_000
     public static let defaultEvaluationIntervalNanoseconds: UInt64 = 1_000_000_000
-    public static let defaultMinimumRampUpCooldownNanoseconds: UInt64 = 10_000_000_000
+    public static let defaultMinimumRampUpCooldownNanoseconds: UInt64 = 5_000_000_000
+    /// Shortest ramp-up wait the controller accepts.
+    public static let minimumAllowedRampUpCooldownNanoseconds: UInt64 = 5_000_000_000
+    /// Base of the wait after failed probes: 2× (20 s) after one, 4× (40 s) after two or more.
+    public static let failedProbeBackoffBaseNanoseconds: UInt64 = 10_000_000_000
     public static let defaultProbeConfirmNanoseconds: UInt64 = 5_000_000_000
 
     public let minBitrateBps: Int
@@ -1645,6 +1722,11 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
     public private(set) var lastStableBitrateBps: Int?
     public private(set) var failedProbeCount: Int = 0
     public private(set) var isCeilingLocked: Bool = false
+    /// "Prefer high quality": a single moderate window (partial HF, heavy FEC) no longer cuts
+    /// the bitrate, cuts are smaller (−15 % / −5 % instead of −20 % / −10 %), and the climb back
+    /// waits half as long after a failed probe (10 s / 20 s) and after a locked ceiling (15 s).
+    /// Trades a few more glitches on a bad link for a sharper picture. Survives `reset`.
+    public var prefersHighQuality = false
 
     public let evaluationIntervalNanoseconds: UInt64
     public let minimumRampUpCooldownNanoseconds: UInt64
@@ -1663,7 +1745,7 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
 
     /// A locked ceiling is released after this long without trouble at the locked bitrate,
     /// so a link that recovered (the user moved closer to the access point) can climb again.
-    public static let ceilingLockReleaseNanoseconds: UInt64 = 120_000_000_000
+    public static let ceilingLockReleaseNanoseconds: UInt64 = 30_000_000_000
     /// Impaired windows within this span (including the current one) count as persistent.
     public static let persistenceWindowNanoseconds: UInt64 = 3_000_000_000
 
@@ -1702,7 +1784,7 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
         self.learnedSafeCeilingBps = clampedCeiling
         self.currentBitrateBps = clampedCeiling
         self.evaluationIntervalNanoseconds = max(100_000_000, evaluationIntervalNanoseconds)
-        self.minimumRampUpCooldownNanoseconds = max(10_000_000_000, minimumRampUpCooldownNanoseconds)
+        self.minimumRampUpCooldownNanoseconds = max(Self.minimumAllowedRampUpCooldownNanoseconds, minimumRampUpCooldownNanoseconds)
         self.probeConfirmNanoseconds = probeConfirmNanoseconds
         self.lastEvaluationNanoseconds = nowNanoseconds
         self.lastChangeNanoseconds = nowNanoseconds
@@ -1776,8 +1858,8 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
 
         let isSevere = heavyLoss || (isPersistent && lossInvolved)
         let isModerate = !isSevere && (
-            heavyPartial
-                || (totalFrames >= 10 && fecRatio > 0.35)
+            (heavyPartial && (isPersistent || !prefersHighQuality))
+                || (totalFrames >= 10 && fecRatio > 0.35 && (isPersistent || !prefersHighQuality))
                 || (isPersistent && (sample.partialHFFramesDelta >= 2 || fecRatio > 0.20))
         )
 
@@ -1815,7 +1897,7 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
             }
 
             // Step down every 1 second until the network stabilizes.
-            let factor = isSevere ? 0.80 : 0.90
+            let factor = prefersHighQuality ? (isSevere ? 0.85 : 0.95) : (isSevere ? 0.80 : 0.90)
             let minStepBps = isSevere ? 2_000_000 : 1_000_000
             let scaled = Int((Double(currentBitrateBps) * factor).rounded(.down))
             let candidate = min(scaled, currentBitrateBps - minStepBps)
@@ -1847,9 +1929,10 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
 
             // Release a locked ceiling after a long clean stretch (conditions change on Wi-Fi);
             // the next probe still waits out the doubled backoff of one failed probe.
+            let lockRelease = prefersHighQuality ? Self.ceilingLockReleaseNanoseconds / 2 : Self.ceilingLockReleaseNanoseconds
             if isCeilingLocked,
                sample.timestampNanoseconds &- max(cleanWindowStartNanoseconds, lockedSinceNanoseconds)
-                   >= Self.ceilingLockReleaseNanoseconds {
+                   >= lockRelease {
                 isCeilingLocked = false
                 learnedSafeCeilingBps = maxCeilingBitrateBps
                 failedProbeCount = 1
@@ -1860,9 +1943,14 @@ public struct SPPWAdaptiveBitrateController: Sendable, Equatable {
                 return .hold
             }
 
-            // Never ramp upward in less than 10 seconds (with backoff after a failed probe).
-            let backoffMultiplier: UInt64 = failedProbeCount == 0 ? 1 : (failedProbeCount == 1 ? 2 : 4)
-            let requiredCooldown = minimumRampUpCooldownNanoseconds * backoffMultiplier
+            // Never ramp upward in less than 5 seconds; 20 s / 40 s after failed probes.
+            let requiredCooldown: UInt64
+            let backoffBase = prefersHighQuality ? Self.failedProbeBackoffBaseNanoseconds / 2 : Self.failedProbeBackoffBaseNanoseconds
+            switch failedProbeCount {
+            case 0: requiredCooldown = minimumRampUpCooldownNanoseconds
+            case 1: requiredCooldown = max(minimumRampUpCooldownNanoseconds, backoffBase * 2)
+            default: requiredCooldown = max(minimumRampUpCooldownNanoseconds, backoffBase * 4)
+            }
             let cleanElapsed = sample.timestampNanoseconds >= cleanWindowStartNanoseconds
                 ? (sample.timestampNanoseconds - cleanWindowStartNanoseconds)
                 : 0
@@ -2129,6 +2217,15 @@ public enum SPPWResolutionMode: Hashable, Sendable, Identifiable {
         }
     }
 
+    /// `title` in English, for the log console.
+    public var englishTitle: String {
+        switch self {
+        case .native: SPPWLocalization.english("settings.resolution_native")
+        case .automatic: SPPWLocalization.english("settings.resolution_auto")
+        case .shortSide(let lines): Self.levelTitle(lines)
+        }
+    }
+
     public static func levelTitle(_ lines: Int) -> String {
         switch lines {
         case 2160: "4K (2160p)"
@@ -2166,6 +2263,10 @@ public struct SPPWAutoResolutionController: Sendable {
     public var maximumStepUpHoldNanos: UInt64 = 120_000_000_000
     public var failedProbeWindowNanos: UInt64 = 20_000_000_000
 
+    /// "Prefer high quality": step down only below 35 % of the ceiling held for 6 s, and try the
+    /// next level up after 8 s at the ceiling (instead of 50 % / 3 s and 15 s). Survives `reset`.
+    public var prefersHighQuality = false
+
     /// Current level, `nil` = native.
     public private(set) var shortSide: Int?
     private var belowSince: UInt64?
@@ -2179,7 +2280,9 @@ public struct SPPWAutoResolutionController: Sendable {
     }
 
     public mutating func reset(shortSide: Int? = nil) {
+        let prefersHighQuality = self.prefersHighQuality
         self = SPPWAutoResolutionController(shortSide: shortSide)
+        self.prefersHighQuality = prefersHighQuality
     }
 
     /// Levels from highest (native, `nil`) to lowest.
@@ -2197,17 +2300,21 @@ public struct SPPWAutoResolutionController: Sendable {
         let index = levels.firstIndex(where: { $0 == shortSide }) ?? 0
         let ratio = ceilingBitrateBps > 0 ? Double(currentBitrateBps) / Double(ceilingBitrateBps) : 1
 
+        let baseHold = prefersHighQuality ? min(baseStepUpHoldNanos, 8_000_000_000) : baseStepUpHoldNanos
         if let lastUp = lastStepUpNanos, now &- lastUp > 60_000_000_000 {
             // Held the higher level for a minute: the probe succeeded.
-            stepUpHoldNanos = baseStepUpHoldNanos
+            stepUpHoldNanos = baseHold
             lastStepUpNanos = nil
         }
+        let downRatio = prefersHighQuality ? min(stepDownBelowRatio, 0.35) : stepDownBelowRatio
+        let downHold = prefersHighQuality ? max(stepDownHoldNanos, 6_000_000_000) : stepDownHoldNanos
+        let upHold = prefersHighQuality ? min(stepUpHoldNanos, max(baseHold, stepUpHoldNanos / 2)) : stepUpHoldNanos
 
-        if ratio < stepDownBelowRatio {
+        if ratio < downRatio {
             atCeilingSince = nil
             let since = belowSince ?? now
             belowSince = since
-            if now &- since >= stepDownHoldNanos, index + 1 < levels.count {
+            if now &- since >= downHold, index + 1 < levels.count {
                 if let lastUp = lastStepUpNanos, now &- lastUp < failedProbeWindowNanos {
                     stepUpHoldNanos = min(stepUpHoldNanos * 2, maximumStepUpHoldNanos)
                 }
@@ -2223,7 +2330,7 @@ public struct SPPWAutoResolutionController: Sendable {
         if ratio >= stepUpAtRatio {
             let since = atCeilingSince ?? now
             atCeilingSince = since
-            if now &- since >= stepUpHoldNanos, index > 0 {
+            if now &- since >= upHold, index > 0 {
                 atCeilingSince = nil
                 lastStepUpNanos = now
                 shortSide = levels[index - 1]
@@ -2431,6 +2538,16 @@ public enum SPPWLocalization {
         return String(format: format, arguments: args)
     }
 
+    /// English text of `key`, whatever the app language. Log console messages always use it:
+    /// logs stay identical on every device and can be pasted into bug reports as they are.
+    public static func english(_ key: String) -> String {
+        translations[key]?["en"] ?? key
+    }
+
+    public static func english(_ key: String, _ args: CVarArg...) -> String {
+        String(format: english(key), locale: Locale(identifier: "en_US_POSIX"), arguments: args)
+    }
+
     public static let translations: [String: [String: String]] = [
         "remote.title": [
             "it": "Controllo remoto", "en": "Remote control", "zh": "远程控制", "fr": "Contrôle à distance", "de": "Fernsteuerung", "ja": "リモート操作", "es": "Control remoto"
@@ -2454,7 +2571,10 @@ public enum SPPWLocalization {
             "it": "Sincronizza appunti", "en": "Sync clipboard", "zh": "同步剪贴板", "fr": "Synchroniser le presse-papiers", "de": "Zwischenablage synchronisieren", "ja": "クリップボードを同期", "es": "Sincronizar portapapeles"
         ],
         "remote.clipboard_footer": [
-            "it": "Mac → iPhone automatico. iPhone → Mac con il pulsante appunti del dock. Con Appunti universali (stesso Apple ID) la copia passa già da sola. Serve il controllo remoto attivo sul Mac.", "en": "Mac → iPhone is automatic. iPhone → Mac with the dock's clipboard button. With Universal Clipboard (same Apple ID) copies already travel on their own. Remote control must be enabled on the Mac.", "zh": "Mac → iPhone 自动同步。iPhone → Mac 请使用程序坞中的剪贴板按钮。使用通用剪贴板（同一 Apple ID）时，复制内容会自动传递。需要在 Mac 上启用远程控制。", "fr": "Mac → iPhone automatique. iPhone → Mac avec le bouton presse-papiers du dock. Avec le presse-papiers universel (même identifiant Apple), les copies passent déjà seules. Le contrôle à distance doit être activé sur le Mac.", "de": "Mac → iPhone automatisch. iPhone → Mac mit der Zwischenablage-Taste im Dock. Mit der universellen Zwischenablage (gleiche Apple-ID) wird Kopiertes bereits automatisch übertragen. Die Fernsteuerung muss auf dem Mac aktiviert sein.", "ja": "Mac → iPhone は自動。iPhone → Mac は Dock のクリップボードボタンで送信します。ユニバーサルクリップボード（同じ Apple ID）では、コピーは自動で共有されます。Mac でリモート操作を有効にする必要があります。", "es": "Mac → iPhone automático. iPhone → Mac con el botón de portapapeles del dock. Con el portapapeles universal (mismo Apple ID) las copias ya pasan solas. El control remoto debe estar activado en el Mac."
+            "it": "Mac → iPhone automatico. iPhone → Mac: ogni nuova copia viene inviata quando torni nell'app (iOS chiede ogni volta \"Consenti incolla\", per sicurezza). Testo, immagini e file da File (i grandi in background). Serve il controllo remoto attivo sul Mac.", "en": "Mac → iPhone is automatic. iPhone → Mac: every new copy is sent when you return to the app (iOS asks \"Allow Paste\" each time, for security). Text, images and files from Files (large ones in the background). Needs remote control on the Mac.", "zh": "Mac → iPhone 自动同步。iPhone → Mac：每次新的复制会在你回到 App 时发送（出于安全，iOS 每次都会询问“允许粘贴”）。支持文本、图片和“文件”中的文件（大文件在后台传输）。需要在 Mac 上开启远程控制。", "fr": "Mac → iPhone automatique. iPhone → Mac : chaque nouvelle copie est envoyée quand vous revenez dans l'app (iOS demande « Autoriser le collage » à chaque fois, par sécurité). Texte, images et fichiers de Fichiers (les gros en arrière-plan). Nécessite le contrôle à distance sur le Mac.", "de": "Mac → iPhone automatisch. iPhone → Mac: Jede neue Kopie wird gesendet, wenn du zur App zurückkehrst (iOS fragt aus Sicherheitsgründen jedes Mal „Einsetzen erlauben“). Text, Bilder und Dateien aus „Dateien“ (große im Hintergrund). Fernsteuerung auf dem Mac nötig.", "ja": "Mac → iPhone は自動。iPhone → Mac：新しくコピーした内容はアプリに戻ったときに送信されます（安全のため iOS が毎回「ペーストを許可」を確認します）。テキスト、画像、「ファイル」のファイル（大きいものはバックグラウンド）。Mac でリモート操作を有効にしてください。", "es": "Mac → iPhone es automático. iPhone → Mac: cada copia nueva se envía al volver a la app (iOS pregunta «Permitir pegar» cada vez, por seguridad). Texto, imágenes y archivos de Archivos (los grandes en segundo plano). Requiere el control remoto activo en el Mac."
+        ],
+        "remote.clipboard_auto_send": [
+            "it": "Invia le copie dell'iPhone in automatico", "en": "Send iPhone copies automatically", "zh": "自动发送 iPhone 上的复制内容", "fr": "Envoyer automatiquement les copies de l'iPhone", "de": "Kopien des iPhone automatisch senden", "ja": "iPhone のコピーを自動送信", "es": "Enviar las copias del iPhone automáticamente"
         ],
         "remote.hint.trackpad": [
             "it": "1 dito muove · tocco clic · 2 dita scorrono · tocco a 2 dita clic destro · tieni premuto e trascina", "en": "1 finger moves · tap clicks · 2 fingers scroll · 2-finger tap right-clicks · press and hold to drag", "zh": "单指移动 · 轻点点击 · 双指滚动 · 双指轻点右键 · 按住拖移", "fr": "1 doigt déplace · toucher clique · 2 doigts défilent · toucher à 2 doigts clic droit · maintenir pour glisser", "de": "1 Finger bewegt · Tippen klickt · 2 Finger scrollen · Tippen mit 2 Fingern Rechtsklick · gedrückt halten zum Ziehen", "ja": "1本指で移動 · タップでクリック · 2本指でスクロール · 2本指タップで右クリック · 長押しでドラッグ", "es": "1 dedo mueve · toque hace clic · 2 dedos desplazan · toque con 2 dedos clic derecho · mantén pulsado para arrastrar"
@@ -2983,6 +3103,204 @@ public enum SPPWLocalization {
             "it": "Clicca sul video per controllare", "en": "Click video to control", "zh": "点击视频开始控制",
             "fr": "Cliquez sur la vidéo pour contrôler", "de": "Zum Steuern ins Video klicken", "ja": "クリックして操作開始", "es": "Haz clic en el vídeo para controlar"
         ],
+        "transfer.clear": [
+            "it": "Rimuovi completati", "en": "Clear finished", "zh": "清除已完成", "fr": "Effacer les terminés", "de": "Abgeschlossene entfernen", "ja": "完了分を消去", "es": "Borrar terminados"
+        ],
+        "transfer.cancel": [
+            "it": "Annulla trasferimento", "en": "Cancel transfer", "zh": "取消传输", "fr": "Annuler le transfert", "de": "Übertragung abbrechen", "ja": "転送をキャンセル", "es": "Cancelar transferencia"
+        ],
+        "transfer.waiting_fmt": [
+            "it": "In attesa · %@", "en": "Waiting · %@", "zh": "等待中 · %@", "fr": "En attente · %@", "de": "Wartet · %@", "ja": "待機中 · %@", "es": "En espera · %@"
+        ],
+        "transfer.done_fmt": [
+            "it": "Completato · %@", "en": "Done · %@", "zh": "已完成 · %@", "fr": "Terminé · %@", "de": "Fertig · %@", "ja": "完了 · %@", "es": "Completado · %@"
+        ],
+        "transfer.failed_fmt": [
+            "it": "Non riuscito (%@)", "en": "Failed (%@)", "zh": "失败（%@）", "fr": "Échec (%@)", "de": "Fehlgeschlagen (%@)", "ja": "失敗（%@）", "es": "Error (%@)"
+        ],
+        "transfer.cancelled": [
+            "it": "Annullato", "en": "Cancelled", "zh": "已取消", "fr": "Annulé", "de": "Abgebrochen", "ja": "キャンセル済み", "es": "Cancelado"
+        ],
+        "security.broadcast_open_note": [
+            "it": "La trasmissione di sistema (Condividi lo schermo) senza App Group non può mostrare il PIN: lì vale la modalità aperta, sempre cifrata.", "en": "System broadcast (Share screen) without the App Group cannot show the PIN: it uses open mode there, still encrypted.", "zh": "未启用 App Group 时，系统广播（共享屏幕）无法显示 PIN：此时使用开放模式，仍然加密。", "fr": "La diffusion système (Partager l'écran) sans App Group ne peut pas afficher le code : elle utilise le mode ouvert, toujours chiffré.", "de": "Die Systemübertragung (Bildschirm teilen) ohne App Group kann die PIN nicht zeigen: Dort gilt der offene Modus, weiterhin verschlüsselt.", "ja": "App Group がない場合、システムブロードキャスト（画面共有）はPINを表示できません：その場合はオープンモード（暗号化は維持）になります。", "es": "La emisión del sistema (Compartir pantalla) sin App Group no puede mostrar el PIN: allí usa el modo abierto, sigue cifrado."
+        ],
+        "security.section": [
+            "it": "Sicurezza", "en": "Security", "zh": "安全", "fr": "Sécurité", "de": "Sicherheit", "ja": "セキュリティ", "es": "Seguridad"
+        ],
+        "security.encryption": [
+            "it": "Cifratura", "en": "Encryption", "zh": "加密", "fr": "Chiffrement", "de": "Verschlüsselung", "ja": "暗号化", "es": "Cifrado"
+        ],
+        "security.encryption.help": [
+            "it": "Cifra lo stream (AES-256-GCM) e richiede l'handshake sicuro. Server e ricevitori devono avere la stessa impostazione.", "en": "Encrypts the stream (AES-256-GCM) and requires the secure handshake. Server and receivers must use the same setting.", "zh": "加密串流（AES-256-GCM）并要求安全握手。服务器和接收端必须设置一致。", "fr": "Chiffre le flux (AES-256-GCM) et exige la poignée de main sécurisée. Le serveur et les récepteurs doivent avoir le même réglage.", "de": "Verschlüsselt den Stream (AES-256-GCM) und verlangt den sicheren Handshake. Server und Empfänger müssen gleich eingestellt sein.", "ja": "ストリームを暗号化（AES-256-GCM）し、安全なハンドシェイクを必須にします。サーバと受信側は同じ設定にしてください。", "es": "Cifra la transmisión (AES-256-GCM) y exige el protocolo de enlace seguro. El servidor y los receptores deben usar el mismo ajuste."
+        ],
+        "security.pairing_mode": [
+            "it": "Abbinamento", "en": "Pairing", "zh": "配对", "fr": "Association", "de": "Kopplung", "ja": "ペアリング", "es": "Emparejamiento"
+        ],
+        "security.mode.pin": [
+            "it": "PIN", "en": "PIN", "zh": "PIN", "fr": "PIN", "de": "PIN", "ja": "PIN", "es": "PIN"
+        ],
+        "security.mode.password": [
+            "it": "Password", "en": "Password", "zh": "密码", "fr": "Mot de passe", "de": "Passwort", "ja": "パスワード", "es": "Contraseña"
+        ],
+        "security.mode.open": [
+            "it": "Aperto", "en": "Open", "zh": "开放", "fr": "Ouvert", "de": "Offen", "ja": "オープン", "es": "Abierto"
+        ],
+        "security.mode.pin.help": [
+            "it": "Un nuovo ricevitore si abbina con il PIN a 5 cifre che compare qui.", "en": "A new receiver pairs with the 5-digit PIN shown here.", "zh": "新接收端使用此处显示的 5 位 PIN 配对。", "fr": "Un nouveau récepteur s'associe avec le code PIN à 5 chiffres affiché ici.", "de": "Ein neuer Empfänger koppelt mit der hier angezeigten 5-stelligen PIN.", "ja": "新しい受信側は、ここに表示される5桁のPINでペアリングします。", "es": "Un receptor nuevo se empareja con el PIN de 5 dígitos que aparece aquí."
+        ],
+        "security.mode.password.help": [
+            "it": "Per server headless senza schermo: un nuovo ricevitore si abbina con questa password.", "en": "For headless servers without a screen: a new receiver pairs with this password.", "zh": "适用于无屏幕的服务器：新接收端使用此密码配对。", "fr": "Pour les serveurs sans écran : un nouveau récepteur s'associe avec ce mot de passe.", "de": "Für Server ohne Bildschirm: Ein neuer Empfänger koppelt mit diesem Passwort.", "ja": "画面のないサーバ向け：新しい受信側はこのパスワードでペアリングします。", "es": "Para servidores sin pantalla: un receptor nuevo se empareja con esta contraseña."
+        ],
+        "security.mode.open.help": [
+            "it": "Qualsiasi ricevitore della rete può collegarsi (sempre cifrato, ma senza verificare chi è).", "en": "Any receiver on the network can connect (still encrypted, but nobody is verified).", "zh": "网络中的任何接收端都可以连接（仍然加密，但不验证身份）。", "fr": "Tout récepteur du réseau peut se connecter (toujours chiffré, mais sans vérification).", "de": "Jeder Empfänger im Netz kann sich verbinden (weiterhin verschlüsselt, aber ohne Prüfung).", "ja": "ネットワーク上のどの受信側も接続できます（暗号化は維持、ただし相手は検証しません）。", "es": "Cualquier receptor de la red puede conectarse (sigue cifrado, pero sin verificar a nadie)."
+        ],
+        "security.password.placeholder": [
+            "it": "Nuova password", "en": "New password", "zh": "新密码", "fr": "Nouveau mot de passe", "de": "Neues Passwort", "ja": "新しいパスワード", "es": "Nueva contraseña"
+        ],
+        "security.password.save": [
+            "it": "Salva", "en": "Save", "zh": "保存", "fr": "Enregistrer", "de": "Sichern", "ja": "保存", "es": "Guardar"
+        ],
+        "security.password.set": [
+            "it": "Password impostata", "en": "Password set", "zh": "已设置密码", "fr": "Mot de passe défini", "de": "Passwort gesetzt", "ja": "パスワード設定済み", "es": "Contraseña establecida"
+        ],
+        "security.password.missing": [
+            "it": "Nessuna password: i nuovi ricevitori non possono abbinarsi", "en": "No password: new receivers cannot pair", "zh": "未设置密码：新接收端无法配对", "fr": "Aucun mot de passe : les nouveaux récepteurs ne peuvent pas s'associer", "de": "Kein Passwort: Neue Empfänger können nicht koppeln", "ja": "パスワード未設定：新しい受信側はペアリングできません", "es": "Sin contraseña: los receptores nuevos no pueden emparejarse"
+        ],
+        "security.fingerprint_this": [
+            "it": "Impronta di questo dispositivo", "en": "This device's fingerprint", "zh": "本设备指纹", "fr": "Empreinte de cet appareil", "de": "Fingerabdruck dieses Geräts", "ja": "このデバイスのフィンガープリント", "es": "Huella de este dispositivo"
+        ],
+        "security.paired_clients_fmt": [
+            "it": "Ricevitori abbinati (%ld)", "en": "Paired receivers (%ld)", "zh": "已配对接收端（%ld）", "fr": "Récepteurs associés (%ld)", "de": "Gekoppelte Empfänger (%ld)", "ja": "ペアリング済み受信側（%ld）", "es": "Receptores emparejados (%ld)"
+        ],
+        "security.paired_servers_fmt": [
+            "it": "Server abbinati (%ld)", "en": "Paired servers (%ld)", "zh": "已配对服务器（%ld）", "fr": "Serveurs associés (%ld)", "de": "Gekoppelte Server (%ld)", "ja": "ペアリング済みサーバ（%ld）", "es": "Servidores emparejados (%ld)"
+        ],
+        "security.forget": [
+            "it": "Dimentica", "en": "Forget", "zh": "忘记", "fr": "Oublier", "de": "Vergessen", "ja": "削除", "es": "Olvidar"
+        ],
+        "security.none_paired": [
+            "it": "Nessun dispositivo abbinato", "en": "No paired devices", "zh": "没有已配对设备", "fr": "Aucun appareil associé", "de": "Keine gekoppelten Geräte", "ja": "ペアリング済みデバイスはありません", "es": "Ningún dispositivo emparejado"
+        ],
+        "security.pin.title": [
+            "it": "PIN di abbinamento", "en": "Pairing PIN", "zh": "配对 PIN", "fr": "Code d'association", "de": "Kopplungs-PIN", "ja": "ペアリングPIN", "es": "PIN de emparejamiento"
+        ],
+        "security.pin.subtitle_fmt": [
+            "it": "Digita questo PIN su %@ · impronta %@", "en": "Type this PIN on %@ · fingerprint %@", "zh": "请在 %@ 上输入此 PIN · 指纹 %@", "fr": "Saisissez ce code sur %@ · empreinte %@", "de": "Diese PIN auf %@ eingeben · Fingerabdruck %@", "ja": "%@ でこのPINを入力 · フィンガープリント %@", "es": "Escribe este PIN en %@ · huella %@"
+        ],
+        "security.pin.expires_fmt": [
+            "it": "Scade tra %ld s", "en": "Expires in %ld s", "zh": "%ld 秒后过期", "fr": "Expire dans %ld s", "de": "Läuft in %ld s ab", "ja": "あと %ld 秒で失効", "es": "Caduca en %ld s"
+        ],
+        "security.pin.dismiss": [
+            "it": "Rifiuta", "en": "Reject", "zh": "拒绝", "fr": "Refuser", "de": "Ablehnen", "ja": "拒否", "es": "Rechazar"
+        ],
+        "security.log.pin_requested_fmt": [
+            "it": "Abbinamento richiesto da %@ (%@): PIN mostrato", "en": "Pairing requested by %@ (%@): PIN shown", "zh": "%@（%@）请求配对：已显示 PIN", "fr": "Association demandée par %@ (%@) : code affiché", "de": "Kopplung angefragt von %@ (%@): PIN angezeigt", "ja": "%@（%@）がペアリングを要求：PINを表示", "es": "Emparejamiento solicitado por %@ (%@): PIN mostrado"
+        ],
+        "security.log.paired_fmt": [
+            "it": "Abbinato %@ (%@)", "en": "Paired %@ (%@)", "zh": "已配对 %@（%@）", "fr": "%@ associé (%@)", "de": "%@ gekoppelt (%@)", "ja": "%@ をペアリング（%@）", "es": "%@ emparejado (%@)"
+        ],
+        "security.log.session_paired_fmt": [
+            "it": "Sessione cifrata con %@ (%@), abbinato", "en": "Encrypted session with %@ (%@), paired", "zh": "与 %@（%@）的加密会话，已配对", "fr": "Session chiffrée avec %@ (%@), associé", "de": "Verschlüsselte Sitzung mit %@ (%@), gekoppelt", "ja": "%@（%@）との暗号化セッション、ペアリング済み", "es": "Sesión cifrada con %@ (%@), emparejado"
+        ],
+        "security.log.session_fmt": [
+            "it": "Sessione cifrata con %@ (%@)", "en": "Encrypted session with %@ (%@)", "zh": "与 %@（%@）的加密会话", "fr": "Session chiffrée avec %@ (%@)", "de": "Verschlüsselte Sitzung mit %@ (%@)", "ja": "%@（%@）との暗号化セッション", "es": "Sesión cifrada con %@ (%@)"
+        ],
+        "security.prompt.pin.title": [
+            "it": "Inserisci il PIN", "en": "Enter the PIN", "zh": "输入 PIN", "fr": "Saisissez le code", "de": "PIN eingeben", "ja": "PINを入力", "es": "Introduce el PIN"
+        ],
+        "security.prompt.pin.message_fmt": [
+            "it": "%@ mostra un PIN a 5 cifre. Impronta del server: %@", "en": "%@ shows a 5-digit PIN. Server fingerprint: %@", "zh": "%@ 显示了一个 5 位 PIN。服务器指纹：%@", "fr": "%@ affiche un code à 5 chiffres. Empreinte du serveur : %@", "de": "%@ zeigt eine 5-stellige PIN. Fingerabdruck des Servers: %@", "ja": "%@ に5桁のPINが表示されています。サーバのフィンガープリント：%@", "es": "%@ muestra un PIN de 5 dígitos. Huella del servidor: %@"
+        ],
+        "security.prompt.password.title": [
+            "it": "Password del server", "en": "Server password", "zh": "服务器密码", "fr": "Mot de passe du serveur", "de": "Server-Passwort", "ja": "サーバのパスワード", "es": "Contraseña del servidor"
+        ],
+        "security.prompt.password.message_fmt": [
+            "it": "Inserisci la password di abbinamento di %@. Impronta del server: %@", "en": "Enter the pairing password of %@. Server fingerprint: %@", "zh": "输入 %@ 的配对密码。服务器指纹：%@", "fr": "Saisissez le mot de passe d'association de %@. Empreinte du serveur : %@", "de": "Kopplungs-Passwort von %@ eingeben. Fingerabdruck des Servers: %@", "ja": "%@ のペアリングパスワードを入力。サーバのフィンガープリント：%@", "es": "Introduce la contraseña de emparejamiento de %@. Huella del servidor: %@"
+        ],
+        "security.prompt.wrong_fmt": [
+            "it": "Errato. Tentativi rimasti: %ld", "en": "Wrong. Attempts left: %ld", "zh": "错误。剩余尝试次数：%ld", "fr": "Incorrect. Essais restants : %ld", "de": "Falsch. Verbleibende Versuche: %ld", "ja": "違います。残り回数：%ld", "es": "Incorrecto. Intentos restantes: %ld"
+        ],
+        "security.prompt.renewed": [
+            "it": "Il PIN precedente non vale più: il server ne mostra uno nuovo.", "en": "The previous PIN is no longer valid: the server shows a new one.", "zh": "之前的 PIN 已失效：服务器显示了新的 PIN。", "fr": "L'ancien code n'est plus valable : le serveur en affiche un nouveau.", "de": "Die vorige PIN gilt nicht mehr: Der Server zeigt eine neue.", "ja": "前のPINは無効です：サーバに新しいPINが表示されます。", "es": "El PIN anterior ya no vale: el servidor muestra uno nuevo."
+        ],
+        "security.prompt.pair": [
+            "it": "Abbina", "en": "Pair", "zh": "配对", "fr": "Associer", "de": "Koppeln", "ja": "ペアリング", "es": "Emparejar"
+        ],
+        "security.prompt.cancel": [
+            "it": "Annulla", "en": "Cancel", "zh": "取消", "fr": "Annuler", "de": "Abbrechen", "ja": "キャンセル", "es": "Cancelar"
+        ],
+        "security.status.paired": [
+            "it": "Cifrato · abbinato", "en": "Encrypted · paired", "zh": "已加密 · 已配对", "fr": "Chiffré · associé", "de": "Verschlüsselt · gekoppelt", "ja": "暗号化 · ペアリング済み", "es": "Cifrado · emparejado"
+        ],
+        "security.status.unverified": [
+            "it": "Cifrato · server non verificato", "en": "Encrypted · server not verified", "zh": "已加密 · 服务器未验证", "fr": "Chiffré · serveur non vérifié", "de": "Verschlüsselt · Server nicht geprüft", "ja": "暗号化 · サーバ未検証", "es": "Cifrado · servidor no verificado"
+        ],
+        "security.status.plaintext": [
+            "it": "Non cifrato", "en": "Not encrypted", "zh": "未加密", "fr": "Non chiffré", "de": "Unverschlüsselt", "ja": "暗号化なし", "es": "Sin cifrar"
+        ],
+        "security.receiver.encryption.help": [
+            "it": "Usa l'handshake sicuro e cifra lo stream. Deve corrispondere all'impostazione del server; se non corrisponde la connessione viene rifiutata, mai declassata.", "en": "Uses the secure handshake and encrypts the stream. Must match the server's setting; a mismatch is refused, never downgraded.", "zh": "使用安全握手并加密串流。必须与服务器设置一致；不一致时拒绝连接，绝不降级。", "fr": "Utilise la poignée de main sécurisée et chiffre le flux. Doit correspondre au réglage du serveur ; une différence est refusée, jamais rétrogradée.", "de": "Nutzt den sicheren Handshake und verschlüsselt den Stream. Muss zur Server-Einstellung passen; Abweichungen werden abgelehnt, nie herabgestuft.", "ja": "安全なハンドシェイクを使い、ストリームを暗号化します。サーバ設定と一致が必要で、不一致は拒否され、決して格下げされません。", "es": "Usa el protocolo de enlace seguro y cifra la transmisión. Debe coincidir con el servidor; si no coincide se rechaza, nunca se degrada."
+        ],
+        "security.failure.server_requires_encryption": [
+            "it": "Il server richiede la cifratura: attivala in questo ricevitore.", "en": "The server requires encryption: turn it on in this receiver.", "zh": "服务器要求加密：请在此接收端开启。", "fr": "Le serveur exige le chiffrement : activez-le sur ce récepteur.", "de": "Der Server verlangt Verschlüsselung: hier einschalten.", "ja": "サーバは暗号化を必要とします：この受信側で有効にしてください。", "es": "El servidor exige cifrado: actívalo en este receptor."
+        ],
+        "security.failure.server_encryption_disabled": [
+            "it": "La cifratura è disattivata sul server: attivala lì o disattivala qui.", "en": "Encryption is off on the server: turn it on there or off here.", "zh": "服务器已关闭加密：请在服务器上开启，或在此关闭。", "fr": "Le chiffrement est désactivé sur le serveur : activez-le là-bas ou désactivez-le ici.", "de": "Auf dem Server ist die Verschlüsselung aus: dort ein- oder hier ausschalten.", "ja": "サーバで暗号化がオフです：サーバで有効にするか、ここで無効にしてください。", "es": "El cifrado está desactivado en el servidor: actívalo allí o desactívalo aquí."
+        ],
+        "security.failure.bad_signature": [
+            "it": "Il server non ha dimostrato la sua identità: connessione interrotta.", "en": "The server did not prove its identity: connection stopped.", "zh": "服务器未能证明其身份：连接已中止。", "fr": "Le serveur n'a pas prouvé son identité : connexion interrompue.", "de": "Der Server hat seine Identität nicht nachgewiesen: Verbindung beendet.", "ja": "サーバが身元を証明できませんでした：接続を中止しました。", "es": "El servidor no demostró su identidad: conexión detenida."
+        ],
+        "security.failure.denied": [
+            "it": "Il server ha rifiutato questo dispositivo.", "en": "The server refused this device.", "zh": "服务器拒绝了此设备。", "fr": "Le serveur a refusé cet appareil.", "de": "Der Server hat dieses Gerät abgelehnt.", "ja": "サーバがこのデバイスを拒否しました。", "es": "El servidor rechazó este dispositivo."
+        ],
+        "security.failure.locked": [
+            "it": "Troppi tentativi: riprova tra qualche minuto.", "en": "Too many attempts: try again in a few minutes.", "zh": "尝试次数过多：请几分钟后重试。", "fr": "Trop d'essais : réessayez dans quelques minutes.", "de": "Zu viele Versuche: in ein paar Minuten erneut versuchen.", "ja": "試行回数が多すぎます：数分後に再試行してください。", "es": "Demasiados intentos: vuelve a intentarlo en unos minutos."
+        ],
+        "security.failure.unavailable": [
+            "it": "Il server non ha una password di abbinamento.", "en": "The server has no pairing password.", "zh": "服务器未设置配对密码。", "fr": "Le serveur n'a pas de mot de passe d'association.", "de": "Der Server hat kein Kopplungs-Passwort.", "ja": "サーバにペアリングパスワードがありません。", "es": "El servidor no tiene contraseña de emparejamiento."
+        ],
+        "security.failure.cancelled": [
+            "it": "Abbinamento annullato.", "en": "Pairing cancelled.", "zh": "已取消配对。", "fr": "Association annulée.", "de": "Kopplung abgebrochen.", "ja": "ペアリングをキャンセルしました。", "es": "Emparejamiento cancelado."
+        ],
+        "settings.prefer_high_quality": [
+            "it": "Preferisci alta qualità", "en": "Prefer high quality", "zh": "优先高画质",
+            "fr": "Privilégier la qualité", "de": "Hohe Qualität bevorzugen", "ja": "高画質を優先", "es": "Preferir alta calidad"
+        ],
+        "settings.prefer_high_quality_help": [
+            "it": "Bitrate e risoluzione automatici restano alti durante i brevi disturbi del Wi-Fi e risalgono prima, con un po' più di FEC: immagine più nitida, qualche scatto in più su una rete debole.",
+            "en": "Automatic bitrate and resolution stay high through short Wi-Fi trouble and climb back sooner, with a little more FEC: a sharper picture, a few more glitches on a weak link.",
+            "zh": "自动码率和分辨率在短暂的 Wi-Fi 波动中保持较高并更快恢复，并略增 FEC：画面更清晰，弱网络下偶尔多些卡顿。",
+            "fr": "Le débit et la résolution automatiques restent élevés pendant les courtes perturbations Wi-Fi et remontent plus vite, avec un peu plus de FEC : image plus nette, quelques saccades de plus sur un réseau faible.",
+            "de": "Automatische Bitrate und Auflösung bleiben bei kurzen WLAN-Störungen hoch und steigen schneller wieder, mit etwas mehr FEC: schärferes Bild, bei schwachem Netz etwas mehr Ruckler.",
+            "ja": "自動ビットレートと解像度が短いWi-Fiの乱れでも高いまま保たれ、早く回復します（FECも少し増加）。画質はより鮮明に、弱い回線では少し乱れが増えます。",
+            "es": "La tasa de bits y la resolución automáticas se mantienen altas durante los cortes breves de Wi-Fi y suben antes, con algo más de FEC: imagen más nítida, algún tirón más en una red débil."
+        ],
+        "receiver.hide_remote_cursor": [
+            "it": "Nascondi cursore remoto", "en": "Hide remote cursor", "zh": "隐藏远程光标",
+            "fr": "Masquer le curseur distant", "de": "Entfernten Zeiger ausblenden", "ja": "リモートのカーソルを隠す", "es": "Ocultar cursor remoto"
+        ],
+        "receiver.hide_remote_cursor_help": [
+            "it": "Lascia fuori dal video il cursore del Mac remoto anche senza controllo remoto. Con il controllo remoto attivo è sempre nascosto: al suo posto c'è il puntatore di questo Mac.",
+            "en": "Keeps the remote Mac's cursor out of the video even without remote control. With remote control on it is always hidden: this Mac's pointer takes its place.",
+            "zh": "即使未开启远程控制，也不在视频中显示远程 Mac 的光标。开启远程控制时始终隐藏，由本机指针代替。",
+            "fr": "Retire le curseur du Mac distant de la vidéo, même sans contrôle à distance. Avec le contrôle à distance activé, il est toujours masqué : le pointeur de ce Mac le remplace.",
+            "de": "Blendet den Zeiger des entfernten Mac auch ohne Fernsteuerung aus dem Video aus. Bei aktiver Fernsteuerung ist er immer ausgeblendet: Der Zeiger dieses Mac ersetzt ihn.",
+            "ja": "リモート操作をしていなくても、リモートMacのカーソルを映像に表示しません。リモート操作中は常に非表示で、このMacのポインタが代わりに使われます。",
+            "es": "Deja fuera del vídeo el cursor del Mac remoto incluso sin control remoto. Con el control remoto activado siempre está oculto: lo sustituye el puntero de este Mac."
+        ],
+        "receiver.clipboard_sync_help": [
+            "it": "Copia qui e incolla sul Mac remoto, e viceversa: testo, immagini e file (fino a 16 MB). Funziona con il controllo remoto attivo.",
+            "en": "Copy here and paste on the remote Mac, and back: text, images and files (up to 16 MB). Works while remote control is on.",
+            "zh": "在此复制、在远程 Mac 上粘贴，反之亦然：文本、图片和文件（最多 16 MB）。需开启远程控制。",
+            "fr": "Copiez ici et collez sur le Mac distant, et inversement : texte, images et fichiers (jusqu’à 16 Mo). Fonctionne avec le contrôle à distance activé.",
+            "de": "Hier kopieren und auf dem entfernten Mac einsetzen und umgekehrt: Text, Bilder und Dateien (bis 16 MB). Funktioniert bei aktiver Fernsteuerung.",
+            "ja": "ここでコピーしてリモートMacでペースト、その逆も可能：テキスト、画像、ファイル（最大16 MB）。リモート操作中に有効です。",
+            "es": "Copia aquí y pega en el Mac remoto, y al revés: texto, imágenes y archivos (hasta 16 MB). Funciona con el control remoto activado."
+        ],
+        "receiver.log.clipboard_received": [
+            "it": "Appunti dal Mac remoto (%@, %ld B)", "en": "Clipboard from the remote Mac (%@, %ld B)", "zh": "来自远程 Mac 的剪贴板（%@，%ld B）",
+            "fr": "Presse-papiers du Mac distant (%@, %ld o)", "de": "Zwischenablage vom entfernten Mac (%@, %ld B)", "ja": "リモートMacのクリップボード（%@、%ld B）", "es": "Portapapeles del Mac remoto (%@, %ld B)"
+        ],
         "receiver.log.remote_control_enabled": [
             "it": "Controllo remoto abilitato (clicca sul video, ⌃⌥Esc per rilasciare)", "en": "Remote control enabled (click video, ⌃⌥Esc to release)", "zh": "已启用远程控制（点击视频区域，按 ⌃⌥Esc 释放）",
             "fr": "Contrôle à distance activé (cliquez sur la vidéo, ⌃⌥Échap pour libérer)", "de": "Fernsteuerung aktiviert (ins Video klicken, ⌃⌥Esc zum Freigeben)", "ja": "リモート操作を有効にしました（映像をクリック、⌃⌥Escで解除）", "es": "Control remoto activado (haz clic en el vídeo, ⌃⌥Esc para liberar)"
@@ -2994,6 +3312,14 @@ public enum SPPWLocalization {
         "broadcast.share_screen": [
             "it": "Condividi tutto lo schermo", "en": "Share the whole screen", "zh": "共享整个屏幕",
             "fr": "Partager tout l’écran", "de": "Ganzen Bildschirm teilen", "ja": "画面全体を共有", "es": "Compartir toda la pantalla"
+        ],
+        "server.clipboard_sync_store": [
+            "it": "Appunti condivisi con i client", "en": "Share the clipboard with clients", "zh": "与客户端共享剪贴板",
+            "fr": "Partager le presse-papiers avec les clients", "de": "Zwischenablage mit Clients teilen", "ja": "クライアントとクリップボードを共有", "es": "Compartir el portapapeles con los clientes"
+        ],
+        "server.remote_control_store_unavailable": [
+            "it": "Nella versione Mac App Store i client non possono controllare mouse e tastiera di questo Mac: la sandbox di macOS non lo consente. Usa la versione scaricabile da GitHub per il controllo remoto.", "en": "In the Mac App Store version clients can't control this Mac's mouse and keyboard: the macOS App Sandbox doesn't allow it. Use the download from GitHub for remote control.", "zh": "在 Mac App Store 版本中，客户端无法控制此 Mac 的鼠标和键盘：macOS App 沙盒不允许。如需远程控制，请使用 GitHub 上的下载版本。",
+            "fr": "Dans la version Mac App Store, les clients ne peuvent pas contrôler la souris et le clavier de ce Mac : le bac à sable macOS ne le permet pas. Utilisez la version téléchargeable sur GitHub pour le contrôle à distance.", "de": "In der Mac App Store-Version können Clients Maus und Tastatur dieses Macs nicht steuern: Die macOS App Sandbox erlaubt es nicht. Für die Fernsteuerung die Version von GitHub verwenden.", "ja": "Mac App Store 版では、クライアントはこの Mac のマウスとキーボードを操作できません（macOS の App Sandbox が許可しないため）。リモート操作には GitHub のダウンロード版を使用してください。", "es": "En la versión de la Mac App Store los clientes no pueden controlar el ratón y el teclado de este Mac: el App Sandbox de macOS no lo permite. Usa la versión descargable de GitHub para el control remoto."
         ],
         "broadcast.stop": [
             "it": "Trasmissione attiva · tocca per fermarla", "en": "Broadcast running · tap to stop", "zh": "正在广播 · 轻点停止",
@@ -3350,9 +3676,9 @@ public enum SPPWLocalization {
 // MARK: - App & Build Version Information
 
 public enum SPPWBuildVersion: Sendable {
-    public static let fallbackVersion = "0.6.10"
-    public static let fallbackBuildNumber = "610"
-    public static let fallbackCommit = "345f619"
+    public static let fallbackVersion = "0.6.19"
+    public static let fallbackBuildNumber = "619"
+    public static let fallbackCommit = "1f7c373"
 
     /// Formatted build version string, e.g. "v0.6.4 (build 604, c778763)".
     /// If commit information is not available, falls back to "v0.6.4 (build 604)".

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(SPPWCommon)
+import SPPWCommon
+#endif
 
 /// Settings shared by the app and its Broadcast Upload Extension.
 ///
@@ -26,6 +29,64 @@ enum IOSBroadcastSettings {
 
     private static var shared: UserDefaults? {
         isShared ? UserDefaults(suiteName: appGroup) : nil
+    }
+
+    // MARK: Security (shared with the extension through the App Group when available)
+
+    /// Identity, paired devices and the headless password. In the App Group container when it
+    /// exists, so the broadcast server uses the same identity and pairings as the app.
+    static let securityStore: SPPWSecurityStore = {
+        if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) {
+            return SPPWSecurityStore(directory: container
+                .appendingPathComponent("Library/Application Support/PyrowaveCast/Security", isDirectory: true))
+        }
+        return SPPWSecurityStore.shared
+    }()
+
+    private static var settingsDefaults: UserDefaults { shared ?? .standard }
+
+    static var encryptionEnabled: Bool {
+        get { settingsDefaults.object(forKey: "serverEncryptionEnabled") as? Bool ?? true }
+        set { settingsDefaults.set(newValue, forKey: "serverEncryptionEnabled") }
+    }
+
+    static var pairingMode: SPPWPairingMode {
+        get { SPPWPairingMode(rawValue: UInt8(settingsDefaults.integer(forKey: "serverPairingMode"))) ?? .pin }
+        set { settingsDefaults.set(Int(newValue.rawValue), forKey: "serverPairingMode") }
+    }
+
+    /// Settings for the broadcast server. Without the App Group the extension cannot show a PIN
+    /// anywhere (it has no screen and the app cannot read it), so it stays encrypted but open.
+    static var broadcastSecurityConfiguration: SPPWServerSecurityConfiguration {
+        let mode = pairingMode
+        return SPPWServerSecurityConfiguration(
+            encryptionEnabled: encryptionEnabled,
+            pairingMode: isShared || mode == .password ? mode : .open
+        )
+    }
+
+    /// The PIN the broadcast server is showing, for the app to display (App Group only).
+    static var broadcastPIN: SPPWPairingPINPrompt? {
+        get {
+            guard let shared, let pin = shared.string(forKey: "broadcastPIN"),
+                  let name = shared.string(forKey: "broadcastPINClient"),
+                  let hex = shared.string(forKey: "broadcastPINFingerprint"),
+                  let fingerprint = SPPWFingerprint(hex: hex) else { return nil }
+            let expires = Date(timeIntervalSince1970: shared.double(forKey: "broadcastPINExpires"))
+            guard expires > Date() else { return nil }
+            return SPPWPairingPINPrompt(pin: pin, clientName: name, clientFingerprint: fingerprint, expiresAt: expires)
+        }
+        set {
+            guard let shared else { return }
+            if let newValue {
+                shared.set(newValue.pin, forKey: "broadcastPIN")
+                shared.set(newValue.clientName, forKey: "broadcastPINClient")
+                shared.set(newValue.clientFingerprint.hex, forKey: "broadcastPINFingerprint")
+                shared.set(newValue.expiresAt.timeIntervalSince1970, forKey: "broadcastPINExpires")
+            } else {
+                shared.removeObject(forKey: "broadcastPIN")
+            }
+        }
     }
 
     /// The port the broadcast server listens on: the app's port when shared, else the default.

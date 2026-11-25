@@ -78,6 +78,8 @@ actor IOSStreamServer {
     private var fps = 0
     private var frameCount = 0
     private var byteCount = 0
+    /// Secure transport (PROTOCOL.md §7) on the UDP socket; `nil` = plain `SPPW/1`.
+    private nonisolated let security: SPPWServerSecurity?
     private let stats = StreamStats()
     private var logID = 0
 
@@ -86,9 +88,11 @@ actor IOSStreamServer {
         screenResolution: (width: Int, height: Int) = (1920, 1080),
         previewEnabled: Bool = true,
         audioInputGain: Float = 1,
+        security: SPPWServerSecurity? = nil,
         logHandler: (@Sendable (ServerLogEntry) -> Void)? = nil,
         previewHandler: (@Sendable (Data, Int, Int) -> Void)? = nil
     ) {
+        self.security = security
         self.source = source
         self.previewEnabled = previewEnabled
         audioPacketizer.gain = audioInputGain
@@ -191,8 +195,10 @@ actor IOSStreamServer {
             sendBufferBytes: SPPWSocketBufferTuning.defaultSendBufferBytes,
             receiveBufferBytes: SPPWSocketBufferTuning.defaultReceiveBufferBytes
         )
+        socket.security = security
         let ipv4 = Self.preferredLocalIPv4Address()
         let serviceName = SPPWNetworkInterface.localBonjourServiceName()
+        security?.setServerName(serviceName)
         let hostName = ipv4 ?? SPPWNetworkInterface.sanitizedMDNSHostname(serviceName: serviceName)
         var txtRecords: [String: String] = [
             "port": String(port),

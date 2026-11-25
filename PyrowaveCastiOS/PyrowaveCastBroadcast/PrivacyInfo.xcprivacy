@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PyrowaveCast privacy manifest (App Store requirement for iOS, iPadOS and macOS apps).
+  No tracking and no data collected: video, audio, input and clipboard only travel between
+  the user's own devices on the local network. Required-reason APIs:
+  - UserDefaults: app settings (CA92.1) and the App Group shared with the broadcast
+    upload extension (1C8F.1).
+  - System boot time (mach_absolute_time): frame, audio and network timing (35F9.1).
+  Copies: PyrowaveCastiOS/PyrowaveCastiOS, PyrowaveCastiOS/PyrowaveCastBroadcast (bundled by
+  Xcode) and the macOS app (copied by scripts/build-app.sh). Keep them identical.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+				<string>1C8F.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

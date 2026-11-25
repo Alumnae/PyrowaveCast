@@ -68,6 +68,11 @@ final class IOSReceiverModel: ObservableObject {
     @Published var bitrateMbps = UserDefaults.standard.object(forKey: "iosReceiverBitrate") as? Double ?? 80
     @Published var automaticBitrate = UserDefaults.standard.object(forKey: "iosReceiverAutomaticBitrate") as? Bool ?? true
     @Published var fecPercent = UserDefaults.standard.object(forKey: "iosReceiverFECPercent") as? Int ?? 18
+    /// "Prefer high quality": the adaptive bitrate and automatic resolution hold the higher
+    /// setting through short Wi-Fi trouble, and the request carries 5 % more FEC.
+    @Published var preferHighQuality: Bool = UserDefaults.standard.bool(forKey: "iosReceiverPreferHighQuality") {
+        didSet { UserDefaults.standard.set(preferHighQuality, forKey: "iosReceiverPreferHighQuality") }
+    }
     @Published var latencyMode: SPPWLatencyMode = {
         let raw = UserDefaults.standard.object(forKey: "iosReceiverLatencyMode") as? Int ?? 2
         return SPPWLatencyMode(rawValue: UInt8(clamping: raw)) ?? .wifiResilient
@@ -109,7 +114,7 @@ final class IOSReceiverModel: ObservableObject {
             guard resolutionMode != oldValue else { return }
             UserDefaults.standard.set(resolutionMode.id, forKey: "iosReceiverResolutionMode")
             autoResolution.reset()
-            appendEvent("Risoluzione richiesta: \(resolutionMode.title)")
+            appendEvent("Requested resolution: \(resolutionMode.englishTitle)")
             if isConnected {
                 applySettings()
             }
@@ -156,7 +161,8 @@ final class IOSReceiverModel: ObservableObject {
         didSet { UserDefaults.standard.set(naturalScrolling, forKey: "iosReceiverNaturalScrolling") }
     }
 
-    /// Clipboard sync with the Mac (Mac → iPhone automatic, iPhone → Mac on explicit paste).
+    /// Clipboard sync with the Mac (Mac → iPhone automatic; iPhone → Mac automatic with iOS's
+    /// "Allow Paste" prompt when `clipboardAutoSend` is on, or with the dock's paste button).
     @Published var clipboardSyncEnabled: Bool = UserDefaults.standard.object(forKey: "iosReceiverClipboardSync") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(clipboardSyncEnabled, forKey: "iosReceiverClipboardSync")
@@ -168,6 +174,34 @@ final class IOSReceiverModel: ObservableObject {
     @Published var stickyModifiers = SPPWStickyModifiers()
 
     nonisolated let clipboardSession = IOSClipboardSession()
+
+    /// iPhone → Mac without the paste button: every new copy is read once (iOS asks "Allow Paste"
+    /// each time, by design) and sent to the Mac while connected.
+    @Published var clipboardAutoSend: Bool = UserDefaults.standard.object(forKey: "iosReceiverClipboardAutoSend") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(clipboardAutoSend, forKey: "iosReceiverClipboardAutoSend") }
+    }
+    /// `UIPasteboard.changeCount` already handled (read and sent, or written by us).
+    private var handledPasteboardChangeCount = UIPasteboard.general.changeCount
+    private var pasteboardWatchTimer: Timer?
+    private var pasteboardObservers: [NSObjectProtocol] = []
+    private var isReadingPasteboard = false
+
+    // MARK: Security (encryption and pairing, PROTOCOL.md §7)
+
+    /// Use the secure handshake and encrypt the stream; must match the server's setting.
+    @Published var encryptionEnabled: Bool = UserDefaults.standard.object(forKey: "iosReceiverEncryptionEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(encryptionEnabled, forKey: "iosReceiverEncryptionEnabled") }
+    }
+    /// Set while the server asks for its PIN or password.
+    @Published private(set) var pairingRequest: SPPWPairingRequest?
+    /// How the current session is protected (nil before the handshake).
+    @Published private(set) var securityInfo: SPPWServerSecurityInfo?
+    @Published private(set) var pairedServers: [SPPWTrustedPeer] = IOSBroadcastSettings.securityStore.trustedPeers(.servers)
+    var deviceFingerprint: String { IOSBroadcastSettings.securityStore.identity.fingerprint.display }
+    private var activeSecurity: SPPWClientSecurity?
+    private var activeSecurityID = UUID()
+    /// The security layer of the `NWConnection` fallback (the UDP socket carries its own).
+    private nonisolated let connectionSecurity = SPPWClientSecurityBox()
     private var inputSequencer = SPPWInputSequencer()
 
     func rotateVideo() {
@@ -655,6 +689,7 @@ final class IOSReceiverModel: ObservableObject {
                 }
             }
         )
+        clientSocket.attachSecurity(makeClientSecurity())
         if reconnectTask == nil {
             state = .waiting
         }
@@ -725,6 +760,13 @@ final class IOSReceiverModel: ObservableObject {
         audioPlayer.stop()
         avSyncClock.reset()
         clipboardSession.stop()
+        stopPasteboardWatch()
+        activeSecurity?.stop()
+        activeSecurity = nil
+        activeSecurityID = UUID()
+        connectionSecurity.current?.stop()
+        connectionSecurity.current = nil
+        pairingRequest = nil
         controlStreamID = 0
         lastFrameID = 0
         hasReceivedFrame = false
@@ -802,6 +844,8 @@ final class IOSReceiverModel: ObservableObject {
     private(set) var localPointer = SPPWLocalPointer()
     /// Fires on every pointer change; not `@Published`, so SwiftUI does not re-render at 120 Hz.
     let localPointerSubject = PassthroughSubject<SPPWLocalPointer, Never>()
+    /// Fires after relative motion (trackpad swipes, mouse), not when a touch places the pointer.
+    let relativePointerMoveSubject = PassthroughSubject<Void, Never>()
     /// Size of the displayed (unzoomed) video in its own axes, set by the fullscreen view on
     /// layout. Relative motion is measured against it.
     var pointerViewport: (width: Double, height: Double)?
@@ -825,6 +869,7 @@ final class IOSReceiverModel: ObservableObject {
         localPointer = pointer
         sendInputEvent(pointer.moveEvent)
         localPointerSubject.send(pointer)
+        relativePointerMoveSubject.send(())
     }
 
     /// Direct touch: the finger is the pointer (the touch event itself moves the Mac's).
@@ -867,7 +912,7 @@ final class IOSReceiverModel: ObservableObject {
     func sendClipboardToHost(_ content: SPPWClipboardContent) {
         guard controlStreamID != 0 else { return }
         if clipboardSession.offer(content) {
-            appendEvent("Appunti inviati al Mac (\(content.format == .png ? "immagine" : "testo"), \(content.data.count) B)")
+            appendEvent("Clipboard sent to the Mac (\(content.format == .png ? "image" : content.format == .files || content.format == .fileOffer ? "files" : "text"), \(content.data.count) B)")
         }
     }
 
@@ -893,6 +938,13 @@ final class IOSReceiverModel: ObservableObject {
         case .ready:
             if reconnectTask == nil {
                 state = .waiting
+            }
+            if connectionSecurity.current == nil, let connection = controlConnection {
+                let security = makeClientSecurity()
+                connectionSecurity.current = security
+                security.start { [weak connection] datagram in
+                    connection?.send(content: datagram, completion: .idempotent)
+                }
             }
             let hello = IOSReceiverWireHeader.control(.clientHello, payload: makeConfiguration().payload)
             send(hello)
@@ -920,8 +972,8 @@ final class IOSReceiverModel: ObservableObject {
     private nonisolated func receiveNext(on connection: NWConnection) {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
             guard let self, let connection else { return }
-            if let data {
-                self.handleDatagramBackground(data)
+            if let data, let plain = self.connectionSecurity.open(data) {
+                self.handleDatagramBackground(plain)
             }
             if let error {
                 Task { @MainActor [weak self, weak connection] in
@@ -969,9 +1021,12 @@ final class IOSReceiverModel: ObservableObject {
                 ? data.subdata(in: IOSReceiverWireHeader.byteCount..<data.count)
                 : Data()
             if let content = clipboardSession.receive(payload) {
+                let host = clipboardSession.peerHost
                 Task { @MainActor [weak self] in
-                    IOSClipboardBridge.write(content)
-                    self?.appendEvent("Appunti dal Mac (\(content.format == .png ? "immagine" : "testo"), \(content.data.count) B)")
+                    IOSClipboardBridge.write(content, peerHost: host)
+                    // Our own write: not a new copy to send back (and no paste prompt for it).
+                    self?.handledPasteboardChangeCount = UIPasteboard.general.changeCount
+                    self?.appendEvent("Clipboard from the Mac (\(content.format == .png ? "image" : content.format == .files || content.format == .fileOffer ? "files" : "text"), \(content.data.count) B)")
                 }
             }
 
@@ -1108,7 +1163,9 @@ final class IOSReceiverModel: ObservableObject {
             controlStreamID = header.streamID
             isResynchronizing = false
             resyncStartedAt = nil
-            state = .waiting
+            // A reconnect or resync over the same picture stays "streaming" (no orange
+            // blink); only a session without a picture waits for its first frame.
+            state = currentPixelBuffer != nil ? .streaming : .waiting
             lastFrameID = 0
             hasReceivedFrame = false
             frameWaitStartedAt = PyrowaveClock.now
@@ -1153,7 +1210,7 @@ final class IOSReceiverModel: ObservableObject {
                 updated.frameWidth = serverW
                 updated.frameHeight = serverH
                 statistics = updated
-                appendEvent("Risoluzione concordata: \(serverW)×\(serverH) (\(resolutionMode.title))")
+                appendEvent("Agreed resolution: \(serverW)×\(serverH) (\(resolutionMode.englishTitle))")
             }
             resetAdaptiveBitrate(nowNanos: nowNanos)
             startHeartbeat()
@@ -1161,11 +1218,12 @@ final class IOSReceiverModel: ObservableObject {
             startAdaptiveBitrateLoop()
             sendReadinessPing()
             startClipboardSession()
+            startPasteboardWatch()
             if remoteCursorHidden {
                 sendInputEvent(.cursorVisibility(hidden: true))
             }
             if wasReconnecting {
-                appendEvent("Riconnesso automaticamente · sessione \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
+                appendEvent("Reconnected automatically · session \(controlStreamID), media \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             } else {
                 appendEvent("Server hello · control session \(controlStreamID), media stream \(mediaStreamID), timeout \(agreedTimeoutSeconds)s")
             }
@@ -1178,7 +1236,7 @@ final class IOSReceiverModel: ObservableObject {
                 let serverH = Int(header.height)
                 if width != serverW || height != serverH {
                     noteServerStreamSize(width: serverW, height: serverH)
-                    appendEvent("Risoluzione stream: \(serverW)×\(serverH) (\(resolutionMode.title))")
+                    appendEvent("Stream resolution: \(serverW)×\(serverH) (\(resolutionMode.englishTitle))")
                 }
             }
             if isResynchronizing {
@@ -1230,7 +1288,7 @@ final class IOSReceiverModel: ObservableObject {
         let safeFPS = max(1, min(fps, 120))
         let safeQuality = max(0.1, min(1.0, quality))
         let safeBitrate = max(5.0, min(1000.0, bitrateMbps))
-        let safeFEC = max(0, min(50, fecPercent))
+        let safeFEC = max(0, min(50, fecPercent + (preferHighQuality ? 5 : 0)))
         let request = requestedResolution(fps: safeFPS, quality: safeQuality, manualBitrateMbps: safeBitrate)
         let expected = SPPWResolutionLadder.resolve(
             requestedWidth: request.width,
@@ -1328,12 +1386,17 @@ final class IOSReceiverModel: ObservableObject {
                 do { try await Task.sleep(nanoseconds: 1_000_000_000) }
                 catch { return }
                 guard let self, (self.udpSocket != nil || self.controlConnection != nil), self.controlStreamID == 0 else { return }
+                if self.pairingRequest != nil {
+                    // The user is typing the PIN/password: no timeout, and the hello waits anyway.
+                    self.connectStartedNanos = DispatchTime.now().uptimeNanoseconds
+                    continue
+                }
                 if self.reconnectTask == nil {
                     let elapsedSec = Double(DispatchTime.now().uptimeNanoseconds &- self.connectStartedNanos) / 1_000_000_000.0
                     if elapsedSec >= Double(self.agreedTimeoutSeconds) {
                         self.teardownActiveConnection(clearAutoReconnect: true)
                         self.state = .failed(SPPWLocalization.tr("receiver.error.connection_timeout_fmt", self.agreedTimeoutSeconds))
-                        self.appendEvent("Nessuna risposta dal server entro \(self.agreedTimeoutSeconds)s")
+                        self.appendEvent("No answer from the server within \(self.agreedTimeoutSeconds)s")
                         return
                     }
                 }
@@ -1372,14 +1435,14 @@ final class IOSReceiverModel: ObservableObject {
 
                 let silenceSeconds = self.secondsSinceLastServerActivity()
                 if silenceSeconds >= 6.0 {
-                    self.triggerAutoReconnect(reason: "Nessuna risposta dal server da \(Int(silenceSeconds))s")
+                    self.triggerAutoReconnect(reason: "No answer from the server for \(Int(silenceSeconds))s")
                     return
                 }
 
                 if self.isResynchronizing,
                    let started = self.resyncStartedAt,
                    started.duration(to: PyrowaveClock.now) >= .seconds(3) {
-                    self.triggerAutoReconnect(reason: "Resync senza risposta dal server")
+                    self.triggerAutoReconnect(reason: "Resync got no answer from the server")
                     return
                 }
 
@@ -1467,7 +1530,7 @@ final class IOSReceiverModel: ObservableObject {
         guard case .changed(let level) = change else { return }
         let config = makeConfiguration()
         send(IOSReceiverWireHeader.control(.streamConfiguration, streamID: controlStreamID, payload: config.payload))
-        appendEvent("Risoluzione automatica: \(level.map(SPPWResolutionMode.levelTitle) ?? SPPWLocalization.tr("settings.resolution_native"))")
+        appendEvent("Automatic resolution: \(level.map(SPPWResolutionMode.levelTitle) ?? "native")")
     }
 
     private func startAdaptiveBitrateLoop() {
@@ -1504,6 +1567,8 @@ final class IOSReceiverModel: ObservableObject {
                 self.abrPrevFECRecoveredFrames = curFECRecovered
                 self.abrPrevLateDroppedFrames = curLateDrop
 
+                self.abrController.prefersHighQuality = self.preferHighQuality
+                self.autoResolution.prefersHighQuality = self.preferHighQuality
                 let decision = self.abrController.evaluate(sample)
                 defer { self.evaluateAutomaticResolution(nowNanos: nowNanos) }
                 switch decision {
@@ -1542,14 +1607,14 @@ final class IOSReceiverModel: ObservableObject {
         guard let deadline = reconnectDeadlineNanos else { return }
         if now >= deadline {
             teardownActiveConnection(clearAutoReconnect: true)
-            let msg = "Timeout riconnessione (\(agreedTimeoutSeconds)s)"
+            let msg = "Reconnection timeout (\(agreedTimeoutSeconds)s)"
             lastError = msg
             state = .failed(msg)
-            appendEvent("Riconnessione automatica scaduta dopo \(agreedTimeoutSeconds)s")
+            appendEvent("Automatic reconnection timed out after \(agreedTimeoutSeconds)s")
             return
         }
 
-        appendEvent("\(reason) · avvio riconnessione automatica (timeout \(agreedTimeoutSeconds)s)")
+        appendEvent("\(reason) · reconnecting automatically (timeout \(agreedTimeoutSeconds)s)")
         teardownActiveConnection(clearAutoReconnect: false)
 
         reconnectTask = Task { [weak self] in
@@ -1558,17 +1623,17 @@ final class IOSReceiverModel: ObservableObject {
                 let tickNow = DispatchTime.now().uptimeNanoseconds
                 guard let activeDeadline = self.reconnectDeadlineNanos, tickNow < activeDeadline else {
                     self.teardownActiveConnection(clearAutoReconnect: true)
-                    let msg = "Timeout riconnessione (\(self.agreedTimeoutSeconds)s)"
+                    let msg = "Reconnection timeout (\(self.agreedTimeoutSeconds)s)"
                     self.lastError = msg
                     self.state = .failed(msg)
-                    self.appendEvent("Riconnessione automatica scaduta dopo \(self.agreedTimeoutSeconds)s")
+                    self.appendEvent("Automatic reconnection timed out after \(self.agreedTimeoutSeconds)s")
                     return
                 }
 
                 self.reconnectAttempt += 1
                 let remaining = max(1, Int((activeDeadline - tickNow) / 1_000_000_000))
                 self.state = .reconnecting(attempt: self.reconnectAttempt, remainingSeconds: remaining)
-                self.appendEvent("Tentativo riconnessione #\(self.reconnectAttempt) (rimangono \(remaining)s)…")
+                self.appendEvent("Reconnection attempt #\(self.reconnectAttempt) (\(remaining)s left)…")
 
                 self.teardownActiveConnection(clearAutoReconnect: false)
                 self.openConnection(endpoint: self.activeEndpoint, isReconnectAttempt: true)
@@ -1598,7 +1663,9 @@ final class IOSReceiverModel: ObservableObject {
         // Keep the last picture on screen (frozen) instead of flashing to black: the
         // server answers with a fresh frame, usually within a few hundred ms.
         frameWaitStartedAt = now
-        state = .waiting
+        if currentPixelBuffer == nil {
+            state = .waiting
+        }
         assemblyLock.lock()
         assembler.reset()
         adaptiveBuffer.reset()
@@ -1614,19 +1681,154 @@ final class IOSReceiverModel: ObservableObject {
         appendEvent(reason)
     }
 
+    // MARK: iPhone → Mac clipboard (automatic)
+
+    /// Watches the pasteboard's change counter (reading it never prompts) while connected.
+    private func startPasteboardWatch() {
+        stopPasteboardWatch()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkPasteboard() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pasteboardWatchTimer = timer
+        let center = NotificationCenter.default
+        for name in [UIPasteboard.changedNotification, UIApplication.didBecomeActiveNotification] {
+            pasteboardObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.checkPasteboard() }
+            })
+        }
+        checkPasteboard()
+    }
+
+    private func stopPasteboardWatch() {
+        pasteboardWatchTimer?.invalidate()
+        pasteboardWatchTimer = nil
+        pasteboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        pasteboardObservers.removeAll()
+    }
+
+    /// A copy made since the last check is read (iOS shows "Allow Paste") and sent to the Mac.
+    /// Each copy is read at most once, so the prompt appears once per copy, not every second.
+    private func checkPasteboard() {
+        let pasteboard = UIPasteboard.general
+        let count = pasteboard.changeCount
+        guard count != handledPasteboardChangeCount, !isReadingPasteboard else { return }
+        guard clipboardSyncEnabled, clipboardAutoSend, controlStreamID != 0,
+              UIApplication.shared.applicationState == .active else { return }
+        handledPasteboardChangeCount = count
+        // Metadata only (no prompt): skip empty pasteboards.
+        guard pasteboard.numberOfItems > 0 else { return }
+        isReadingPasteboard = true
+        let providers = pasteboard.itemProviders
+        Task { @MainActor [weak self] in
+            let content = await IOSClipboardBridge.content(from: providers)
+            guard let self else { return }
+            self.isReadingPasteboard = false
+            if let content { self.sendClipboardToHost(content) }
+        }
+    }
+
+    /// The Mac's address when connected through the `NWConnection` fallback.
+    private var clipboardConnectionHost: String? {
+        guard case let .hostPort(host, _)? = controlConnection?.currentPath?.remoteEndpoint else { return nil }
+        switch host {
+        case let .ipv4(address): return "\(address)"
+        case let .ipv6(address): return "\(address)"
+        case let .name(name, _): return name
+        @unknown default: return nil
+        }
+    }
+
     /// (Re)creates the clipboard channel for the current control session and sends the
     /// subscription. Chunks are sent from the channel's queue straight to the socket.
     private func startClipboardSession() {
         let socket = udpSocket
         let connection = controlConnection
         let streamID = controlStreamID
-        clipboardSession.start(mtu: Int(makeConfiguration().mtu), enabled: clipboardSyncEnabled) { payload in
+        let connectionSecurity = self.connectionSecurity
+        clipboardSession.start(mtu: Int(makeConfiguration().mtu), enabled: clipboardSyncEnabled, peerHost: udpSocket?.host ?? clipboardConnectionHost) { payload in
             let datagram = IOSReceiverWireHeader.control(.clipboard, streamID: streamID, payload: payload)
             if let socket {
                 socket.send(datagram)
-            } else {
-                connection?.send(content: datagram, completion: .idempotent)
+            } else if let sealed = connectionSecurity.seal(datagram) {
+                connection?.send(content: sealed, completion: .idempotent)
             }
+        }
+    }
+
+    private func makeClientSecurity() -> SPPWClientSecurity {
+        let id = UUID()
+        activeSecurityID = id
+        securityInfo = nil
+        let security = SPPWClientSecurity(
+            store: IOSBroadcastSettings.securityStore,
+            encryptionEnabled: encryptionEnabled,
+            deviceName: UIDevice.current.name
+        ) { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeSecurityID == id else { return }
+                self.handleSecurityEvent(event)
+            }
+        }
+        activeSecurity = security
+        return security
+    }
+
+    private func handleSecurityEvent(_ event: SPPWClientSecurityEvent) {
+        switch event {
+        case let .secured(info):
+            pairingRequest = nil
+            securityInfo = info
+            appendEvent(Self.securityStatusText(info))
+        case let .paired(info):
+            pairingRequest = nil
+            securityInfo = info
+            pairedServers = IOSBroadcastSettings.securityStore.trustedPeers(.servers)
+            appendEvent(SPPWLocalization.english("security.log.paired_fmt", info.name, info.fingerprint?.short ?? ""))
+        case let .needsSecret(request):
+            pairingRequest = request
+        case let .failed(failure):
+            pairingRequest = nil
+            let message = Self.failureText(failure)
+            appendEvent(message)
+            teardownActiveConnection(clearAutoReconnect: true)
+            state = .failed(message)
+        }
+    }
+
+    /// The PIN or password typed by the user.
+    func providePairingSecret(_ secret: String) {
+        connectStartedNanos = DispatchTime.now().uptimeNanoseconds
+        pairingRequest = nil
+        (activeSecurity ?? connectionSecurity.current)?.provideSecret(secret)
+    }
+
+    func cancelPairing() {
+        (activeSecurity ?? connectionSecurity.current)?.cancelPairing()
+    }
+
+    func forgetPairedServer(_ peer: SPPWTrustedPeer) {
+        IOSBroadcastSettings.securityStore.forget(.servers, fingerprintHex: peer.fingerprintHex)
+        pairedServers = IOSBroadcastSettings.securityStore.trustedPeers(.servers)
+    }
+
+    static func securityStatusText(_ info: SPPWServerSecurityInfo) -> String {
+        switch info.trust {
+        case .paired: SPPWLocalization.tr("security.status.paired")
+        case .unverified: SPPWLocalization.tr("security.status.unverified")
+        case .plaintext: SPPWLocalization.tr("security.status.plaintext")
+        }
+    }
+
+    static func failureText(_ failure: SPPWSecurityFailure) -> String {
+        switch failure {
+        case .serverRequiresEncryption: SPPWLocalization.tr("security.failure.server_requires_encryption")
+        case .serverEncryptionDisabled: SPPWLocalization.tr("security.failure.server_encryption_disabled")
+        case .badServerSignature: SPPWLocalization.tr("security.failure.bad_signature")
+        case .denied: SPPWLocalization.tr("security.failure.denied")
+        case .pairingLocked: SPPWLocalization.tr("security.failure.locked")
+        case .pairingUnavailable: SPPWLocalization.tr("security.failure.unavailable")
+        case .cancelled: SPPWLocalization.tr("security.failure.cancelled")
         }
     }
 
@@ -1635,6 +1837,7 @@ final class IOSReceiverModel: ObservableObject {
             udpSocket.send(data)
             return
         }
+        guard let data = connectionSecurity.seal(data) else { return }
         controlConnection?.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let error else { return }
             Task { @MainActor in

@@ -77,7 +77,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "pyrowave-server",
-            dependencies: ["PyrowaveServerKit"]
+            dependencies: ["PyrowaveServerKit", "SPPWCommon"]
         ),
         .executableTarget(
             name: "pyrowave-server-gui",

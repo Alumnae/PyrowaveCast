@@ -67,6 +67,104 @@ final class IOSServerModel: ObservableObject {
             server?.setAudioInputGain(Float(audioInputVolume))
         }
     }
+    // MARK: Security (encryption and pairing, PROTOCOL.md §7)
+
+    let securityStore = IOSBroadcastSettings.securityStore
+    private(set) lazy var security: SPPWServerSecurity = {
+        let security = SPPWServerSecurity(
+            store: securityStore,
+            configuration: SPPWServerSecurityConfiguration(encryptionEnabled: encryptionEnabled, pairingMode: pairingMode),
+            serverName: UIDevice.current.name
+        ) { [weak self] event in
+            Task { @MainActor in self?.handleSecurityEvent(event) }
+        }
+        return security
+    }()
+    @Published var encryptionEnabled: Bool = IOSBroadcastSettings.encryptionEnabled {
+        didSet {
+            IOSBroadcastSettings.encryptionEnabled = encryptionEnabled
+            security.update(SPPWServerSecurityConfiguration(encryptionEnabled: encryptionEnabled, pairingMode: pairingMode))
+        }
+    }
+    @Published var pairingMode: SPPWPairingMode = IOSBroadcastSettings.pairingMode {
+        didSet {
+            IOSBroadcastSettings.pairingMode = pairingMode
+            security.update(SPPWServerSecurityConfiguration(encryptionEnabled: encryptionEnabled, pairingMode: pairingMode))
+        }
+    }
+    /// PIN of the in-app server, or of the broadcast extension (read from the App Group).
+    @Published private(set) var pairingPIN: SPPWPairingPINPrompt?
+    @Published private(set) var pairedClients: [SPPWTrustedPeer] = IOSBroadcastSettings.securityStore.trustedPeers(.clients)
+    @Published private(set) var hasPairingPassword: Bool = IOSBroadcastSettings.securityStore.hasServerPassword
+    private var inAppPIN: SPPWPairingPINPrompt?
+    private var broadcastPINTimer: Timer?
+
+    var serverFingerprint: String { securityStore.identity.fingerprint.display }
+    /// The broadcast extension only pairs with a PIN when it shares the App Group with the app.
+    var broadcastSharesSecurity: Bool { IOSBroadcastSettings.isShared }
+
+    func setPairingPassword(_ password: String) {
+        securityStore.setServerPassword(password)
+        hasPairingPassword = securityStore.hasServerPassword
+    }
+
+    func forgetPairedClient(_ peer: SPPWTrustedPeer) {
+        securityStore.forget(.clients, fingerprintHex: peer.fingerprintHex)
+        security.revoke(fingerprintHex: peer.fingerprintHex)
+        pairedClients = securityStore.trustedPeers(.clients)
+    }
+
+    func dismissPairingPIN() {
+        security.cancelPIN()
+        IOSBroadcastSettings.broadcastPIN = nil
+        inAppPIN = nil
+        refreshPairingPIN()
+    }
+
+    /// Polls the broadcast extension's PIN once a second while the server screen is visible.
+    func setSecurityPolling(_ active: Bool) {
+        broadcastPINTimer?.invalidate()
+        broadcastPINTimer = nil
+        guard active else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshPairingPIN() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        broadcastPINTimer = timer
+        refreshPairingPIN()
+    }
+
+    private func refreshPairingPIN() {
+        let broadcast = IOSBroadcastSettings.broadcastPIN
+        let next = inAppPIN.flatMap { $0.expiresAt > Date() ? $0 : nil } ?? broadcast
+        if next != pairingPIN { pairingPIN = next }
+        let peers = securityStore.trustedPeers(.clients)
+        if peers != pairedClients { pairedClients = peers }
+    }
+
+    private func handleSecurityEvent(_ event: SPPWServerSecurityEvent) {
+        let text: String
+        switch event {
+        case let .pinRequested(prompt):
+            inAppPIN = prompt
+            refreshPairingPIN()
+            text = SPPWLocalization.english("security.log.pin_requested_fmt", prompt.clientName, prompt.clientFingerprint.short)
+        case .pinCleared:
+            inAppPIN = nil
+            refreshPairingPIN()
+            return
+        case let .paired(peer):
+            inAppPIN = nil
+            refreshPairingPIN()
+            text = SPPWLocalization.english("security.log.paired_fmt", peer.name, peer.fingerprint.short)
+        case let .clientAuthenticated(name, fingerprint, paired):
+            text = SPPWLocalization.english(paired ? "security.log.session_paired_fmt" : "security.log.session_fmt", name, fingerprint.short)
+        case let .log(message):
+            text = message
+        }
+        append(ServerLogEntry(id: 0, timestamp: Date(), text: text, isError: false))
+    }
+
     private var microphone: SPPWMicrophoneCapture?
     /// Background streaming (continued-processing GPU task) + diagnostics while the server runs.
     private var backgroundGuard: IOSBackgroundStreamingGuard?
@@ -141,6 +239,7 @@ final class IOSServerModel: ObservableObject {
             screenResolution: serverScreenResolution,
             previewEnabled: previewEnabled,
             audioInputGain: Float(audioInputVolume),
+            security: security,
             logHandler: { [weak self] entry in
                 Task { @MainActor in self?.append(entry) }
             },

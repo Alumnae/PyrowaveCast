@@ -4,7 +4,9 @@ import PyrowaveGUI
 
 @main
 struct PyrowaveServerApp: App {
-    @StateObject private var model = ServerModel()
+    /// `@State`, not `@StateObject`: the scene must not observe the model, or every status
+    /// update rebuilds the menu bar (blank rows, menus closing). The content view observes it.
+    @State private var model = ServerModel()
 
     var body: some Scene {
         WindowGroup {

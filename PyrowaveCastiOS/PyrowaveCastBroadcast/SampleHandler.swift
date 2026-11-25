@@ -98,10 +98,31 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
         lock.unlock()
 
         let logger = self.logger
+        // Same identity, pairings and settings as the app when the App Group is available; the
+        // PIN goes to the App Group so the app can show it (the extension has no screen).
+        let security = SPPWServerSecurity(
+            store: IOSBroadcastSettings.securityStore,
+            configuration: IOSBroadcastSettings.broadcastSecurityConfiguration,
+            // Replaced by the Bonjour service name when the server starts.
+            serverName: "PyrowaveCast"
+        ) { event in
+            switch event {
+            case let .pinRequested(prompt):
+                IOSBroadcastSettings.broadcastPIN = prompt
+                logger.log("Pairing PIN shown in the app for \(prompt.clientName, privacy: .public)")
+            case .pinCleared, .paired:
+                IOSBroadcastSettings.broadcastPIN = nil
+            case let .clientAuthenticated(name, _, paired):
+                logger.log("Secure session with \(name, privacy: .public), paired: \(paired)")
+            case let .log(text):
+                logger.log("\(text, privacy: .public)")
+            }
+        }
         let instance = IOSStreamServer(
             source: .screen,
             screenResolution: (width, height),
             previewEnabled: false,
+            security: security,
             logHandler: { entry in
                 if entry.isError {
                     logger.error("\(entry.text, privacy: .public)")
